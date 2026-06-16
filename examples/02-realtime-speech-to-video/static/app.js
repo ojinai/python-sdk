@@ -1,20 +1,22 @@
 // Realtime Speech-To-Video — browser client.
 // Captures the mic (16 kHz mono) + webcam, streams mic PCM to the Python backend,
 // and renders the avatar JPEG video + PCM audio the backend streams back.
+//
+// The backend connects to the Ojin service only when this page opens the WebSocket,
+// and we open it only when you press Start — never on page load.
 
 const RATE = 16000;
 const statusEl = document.getElementById("status");
 const avatarEl = document.getElementById("avatar");
+const startBtn = document.getElementById("start");
 
-const ws = new WebSocket(`ws://${location.host}/ws`);
-ws.binaryType = "arraybuffer";
-ws.onclose = () => (statusEl.textContent = "Disconnected — refresh to reconnect.");
-
+let ws = null; // opened on Start — this is what triggers the backend↔Ojin connection
 let audioCtx = null; // one 16 kHz context for both capture and playback
 let playHead = 0; // scheduled start time of the next avatar audio chunk
 let lastFrameUrl = null;
 
-document.getElementById("start").onclick = async () => {
+startBtn.onclick = async () => {
+  // 1) Get mic + camera first, so we never connect to Ojin if permission is denied.
   let stream;
   try {
     stream = await navigator.mediaDevices.getUserMedia({
@@ -27,8 +29,20 @@ document.getElementById("start").onclick = async () => {
   }
 
   document.getElementById("me").srcObject = stream; // your webcam, on the left
+  startBtn.disabled = true;
 
-  // Asking for a 16 kHz context lets the browser downsample the mic for us.
+  // 2) Open the WebSocket now — this is what makes the backend connect to Ojin.
+  statusEl.textContent = "Connecting to Ojin…";
+  ws = new WebSocket(`ws://${location.host}/ws`);
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = onMessage;
+  ws.onclose = () => (statusEl.textContent = "Disconnected — refresh to reconnect.");
+  ws.onopen = () => {
+    statusEl.textContent = "Listening — talk, pause to hear the avatar, talk again to interrupt.";
+  };
+
+  // 3) Stream mic audio to the backend. A 16 kHz context lets the browser
+  //    downsample the mic for us.
   audioCtx = new AudioContext({ sampleRate: RATE });
   const source = audioCtx.createMediaStreamSource(stream);
   const processor = audioCtx.createScriptProcessor(1024, 1, 1); // ~64 ms blocks
@@ -39,7 +53,7 @@ document.getElementById("start").onclick = async () => {
   mute.connect(audioCtx.destination);
 
   processor.onaudioprocess = (e) => {
-    if (ws.readyState !== WebSocket.OPEN) return;
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
     const f32 = e.inputBuffer.getChannelData(0); // Float32 @ 16 kHz
     const i16 = new Int16Array(f32.length);
     for (let i = 0; i < f32.length; i++) {
@@ -48,12 +62,9 @@ document.getElementById("start").onclick = async () => {
     }
     ws.send(i16.buffer); // mic PCM -> backend
   };
-
-  document.getElementById("start").disabled = true;
-  statusEl.textContent = "Listening — talk, pause to hear the avatar, talk again to interrupt.";
 };
 
-ws.onmessage = (ev) => {
+function onMessage(ev) {
   if (typeof ev.data === "string") {
     statusEl.textContent = ev.data; // server status / error
     return;
@@ -62,7 +73,7 @@ ws.onmessage = (ev) => {
   const body = msg.subarray(1);
   if (msg[0] === 1) renderVideo(body); // 0x01 = JPEG frame
   else playAudio(body); // 0x00 = int16 PCM @ 16 kHz
-};
+}
 
 function renderVideo(jpegBytes) {
   if (lastFrameUrl) URL.revokeObjectURL(lastFrameUrl);

@@ -1,0 +1,150 @@
+"""Self-contained Pipecat adapter for an Ojin lip-synced talking-avatar (face).
+
+`OjinAvatarService` is a Pipecat ``FrameProcessor`` that turns the TTS audio
+stream into a lip-synced avatar. Place it in the pipeline **after your TTS
+service and before ``transport.output()``** — the same slot Pipecat's built-in
+avatar services (Simli, Tavus, HeyGen) use:
+
+    transport.input() -> STT -> LLM -> TTS -> [OjinAvatarService] -> transport.output()
+
+All avatar behaviour (connect/retry, audio-as-clock playback, A/V sync, re-sync
+after barge-in) lives in ``ojin.stv.OjinSTVClient`` — this class is just the
+mapping between Pipecat frames and the client's API. It needs only
+``ojin-client[stv]`` and ``pipecat-ai``.
+
+This module is the adapter from the ``ojin-stv-pipecat`` skill, kept here so the
+example runs standalone.
+"""
+
+from __future__ import annotations
+
+from pipecat.frames.frames import (
+    CancelFrame,
+    EndFrame,
+    Frame,
+    OutputAudioRawFrame,
+    OutputImageRawFrame,
+    StartFrame,
+    TTSAudioRawFrame,
+    TTSStartedFrame,
+    UserStartedSpeakingFrame,
+)
+from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
+
+from ojin.stv import OjinSTVClient, STVAudioFrame, STVEvent, STVVideoFrame
+
+
+def _is_trailing_silence(pcm: bytes, sample_rate: int, num_channels: int) -> bool:
+    """Return True for the ~0.5 s all-zero sentinel some TTS engines emit at end-of-turn."""
+    if not pcm:
+        return False
+    duration = len(pcm) / (sample_rate * num_channels * 2)
+    return abs(duration - 0.5) < 0.01 and pcm == b"\x00" * len(pcm)
+
+
+class _AvatarOutput:
+    """STVOutput sink: pushes the client's synced A/V downstream as Pipecat frames."""
+
+    def __init__(self, service: "OjinAvatarService") -> None:
+        self._svc = service
+
+    async def write_audio(self, frame: STVAudioFrame) -> None:
+        # The client returns your ORIGINAL TTS audio to play (never the server's).
+        await self._svc.push_frame(
+            OutputAudioRawFrame(frame.pcm, frame.sample_rate, frame.num_channels)
+        )
+
+    async def write_video(self, frame: STVVideoFrame) -> None:
+        # rgb is decoded pixels; it repeats the last frame on held ticks (smooth),
+        # and is None only with a passthrough decoder (we use the default).
+        if frame.rgb is not None:
+            await self._svc.push_frame(
+                OutputImageRawFrame(
+                    image=frame.rgb,
+                    size=(frame.width, frame.height),
+                    format=frame.format,
+                )
+            )
+
+    def on_event(self, event: STVEvent, **kwargs: object) -> None:
+        pass  # lifecycle events are wired via the client's emitter (see __init__)
+
+
+class OjinAvatarService(FrameProcessor):
+    """Pipecat FrameProcessor that turns the TTS audio stream into a lip-synced avatar.
+
+    Place it in the pipeline after your TTS service and before transport.output().
+    All avatar behavior (connect/retry, audio-as-clock playback, A/V sync, re-sync
+    after barge-in) lives in ojin.stv.OjinSTVClient; this class is just the mapping.
+    """
+
+    def __init__(
+        self,
+        *,
+        api_key: str,
+        config_id: str,
+        image_size: tuple[int, int] = (512, 512),
+        ws_url: str = "wss://models.ojin.ai/realtime",
+    ) -> None:
+        """Build the avatar service and wire the client's lifecycle events.
+
+        Args:
+            api_key: Ojin API key.
+            config_id: Ojin Face-model config id (the avatar to drive).
+            image_size: Avatar frame size; must match the transport's
+                ``video_out_width``/``video_out_height``.
+            ws_url: Ojin realtime websocket URL.
+
+        """
+        super().__init__(name="ojin-avatar")
+        self._waiting_for_first_tts = False
+        self._stv = OjinSTVClient(
+            api_key=api_key,
+            config_id=config_id,
+            ws_url=ws_url,
+            image_size=image_size,  # must match the transport's video_out_width/height
+            output=_AvatarOutput(self),  # push model — do NOT call output_stream()
+        )
+
+        @self._stv.on(STVEvent.BOT_STARTED_SPEAKING)
+        async def _started(**_: object) -> None:
+            await self.stop_ttfb_metrics()  # first avatar frame => stop TTFB timer
+
+        @self._stv.on(STVEvent.ERROR)
+        async def _error(message: str = "", fatal: bool = False, **_: object) -> None:
+            await self.push_error(message, fatal=fatal)
+
+    def can_generate_metrics(self) -> bool:
+        """Report that this processor emits TTFB / usage metrics."""
+        return True
+
+    async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
+        """Map each inbound Pipecat frame to the matching OjinSTVClient call."""
+        await super().process_frame(frame, direction)
+
+        if isinstance(frame, StartFrame):
+            await self.push_frame(frame, direction)
+            await self._stv.start()  # connect + run the playback loops
+        elif isinstance(frame, TTSStartedFrame):
+            self._waiting_for_first_tts = True
+            await self._stv.start_turn()  # open a buffer for this utterance
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, TTSAudioRawFrame):
+            if _is_trailing_silence(frame.audio, frame.sample_rate, frame.num_channels):
+                return  # drop the end-of-turn silence sentinel
+            if self._waiting_for_first_tts:
+                self._waiting_for_first_tts = False
+                await self.start_ttfb_metrics()  # arm TTFB on the first real audio
+            await self._stv.send_tts_audio(
+                frame.audio, frame.sample_rate, frame.num_channels
+            )
+        elif isinstance(frame, UserStartedSpeakingFrame):
+            await self._stv.interrupt()  # barge-in (no-op if the avatar is idle)
+            await self.push_frame(frame, direction)
+        elif isinstance(frame, (EndFrame, CancelFrame)):
+            await self._stv.close()
+            await self.push_frame(frame, direction)
+        else:
+            await self.push_frame(
+                frame, direction
+            )  # stay transparent for everything else

@@ -50,7 +50,6 @@ def _configure_tcp_nodelay(ws: ClientConnection) -> None:
             sock = transport.get_extra_info("socket")
             if sock is not None:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                logger.debug("TCP_NODELAY enabled on client websocket")
     except Exception as e:
         logger.warning("Failed to set TCP_NODELAY: %s", e)
 
@@ -147,7 +146,6 @@ class OjinClient(IOjinClient):
                 self._process_messages_task = asyncio.create_task(
                     self._process_client_messages()
                 )
-                logger.info("Successfully connected to OJIN STV service")
                 return
             except WebSocketException as e:  # noqa: PERF203
                 last_error = e
@@ -191,8 +189,6 @@ class OjinClient(IOjinClient):
                 await self._receive_task
             self._receive_task = None
 
-        logger.info("Disconnected from OJIN STV service")
-
     async def _receive_server_messages(self) -> None:
         """Continuously receive and process incoming messages from the server."""
         if not self._ws:
@@ -227,16 +223,11 @@ class OjinClient(IOjinClient):
                             interaction_server_response
                         )
                     )
-                    logger.debug(
-                        "Received InteractionResponse for id %s",
-                        interaction_response.interaction_id,
-                    )
 
                     if (
                         interaction_response.interaction_id
                         != self._active_interaction_id
                     ):
-                        logger.debug("Interaction id changed.")
                         self._active_interaction_id = (
                             interaction_response.interaction_id
                         )
@@ -334,8 +325,6 @@ class OjinClient(IOjinClient):
                 if isinstance(msg, OjinSessionReadyPing):
                     # Discard session pings
                     pass
-
-                logger.info("Received message: %s", msg)
             else:
                 logger.warning("Unknown message type: %s", msg_type)
 
@@ -371,8 +360,6 @@ class OjinClient(IOjinClient):
             raise ConnectionError("Inference Server is not ready to receive messages")
 
         if isinstance(message, OjinCancelInteractionMessage):
-            logger.info("Interrupt")
-
             self._cancelled = True
             cancel_input = CancelInteractionMessage(payload=message.to_proxy_message())
 
@@ -388,7 +375,6 @@ class OjinClient(IOjinClient):
             message,
             (OjinAudioInputMessage, OjinTextInputMessage, OjinEndInteractionMessage),
         ):
-            logger.info("InteractionMessage")
             await self._pending_client_messages_queue.put(message)
             return
 
@@ -411,7 +397,6 @@ class OjinClient(IOjinClient):
                 continue
 
             if self._ws is None:
-                logger.debug("[_process_messages:] no websocket connection.")
                 await asyncio.sleep(1.0)
                 continue
 
@@ -422,11 +407,6 @@ class OjinClient(IOjinClient):
                     message.audio_int16_bytes[i : i + max_chunk_size]
                     for i in range(0, len(message.audio_int16_bytes), max_chunk_size)
                 ]
-                logger.info(
-                    "Split audio into %d chunks of max %d bytes",
-                    len(audio_chunks),
-                    max_chunk_size,
-                )
 
                 # NOTE(mouad): make sure we handle the case where the input is empty
                 if len(audio_chunks) == 0:
