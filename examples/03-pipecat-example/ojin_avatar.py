@@ -18,6 +18,11 @@ example runs standalone.
 
 from __future__ import annotations
 
+import logging
+import os
+import uuid
+from datetime import datetime, timezone
+
 from pipecat.frames.frames import (
     CancelFrame,
     EndFrame,
@@ -31,7 +36,31 @@ from pipecat.frames.frames import (
 )
 from pipecat.processors.frame_processor import FrameDirection, FrameProcessor
 
-from ojin.stv import OjinSTVClient, STVAudioFrame, STVEvent, STVVideoFrame
+from ojin.stv import (
+    OjinSessionTrace,
+    OjinSTVClient,
+    STVAudioFrame,
+    STVEvent,
+    STVVideoFrame,
+)
+
+logger = logging.getLogger(__name__)
+
+# Per-session Perfetto trace output. On by default; set OJIN_STV_SESSION_TRACE to
+# 0/false/no/off to disable. Files land under OJIN_STV_TRACE_DIR (default below) as
+# <root>/<date>/<time>_<session_id>/session.json — the same layout the inference
+# server's session trace uses, so the two diff cleanly in https://ui.perfetto.dev.
+_TRACE_ROOT = os.getenv("OJIN_STV_TRACE_DIR", "/root/debug/sessions/stv-example")
+
+
+def _trace_disabled() -> bool:
+    """Return True if the per-session Perfetto trace is switched off via env."""
+    return os.getenv("OJIN_STV_SESSION_TRACE", "").strip().lower() in {
+        "0",
+        "false",
+        "no",
+        "off",
+    }
 
 
 def _is_trailing_silence(pcm: bytes, sample_rate: int, num_channels: int) -> bool:
@@ -98,12 +127,21 @@ class OjinAvatarService(FrameProcessor):
         """
         super().__init__(name="ojin-avatar")
         self._waiting_for_first_tts = False
+        # Per-session Perfetto trace, injected as the client's tracer so every
+        # audio/video tick, buffer swap, and barge-in lands on one timeline. It is
+        # dumped to disk on close (see _write_trace). None => NullTracer (no-op).
+        self._trace = (
+            None
+            if _trace_disabled()
+            else OjinSessionTrace(session_id=uuid.uuid4().hex[:12], config_id=config_id)
+        )
         self._stv = OjinSTVClient(
             api_key=api_key,
             config_id=config_id,
             ws_url=ws_url,
             image_size=image_size,  # must match the transport's video_out_width/height
             output=_AvatarOutput(self),  # push model — do NOT call output_stream()
+            tracer=self._trace,  # None => the client falls back to a NullTracer
         )
 
         @self._stv.on(STVEvent.BOT_STARTED_SPEAKING)
@@ -143,8 +181,26 @@ class OjinAvatarService(FrameProcessor):
             await self.push_frame(frame, direction)
         elif isinstance(frame, (EndFrame, CancelFrame)):
             await self._stv.close()
+            self._write_trace()  # flush the session's Perfetto trace on teardown
             await self.push_frame(frame, direction)
         else:
             await self.push_frame(
                 frame, direction
             )  # stay transparent for everything else
+
+    def _write_trace(self) -> None:
+        """Dump the session's Perfetto trace to disk on close (best-effort, once)."""
+        trace, self._trace = self._trace, None  # write at most once
+        if trace is None:
+            return
+        now = datetime.now(timezone.utc)
+        path = os.path.join(
+            _TRACE_ROOT,
+            now.strftime("%Y-%m-%d"),
+            f"{now.strftime('%H-%M-%S')}_{trace.session_id}",
+            "session.json",
+        )
+        try:
+            logger.info("Ojin STV session trace written to %s", trace.dump(path))
+        except Exception as exc:  # never let trace I/O break teardown
+            logger.warning("Failed to write Ojin STV session trace: %s", exc)

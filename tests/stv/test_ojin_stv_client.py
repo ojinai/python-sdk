@@ -161,6 +161,74 @@ def test_interrupt_sends_cancel_only_when_interruptible() -> None:
     asyncio.run(run())
 
 
+def _interaction_response(frame_type):
+    """Build a minimal server interaction-response message of the given type."""
+    return OjinInteractionResponseMessage(
+        interaction_id="i1",
+        video_frame_bytes=b"",
+        audio_frame_bytes=b"\x00\x00" * 320,
+        is_final_response=False,
+        index=0,
+        frame_type=frame_type,
+    )
+
+
+def _live_buffer():
+    """Build a fresh, non-interrupted buffer with audio to fade (interruptible)."""
+    buf = AudioBuffer(sample_rate=16000)
+    buf.bytes_.extend(b"\x01\x02" * 100)
+    return buf
+
+
+def test_interrupt_suppressed_while_one_is_ongoing() -> None:
+    """A second barge-in is dropped while an interruption is still in flight."""
+
+    async def run() -> None:
+        c, fc, _out = make_client()
+        c._synchronizer.current_buffer = _live_buffer()
+        await c.interrupt()
+        assert c._interruption_ongoing is True
+        cancels = [m for m in fc.sent if isinstance(m, OjinCancelInteractionMessage)]
+        assert len(cancels) == 1
+
+        # A new turn may swap in a fresh, interruptible buffer, but the prior cancel
+        # is still unacknowledged — a second barge-in must not fire another cancel.
+        c._synchronizer.current_buffer = _live_buffer()
+        await c.interrupt()
+        cancels = [m for m in fc.sent if isinstance(m, OjinCancelInteractionMessage)]
+        assert len(cancels) == 1, "second interrupt should not send another cancel"
+
+        # In-flight speech frames do not end the interruption window.
+        c._on_interaction_response(_interaction_response(FrameType.SPEECH))
+        assert c._interruption_ongoing is True
+
+    asyncio.run(run())
+
+
+def test_interrupt_window_closes_on_idle_or_fadeout_frame() -> None:
+    """The first idle/fade-out frame after a cancel reopens interruptibility."""
+
+    async def run() -> None:
+        for end_frame in (FrameType.IDLE, FrameType.FADE_OUT):
+            c, fc, _out = make_client()
+            c._synchronizer.current_buffer = _live_buffer()
+            await c.interrupt()
+            assert c._interruption_ongoing is True
+
+            c._on_interaction_response(_interaction_response(end_frame))
+            assert c._interruption_ongoing is False
+
+            # Window closed → a fresh barge-in sends a new cancel.
+            c._synchronizer.current_buffer = _live_buffer()
+            await c.interrupt()
+            cancels = [
+                m for m in fc.sent if isinstance(m, OjinCancelInteractionMessage)
+            ]
+            assert len(cancels) == 2
+
+    asyncio.run(run())
+
+
 def test_emit_tick_fires_started_speaking_event() -> None:
     """When a buffer begins draining, the tick emits BOT_STARTED_SPEAKING."""
 

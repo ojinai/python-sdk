@@ -116,6 +116,11 @@ class OjinSTVClient:
         self._waiting_for_first_tts = False
         self._last_audio_shape = (OJIN_PERSONA_SAMPLE_RATE, 1)
         self._last_played_rgb: Optional[bytes] = None
+        # Barge-in in flight: set when a cancel is sent, cleared when the server's
+        # first idle/fade-out frame acknowledges it. While set, further interrupts
+        # are dropped so a re-fire (e.g. VAD flap, or a new turn that swapped in
+        # before the cancel landed) can't stack a second cancel on the server.
+        self._interruption_ongoing = False
 
         # Per-tick trace bookkeeping (only touched when a real tracer is injected,
         # so a NullTracer session pays nothing). Mirrors OjinVideoService.
@@ -327,8 +332,17 @@ class OjinSTVClient:
         await self.send_tts_audio(pcm, sample_rate, num_channels)
 
     async def interrupt(self) -> None:
-        """Barge-in: fade the current turn and cancel it server-side if playing."""
+        """Barge-in: fade the current turn and cancel it server-side if playing.
+
+        No-op while an interruption is already in flight: the window stays open from
+        the cancel until the server's first idle/fade-out frame acknowledges it (see
+        :meth:`_on_interaction_response`), so a re-fire can't stack a second cancel.
+        """
+        if self._interruption_ongoing:
+            self._tracer.instant("interruption", "interrupt_suppressed")
+            return
         if self._synchronizer.interrupt():
+            self._interruption_ongoing = True
             await self._client.send_message(OjinCancelInteractionMessage())
             self._tr_interrupt_start = self._tracer.mark()
             self._tracer.instant("interruption", "cancel_sent")
@@ -409,6 +423,14 @@ class OjinSTVClient:
             args={"frame_type": frame_type, "volume": volume},
         )
         self._tracer.counter("recv_frame_type", frame_type)
+        # End the barge-in window on the first idle/fade-out frame after a cancel —
+        # the server's acknowledgement that the interruption took effect. Re-enables
+        # interrupt() for the next turn.
+        if self._interruption_ongoing and (
+            video_frame.is_silence() or video_frame.is_fade_out()
+        ):
+            self._interruption_ongoing = False
+            self._tracer.instant("interruption", "interrupt_ended")
         # Close the cancel→new-turn span on the first new-turn frame after barge-in.
         if (
             frame_type == FrameType.START_OF_SPEECH
