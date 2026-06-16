@@ -1,0 +1,98 @@
+[project]
+name = "ojin-client"
+version = "0.6.7"
+description = "Ojin platform services"
+readme = "README.md"
+requires-python = ">=3.10"
+authors = [{name = "Journee"}]
+license = {text = "Apache-2.0"}
+classifiers = [
+    "License :: OSI Approved :: Apache Software License"
+]
+dependencies = [    
+    "websockets>=15.0.1,<16",
+    "async-lru>=2.0.5",
+    "pyjwt>=2.10.1",
+    "pydantic-settings>=2.8.1",
+    "deprecated"
+]
+
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project.urls]
+Homepage = "https://ojin.ai"
+Repository = "https://github.com/ojinai/python-sdk"
+Documentation = "https://docs.ojin.ai"
+Issues = "https://github.com/ojinai/python-sdk/issues"
+
+[tool.setuptools]
+package-dir = {"" = "src"}
+packages = [
+    "ojin",
+    "ojin.entities",
+    "ojin.stv",
+]
+
+[tool.setuptools.package-data]
+ojin = ["*.pem"]
+
+[project.optional-dependencies]
+# High-level Speech-To-Video client (ojin.stv). numpy is used throughout the
+# sync math; opencv and soxr are lazy-imported inside the default decoder /
+# resampler, so injecting your own avoids them.
+stv = [
+    "numpy>=1.24",
+    "opencv-python-headless>=4.9",
+    "soxr>=0.3",
+]
+dev = [
+    "pytest>=8.3.5",
+    "pytest-asyncio>=0.26.0",
+    "pytest-cov>=4.1.0",
+    "pytest-httpx>=0.35.0",
+    "ruff>=0.11.4",
+    "build>=0.10.0",
+    "twine>=5.0.0",
+    "fastapi>=0.115.13",
+    "uvicorn>=0.34.3",
+    "numpy>=1.24",
+    "opencv-python-headless>=4.9",
+    "soxr>=0.3"
+]
+
+[tool.ruff]
+lint.select = ["E", "F", "D", "I", "N", "B", "C4", "ARG", "SIM", "TID", "TD", "PL", "RUF", "PERF", "ERA", "FAST", "G"]
+lint.ignore = ["D203", "D213"]
+target-version = "py310"
+
+[tool.ruff.format]
+docstring-code-format=true
+docstring-code-line-length = "dynamic"
+
+[tool.ruff.lint.isort]
+known-first-party = ["ojin"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401", "D104"]
+"**/{tests,docs,tools}/*" = ["E402", "ARG001", "PLR2004", "ARG002", "E722"]
+
+[tool.pyright]
+reportMissingSuperCall = "error"
+reportMissingParameterType = "error"
+
+[tool.pytest.ini_options]
+minversion = "8.0"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+asyncio_mode = "auto"
+markers = [
+    "unit: unit tests",
+    "integration: integration tests"
+]
+log_cli = true
+log_cli_level = "INFO"
+addopts = "--cov=ojin --cov-report=lcov:coverage/lcov"
