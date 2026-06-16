@@ -1,0 +1,104 @@
+name: Release
+
+# Publish ojin-client to PyPI when the version in pyproject.toml is bumped on main.
+#
+# Trigger: a push to `main` that touches pyproject.toml. The `check` job then confirms
+# the version actually changed (vs the previous commit) before anything is built or
+# published — so an ordinary feature merge that doesn't bump the version is a no-op.
+#
+# Auth: PyPI Trusted Publishing (OIDC). No API tokens are stored anywhere; the
+# `publish` job mints a short-lived token that PyPI trusts. This requires a one-time
+# setup on PyPI (a trusted publisher for this repo + workflow) and a GitHub
+# Environment named `pypi` — see CONTRIBUTING.md / the PR description.
+
+on:
+  push:
+    branches: [main]
+    paths: ["pyproject.toml"]
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  # 1) Did the version actually change? Everything downstream hangs off this.
+  check:
+    runs-on: ubuntu-latest
+    outputs:
+      should_publish: ${{ steps.v.outputs.SHOULD_BUILD }}
+      version: ${{ steps.v.outputs.VERSION }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 2 # need HEAD~1 to diff the version
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - id: v
+        run: |
+          python .ci/release_check.py extract_current_version
+          python .ci/release_check.py check_build
+
+  # 2) Run the same checks reviewers run; never publish a red main.
+  #    Skipped (and so is everything after it) when the version didn't change.
+  verify:
+    needs: check
+    if: needs.check.outputs.should_publish == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv sync --all-extras
+      - run: uv run ruff format --check .
+      - run: uv run ruff check .
+      - name: Type-check
+        run: |
+          source .venv/bin/activate # let pyright resolve imports against the project env
+          uvx pyright
+      - run: uv run pytest tests/stv # hermetic unit suite; skips live integration
+
+  # 3) Build sdist + wheel with uv, hand them to the publish job as an artifact.
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+
+  # 4) Publish to PyPI via OIDC trusted publishing — no secrets.
+  publish:
+    needs: [check, build]
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # mint the OIDC token PyPI trusts
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  # 5) Tag the release commit (replaces the manual `git tag vX.Y.Z`).
+  tag:
+    needs: [check, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write # push the tag
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag the release commit
+        env:
+          VERSION: ${{ needs.check.outputs.version }}
+        run: |
+          if git ls-remote --exit-code --tags origin "refs/tags/v$VERSION" >/dev/null 2>&1; then
+            echo "Tag v$VERSION already exists on origin; skipping."
+          else
+            git tag "v$VERSION"
+            git push origin "v$VERSION"
+          fi
