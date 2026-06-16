@@ -1,0 +1,32 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Ojin · Realtime Speech-To-Video</title>
+    <style>
+      body { margin: 0; font-family: system-ui, sans-serif; background: #0b0b0f; color: #eee; }
+      header { padding: 16px 24px; }
+      h1 { font-size: 18px; margin: 0; font-weight: 600; }
+      #status { color: #8ab4ff; font-size: 14px; margin: 6px 0 12px; }
+      .stage { display: flex; gap: 16px; padding: 0 24px 24px; }
+      .pane { flex: 1; }
+      .pane h2 { font-size: 12px; color: #888; text-transform: uppercase; letter-spacing: 0.06em; }
+      video, img { width: 100%; aspect-ratio: 1 / 1; object-fit: cover; background: #16161d; border-radius: 12px; }
+      button { font-size: 15px; padding: 10px 18px; border: 0; border-radius: 10px; background: #3b6cf6; color: #fff; cursor: pointer; }
+      button:disabled { opacity: 0.4; cursor: default; }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>Realtime Speech-To-Video</h1>
+      <div id="status">Click start, allow the mic + camera, then just talk.</div>
+      <button id="start">Start</button>
+    </header>
+    <div class="stage">
+      <div class="pane"><h2>You</h2><video id="me" autoplay muted playsinline></video></div>
+      <div class="pane"><h2>Avatar</h2><img id="avatar" alt="avatar" /></div>
+    </div>
+    <script src="/static/app.js"></script>
+  </body>
+</html>

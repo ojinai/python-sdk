@@ -1,0 +1,12 @@
+# Pinned to compatible-release ranges (~=): the major.minor is fixed, but security
+# patch releases are still allowed in. Run `pip install -U -r requirements.txt`
+# periodically, and `pip-audit -r requirements.txt` to check for advisories.
+
+# The Ojin SDK with the high-level Speech-To-Video client (numpy + opencv via [stv]).
+ojin-client[stv]>=0.6.7
+
+# Bundles an ffmpeg binary; mp4_writer.py uses it to mux video + WAV audio.
+imageio-ffmpeg~=0.6.0
+
+# Working inside this repo instead of from PyPI? Use the local package:
+#   pip install -e "../..[stv]"
