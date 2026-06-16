@@ -380,7 +380,9 @@ def test_send_tts_audio_records_input_rms() -> None:
         await c.start()
         await asyncio.sleep(0.02)
         await c.start_turn()
-        await c.send_tts_audio(b"\x05\x06" * 480, 24000, 1)
+        # 100 ms @ 24 kHz: enough to clear the streaming resampler's filter
+        # warm-up (a single ~20 ms chunk is fully absorbed and emits nothing).
+        await c.send_tts_audio(b"\x05\x06" * 2400, 24000, 1)
         assert any(name == "input_audio_rms" for (name, _v) in tr.counters)
         assert any(n == "tts_audio" for (_lane, n, _a) in tr.instants)
         await c.close()

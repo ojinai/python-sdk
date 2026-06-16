@@ -27,6 +27,7 @@ from ojin_avatar import OjinAvatarService
 from pipecat.audio.vad.silero import SileroVADAnalyzer
 from pipecat.frames.frames import LLMRunFrame
 from pipecat.pipeline.pipeline import Pipeline
+from pipecat.services.elevenlabs.tts import ElevenLabsTTSService
 from pipecat.pipeline.worker import PipelineParams, PipelineWorker
 from pipecat.processors.aggregators.llm_context import LLMContext
 from pipecat.processors.aggregators.llm_response_universal import (
@@ -109,13 +110,22 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
         model="gemini-2.5-flash",
     )
 
-    tts = CartesiaTTSService(
-        api_key=os.environ["CARTESIA_API_KEY"],
-        settings=CartesiaTTSService.Settings(
-            voice="71a7ad14-091c-4e8e-a314-022ece01c121",  # Cartesia "British Lady"
-            model="sonic-3",
+    tts = ElevenLabsTTSService(
+        api_key=os.environ["ELEVENLABS_API_KEY"],
+        voice_id=os.environ["ELEVENLABS_VOICE_ID"],
+        model="eleven_flash_v2_5",
+        params=ElevenLabsTTSService.InputParams(
+            stability=1.0,
+            similarity_boost=1.0,
         ),
     )
+    # tts = CartesiaTTSService(
+    #     api_key=os.environ["CARTESIA_API_KEY"],
+    #     settings=CartesiaTTSService.Settings(
+    #         voice="71a7ad14-091c-4e8e-a314-022ece01c121",  # Cartesia "British Lady"
+    #         model="sonic-3",
+    #     ),
+    # )
 
     # The Ojin face — the one stage that makes this an avatar agent. It lip-syncs
     # to whatever `tts` produces, so it sits right after TTS and before output.
