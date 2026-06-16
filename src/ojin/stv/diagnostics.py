@@ -6,8 +6,9 @@ main thread even while it is blocked in a C extension) when a playback tick fail
 to advance within a threshold, and a loop exception handler names the connection
 behind otherwise-anonymous asyncio socket errors.
 
-All gated by the threshold knobs; ``0`` disables a tier. Diagnostics must never
-break a session, so every operation is defensive.
+All gated by the threshold knobs and **off by default** (``0`` disables a tier);
+enable a tier by passing a positive threshold via :class:`~ojin.stv.config.STVConfig`.
+Diagnostics must never break a session, so every operation is defensive.
 """
 
 from __future__ import annotations
@@ -30,9 +31,9 @@ class LoopDiagnostics:
     def __init__(
         self,
         *,
-        watchdog_ms: float = 250.0,
+        watchdog_ms: float = 0.0,
         tick_warn_ms: float = 80.0,
-        stall_probe_ms: float = 70.0,
+        stall_probe_ms: float = 0.0,
         clock=time.perf_counter,
     ) -> None:
         """Configure the diagnostics; construction starts nothing."""

@@ -36,8 +36,10 @@ class STVConfig:
     # Barge-in
     interrupt_audio_fade_s: float = 0.75
 
-    # Verification / diagnostics (env-overridable in the client; 0 disables)
+    # Diagnostics — off by default; a published SDK should be quiet. Each tier
+    # dumps every thread's stack to stderr when a playback tick stalls past its
+    # threshold (ms); set a positive value to opt in, 0 disables that tier.
     lipsync_trace_enabled: bool = False
-    loop_stall_watchdog_ms: float = 250.0
-    tick_warn_ms: float = 80.0
-    stall_probe_ms: float = 70.0
+    loop_stall_watchdog_ms: float = 0.0  # hard-freeze tier (set e.g. 250 to enable)
+    tick_warn_ms: float = 80.0  # slow-tick log line; active only with a tracer
+    stall_probe_ms: float = 0.0  # small-stall probe (set e.g. 70 to enable)

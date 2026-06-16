@@ -37,7 +37,7 @@ class UnknownMessage(BaseModel):
 def run_server():
     """Run the FastAPI WebSocket server in a separate process."""
     try:
-        import uvicorn  # noqa: PLC0415
+        import uvicorn
 
         # Try to import your server module
         logger.info("Starting FastAPI WebSocket server on port 8000...")

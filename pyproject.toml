@@ -11,10 +11,10 @@ classifiers = [
 ]
 dependencies = [    
     "websockets>=15.0.1,<16",
-    "async-lru>=2.0.5",
-    "pyjwt>=2.10.1",
-    "pydantic-settings>=2.8.1",
-    "deprecated"
+    "async-lru>=2.0.5,<3",
+    "pyjwt>=2.13.0,<3",  # 2.13.0 fixes PYSEC-2026-175..179 / GHSA-jq35-7prp-9v3f
+    "pydantic-settings>=2.8.1,<3",
+    "deprecated>=1.2.14,<2",
 ]
 
 [build-system]
@@ -43,9 +43,9 @@ ojin = ["*.pem"]
 # sync math; opencv and soxr are lazy-imported inside the default decoder /
 # resampler, so injecting your own avoids them.
 stv = [
-    "numpy>=1.24",
-    "opencv-python-headless>=4.9",
-    "soxr>=0.3",
+    "numpy>=1.24,<3",
+    "opencv-python-headless>=4.9,<5",
+    "soxr>=0.3,<2",
 ]
 dev = [
     "pytest>=8.3.5",
@@ -57,9 +57,9 @@ dev = [
     "twine>=5.0.0",
     "fastapi>=0.115.13",
     "uvicorn>=0.34.3",
-    "numpy>=1.24",
-    "opencv-python-headless>=4.9",
-    "soxr>=0.3"
+    "numpy>=1.24,<3",
+    "opencv-python-headless>=4.9,<5",
+    "soxr>=0.3,<2",
 ]
 
 [tool.ruff]
@@ -77,10 +77,16 @@ known-first-party = ["ojin"]
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "D104"]
 "**/{tests,docs,tools}/*" = ["E402", "ARG001", "PLR2004", "ARG002", "E722"]
+# Examples are standalone teaching projects: allow long instructional help strings
+# (E501), literal CLI indices (PLR2004), and the tiny .env-parser loop var (PLW2901).
+"examples/**/*.py" = ["E501", "PLR2004", "PLW2901"]
 
 [tool.pyright]
 reportMissingSuperCall = "error"
 reportMissingParameterType = "error"
+# Examples are standalone projects with their own requirements.txt (fastapi,
+# webrtcvad, ...) that aren't installed in the SDK dev env — don't type-check them.
+exclude = ["examples", "**/node_modules", "**/__pycache__", "**/.*"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

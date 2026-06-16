@@ -41,18 +41,24 @@ Most applications want `OjinSTVClient`. Reach for `OjinClient` only when you're 
 
 ## Installation
 
+With [uv](https://docs.astral.sh/uv/) (recommended):
+
 ```bash
-pip install ojin-client            # low-level OjinClient only
-pip install "ojin-client[stv]"     # + the high-level OjinSTVClient
+uv add "ojin-client[stv]"          # high-level OjinSTVClient (in a uv project)
+uv pip install "ojin-client[stv]"  # ...or into the active environment
 ```
 
-Or with [uv](https://docs.astral.sh/uv/):
+Or with pip:
 
 ```bash
-uv add "ojin-client[stv]"
+pip install "ojin-client[stv]"     # high-level OjinSTVClient
+pip install ojin-client            # low-level OjinClient only
 ```
 
 The `[stv]` extra pulls in `numpy`, `opencv-python-headless`, and `soxr` for the sync math, default JPEG decoder, and resampler. If you inject your own decoder/resampler you can stay on the base install.
+
+> Developing against a local checkout of this repo? Install it editable:
+> `uv pip install -e ".[stv]"` (or `pip install -e ".[stv]"`).
 
 ## Authentication
 
@@ -71,6 +77,16 @@ client = OjinSTVClient(
     api_key=os.environ["OJIN_API_KEY"],
     config_id=os.environ["OJIN_CONFIG_ID"],
 )
+```
+
+Or let the SDK read and validate them for you — `resolve_credentials()` loads an optional `.env` file and raises a `MissingCredentialsError` (with setup instructions) if either value is absent:
+
+```python
+from ojin import resolve_credentials
+from ojin.stv import OjinSTVClient
+
+creds = resolve_credentials()  # reads OJIN_API_KEY + OJIN_CONFIG_ID (and a .env file)
+client = OjinSTVClient(api_key=creds.api_key, config_id=creds.config_id)
 ```
 
 By default the client connects to `wss://models.ojin.ai/realtime`. Override it with the `ws_url` argument if you're pointed at another environment.
