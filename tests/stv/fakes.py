@@ -33,6 +33,7 @@ class FakeOjinClient(IOjinClient):
         self.closed = False
         self._session_parameters = session_parameters or {"persona": "test"}
         self._raise_on_connect = raise_on_connect
+        self.queue_depths: dict[str, int] = {}
 
     async def connect(self) -> None:
         """Mark connected and enqueue a SessionReady message (or fail)."""
@@ -63,6 +64,10 @@ class FakeOjinClient(IOjinClient):
     async def push(self, message: BaseModel) -> None:
         """Test helper: enqueue a server message for the receive loop."""
         await self._queue.put(message)
+
+    def debug_queue_depths(self) -> dict[str, int]:
+        """Return canned receive-pipeline depths for trace-forwarding assertions."""
+        return dict(self.queue_depths)
 
 
 class RecordingTracer:

@@ -30,8 +30,11 @@ class STVVideoFrame:
     """One avatar video frame.
 
     ``rgb`` holds decoded RGB pixels when a decoder is active (``None`` for a
-    passthrough decoder or a decode failure); ``source_bytes`` always carries the
-    raw JPEG from the server so a consumer can decode/forward it itself.
+    passthrough decoder or a decode failure); ``source_bytes`` carries the raw JPEG
+    from the server so a consumer can decode/forward it itself, but is **empty
+    (``b""``) on a held/repeat tick** (no new server frame) — ``rgb`` repeats the
+    last decoded frame on those ticks, so render from ``rgb`` for seamless video and
+    skip empty ``source_bytes`` if you forward the JPEG instead.
 
     ``volume`` is the RMS amplitude of the audio the server bundled with this frame
     (the lip-sync target) — i.e. the amplitude of the audio timeline the video was

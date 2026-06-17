@@ -15,6 +15,7 @@ from ojin.stv.resampler import (
     NumpyLinearResampler,
     Resampler,
     SoxrResampler,
+    SoxrStreamResampler,
     default_resampler,
 )
 from ojin.stv.session_trace import OjinSessionTrace
@@ -45,6 +46,7 @@ __all__ = [
     "STVOutput",
     "STVVideoFrame",
     "SoxrResampler",
+    "SoxrStreamResampler",
     "SyncReport",
     "TickSample",
     "Tracer",

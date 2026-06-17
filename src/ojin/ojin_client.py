@@ -1,12 +1,21 @@
 """WebSocket client for OJIN Speech-To-Video service."""
 
+import array
 import asyncio
 import contextlib
 import json
 import logging
 import socket
+import struct
 import time
 from typing import Dict, Optional, Type, TypeVar
+
+try:  # FIONREAD socket probe is Unix-only; absent on Windows.
+    import fcntl
+    import termios
+except ImportError:  # pragma: no cover - non-Unix platforms
+    fcntl = None  # type: ignore[assignment]
+    termios = None  # type: ignore[assignment]
 
 import websockets
 from pydantic import BaseModel
@@ -50,9 +59,39 @@ def _configure_tcp_nodelay(ws: ClientConnection) -> None:
             sock = transport.get_extra_info("socket")
             if sock is not None:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                logger.debug("TCP_NODELAY enabled on client websocket")
     except Exception as e:
         logger.warning("Failed to set TCP_NODELAY: %s", e)
+
+
+# ``struct tcp_info`` (linux/tcp.h) prefix: 8 x u8 then 24 x u32 (rto..total_retrans).
+# Stable across kernels; later u64 fields move by version so we don't read them. Lets us
+# see the *receive* side of the proxy->client TCP connection from inside the client
+# (e.g. WSL2): RTT, loss/retransmits, and the receive-window estimate the client offers.
+_TCP_INFO_FMT = "<8B24I"
+_TCP_INFO_LEN = struct.calcsize(_TCP_INFO_FMT)  # 104 bytes
+_TCP_INFO_FIELDS = {
+    "tcp_retransmits": 2,  # u8: hard retransmit count
+    "tcp_rtt_us": 23,  # smoothed RTT to the proxy (microseconds)
+    "tcp_rttvar_us": 24,  # RTT variance (microseconds)
+    "tcp_snd_cwnd": 26,  # send congestion window (MSS units)
+    "tcp_rcv_space": 30,  # receive-window estimate this end advertises (bytes)
+    "tcp_retrans_total": 31,  # cumulative segment retransmissions
+}
+
+
+def _read_tcp_info(sock: socket.socket) -> dict[str, int]:
+    """Return selected ``tcp_info`` fields for ``sock`` (``{}`` if unavailable)."""
+    tcp_info_opt = getattr(socket, "TCP_INFO", None)
+    if tcp_info_opt is None:
+        return {}
+    try:
+        raw = sock.getsockopt(socket.IPPROTO_TCP, tcp_info_opt, _TCP_INFO_LEN)
+        if len(raw) < _TCP_INFO_LEN:
+            return {}
+        t = struct.unpack(_TCP_INFO_FMT, raw[:_TCP_INFO_LEN])
+        return {name: int(t[idx]) for name, idx in _TCP_INFO_FIELDS.items()}
+    except Exception:
+        return {}
 
 
 class OjinClient(IOjinClient):
@@ -147,7 +186,6 @@ class OjinClient(IOjinClient):
                 self._process_messages_task = asyncio.create_task(
                     self._process_client_messages()
                 )
-                logger.info("Successfully connected to OJIN STV service")
                 return
             except WebSocketException as e:  # noqa: PERF203
                 last_error = e
@@ -191,8 +229,6 @@ class OjinClient(IOjinClient):
                 await self._receive_task
             self._receive_task = None
 
-        logger.info("Disconnected from OJIN STV service")
-
     async def _receive_server_messages(self) -> None:
         """Continuously receive and process incoming messages from the server."""
         if not self._ws:
@@ -227,16 +263,11 @@ class OjinClient(IOjinClient):
                             interaction_server_response
                         )
                     )
-                    logger.debug(
-                        "Received InteractionResponse for id %s",
-                        interaction_response.interaction_id,
-                    )
 
                     if (
                         interaction_response.interaction_id
                         != self._active_interaction_id
                     ):
-                        logger.debug("Interaction id changed.")
                         self._active_interaction_id = (
                             interaction_response.interaction_id
                         )
@@ -334,8 +365,6 @@ class OjinClient(IOjinClient):
                 if isinstance(msg, OjinSessionReadyPing):
                     # Discard session pings
                     pass
-
-                logger.info("Received message: %s", msg)
             else:
                 logger.warning("Unknown message type: %s", msg_type)
 
@@ -371,8 +400,6 @@ class OjinClient(IOjinClient):
             raise ConnectionError("Inference Server is not ready to receive messages")
 
         if isinstance(message, OjinCancelInteractionMessage):
-            logger.info("Interrupt")
-
             self._cancelled = True
             cancel_input = CancelInteractionMessage(payload=message.to_proxy_message())
 
@@ -388,7 +415,6 @@ class OjinClient(IOjinClient):
             message,
             (OjinAudioInputMessage, OjinTextInputMessage, OjinEndInteractionMessage),
         ):
-            logger.info("InteractionMessage")
             await self._pending_client_messages_queue.put(message)
             return
 
@@ -411,7 +437,6 @@ class OjinClient(IOjinClient):
                 continue
 
             if self._ws is None:
-                logger.debug("[_process_messages:] no websocket connection.")
                 await asyncio.sleep(1.0)
                 continue
 
@@ -422,11 +447,6 @@ class OjinClient(IOjinClient):
                     message.audio_int16_bytes[i : i + max_chunk_size]
                     for i in range(0, len(message.audio_int16_bytes), max_chunk_size)
                 ]
-                logger.info(
-                    "Split audio into %d chunks of max %d bytes",
-                    len(audio_chunks),
-                    max_chunk_size,
-                )
 
                 # NOTE(mouad): make sure we handle the case where the input is empty
                 if len(audio_chunks) == 0:
@@ -468,3 +488,68 @@ class OjinClient(IOjinClient):
     def is_connected(self) -> bool:
         """Check if the client is connected to the WebSocket."""
         return self._running and self._ws is not None and self._ws.open
+
+    def debug_queue_depths(self) -> dict[str, int]:
+        """Best-effort receive-pipeline depth gauges (diagnostic only).
+
+        Returns the depth of each buffering stage this client owns so a tracer can
+        localize where frames back up between the wire and the consumer. Every probe
+        is independently guarded: a websockets-internals change, a closed socket, or
+        a non-Unix platform yields a missing key rather than an exception, so this is
+        safe to call from a hot trace path.
+
+        The keys, when present, are:
+
+        - ``sock_bytes``: bytes ACKed by TCP but not yet read by us (kernel recv
+          buffer, via ``FIONREAD``). Grows when the event loop can't read fast
+          enough — e.g. starved by the playback busy-wait.
+        - ``ws_frames``: frames assembled by ``websockets`` but not yet consumed by
+          the ``async for`` receive loop. Capped at ``max_queue`` (default 16)
+          before read-backpressure pauses the wire.
+        - ``ws_paused``: ``1`` when ``websockets`` has paused reading (the cap was
+          hit and TCP backpressure is engaged), else ``0``.
+        - ``server_msgs``: parsed responses sitting in the (unbounded) queue awaiting
+          :meth:`receive_message`. Grows when downstream consumption (decode/
+          playback) lags — the absorber that hides backpressure upstream.
+        - ``tcp_rtt_us`` / ``tcp_rttvar_us`` / ``tcp_retrans_total`` /
+          ``tcp_snd_cwnd`` / ``tcp_rcv_space``: TCP path conditions (from
+          ``TCP_INFO``) on the client end of the proxy→client connection. High
+          ``tcp_rtt_us``/``tcp_rttvar_us`` or a climbing ``tcp_retrans_total``
+          point to a lossy/throttled local path (e.g. WSL2 NAT / WAN) rather
+          than the proxy or server. Linux-only; absent elsewhere.
+
+        Returns:
+            Mapping of gauge name to depth; a key is present only when readable.
+
+        """
+        depths: dict[str, int] = {}
+        ws = self._ws
+        if ws is not None:
+            with contextlib.suppress(Exception):
+                # websockets' asyncio Assembler buffers frames in a custom SimpleQueue
+                # that supports len() but not qsize(); the stdlib queue.SimpleQueue is
+                # the reverse. Try len() first, fall back to qsize().
+                frames = ws.recv_messages.frames
+                try:
+                    depths["ws_frames"] = len(frames)
+                except TypeError:
+                    depths["ws_frames"] = frames.qsize()  # pyright: ignore[reportAttributeAccessIssue]
+            with contextlib.suppress(Exception):
+                depths["ws_paused"] = int(ws.recv_messages.paused)
+            with contextlib.suppress(Exception):
+                transport = ws.transport
+                sock = transport.get_extra_info("socket") if transport else None
+                if sock is not None:
+                    if fcntl is not None and termios is not None:
+                        buf = array.array("i", [0])
+                        fcntl.ioctl(sock.fileno(), termios.FIONREAD, buf)
+                        depths["sock_bytes"] = buf[0]
+                    # TCP_INFO on the client end of the proxy->client conn:
+                    # surfaces the *receive*-side path conditions (RTT/loss/
+                    # window) so a sub-25fps delivery can be attributed to the
+                    # local network (e.g. WSL2 NAT) vs the proxy. Empty on
+                    # non-Linux / if the option is unavailable.
+                    depths.update(_read_tcp_info(sock))
+        with contextlib.suppress(Exception):
+            depths["server_msgs"] = self._available_response_messages_queue.qsize()
+        return depths
