@@ -116,6 +116,11 @@ class OjinSTVClient:
         self._waiting_for_first_tts = False
         self._last_audio_shape = (OJIN_PERSONA_SAMPLE_RATE, 1)
         self._last_played_rgb: Optional[bytes] = None
+        # Barge-in in flight: set when a cancel is sent, cleared when the server's
+        # first idle/fade-out frame acknowledges it. While set, further interrupts
+        # are dropped so a re-fire (e.g. VAD flap, or a new turn that swapped in
+        # before the cancel landed) can't stack a second cancel on the server.
+        self._interruption_ongoing = False
 
         # Per-tick trace bookkeeping (only touched when a real tracer is injected,
         # so a NullTracer session pays nothing). Mirrors OjinVideoService.
@@ -327,8 +332,17 @@ class OjinSTVClient:
         await self.send_tts_audio(pcm, sample_rate, num_channels)
 
     async def interrupt(self) -> None:
-        """Barge-in: fade the current turn and cancel it server-side if playing."""
+        """Barge-in: fade the current turn and cancel it server-side if playing.
+
+        No-op while an interruption is already in flight: the window stays open from
+        the cancel until the server's first idle/fade-out frame acknowledges it (see
+        :meth:`_on_interaction_response`), so a re-fire can't stack a second cancel.
+        """
+        if self._interruption_ongoing:
+            self._tracer.instant("interruption", "interrupt_suppressed")
+            return
         if self._synchronizer.interrupt():
+            self._interruption_ongoing = True
             await self._client.send_message(OjinCancelInteractionMessage())
             self._tr_interrupt_start = self._tracer.mark()
             self._tracer.instant("interruption", "cancel_sent")
@@ -409,6 +423,14 @@ class OjinSTVClient:
             args={"frame_type": frame_type, "volume": volume},
         )
         self._tracer.counter("recv_frame_type", frame_type)
+        # End the barge-in window on the first idle/fade-out frame after a cancel —
+        # the server's acknowledgement that the interruption took effect. Re-enables
+        # interrupt() for the next turn.
+        if self._interruption_ongoing and (
+            video_frame.is_silence() or video_frame.is_fade_out()
+        ):
+            self._interruption_ongoing = False
+            self._tracer.instant("interruption", "interrupt_ended")
         # Close the cancel→new-turn span on the first new-turn frame after barge-in.
         if (
             frame_type == FrameType.START_OF_SPEECH
@@ -583,6 +605,53 @@ class OjinSTVClient:
         tr.counter("loop_lag_ms", round(max(0.0, lag_ms), 1))
         work_ms = (time.perf_counter() - tick_start) * 1000.0
         tr.counter("tick_work_ms", round(work_ms, 1))
+        self._trace_pipeline_depths(tr)
+
+    def _trace_pipeline_depths(self, tr: Tracer) -> None:
+        """Emit receive-pipeline depth gauges to localize where frames back up.
+
+        When the fixed-25fps synchronizer starves (repeated frames / lipsync drift),
+        exactly one stage is the bottleneck. These counters, read upstream→downstream,
+        point straight at it:
+
+        - ``recv_sock_bytes`` grows → the event loop can't read the socket fast enough
+          (e.g. starved by the playback busy-wait); TCP is delivering but we're behind.
+        - ``recv_ws_frames`` near 16 / ``recv_ws_paused`` = 1 → websockets read-
+          backpressure engaged; the ``async for`` receive loop is the bottleneck.
+        - ``recv_server_msgs`` grows → parsing keeps up but downstream consumption
+          (decode/playback) lags; this unbounded queue is what hides upstream
+          backpressure (why the proxy still egresses a steady 25fps).
+        - ``recv_decode_in`` grows → the cv2 decode worker can't keep up.
+        - ``recv_decode_out`` grows → the synchronizer drain is behind (rare; it drains
+          fully each tick).
+        - all ≈ 0 while frames still arrive < 25fps → frames simply aren't being
+          delivered faster (upstream network/proxy), not a client-side backlog.
+
+        The final stage, the synchronizer deque, is the pre-existing
+        ``pending_video_frames`` counter.
+
+        The ``tcp_*`` gauges (RTT/loss/window on the client end of the proxy→client TCP
+        connection) further split that last case: a steady < 25fps with all queues ≈ 0
+        but climbing ``tcp_retrans_total`` or high/jittery ``tcp_rtt_us`` indicates the
+        *local* path (e.g. WSL2 NAT / WAN) is throttling delivery, not the proxy/server.
+        """
+        probe = getattr(self._client, "debug_queue_depths", None)
+        depths = probe() if probe is not None else {}
+        for name in ("sock_bytes", "ws_frames", "ws_paused", "server_msgs"):
+            if name in depths:
+                tr.counter(f"recv_{name}", depths[name])
+        for name in (
+            "tcp_rtt_us",
+            "tcp_rttvar_us",
+            "tcp_retrans_total",
+            "tcp_retransmits",
+            "tcp_snd_cwnd",
+            "tcp_rcv_space",
+        ):
+            if name in depths:
+                tr.counter(name, depths[name])
+        tr.counter("recv_decode_in", self._decode_in.qsize())
+        tr.counter("recv_decode_out", self._decode_out.qsize())
 
     async def _emit_video(self, result, pts: int) -> None:
         """Emit a video frame for this tick (new, or a repeat of the last RGB)."""

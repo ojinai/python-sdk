@@ -46,7 +46,7 @@ class VadSegmenter:
     def __init__(
         self,
         rate: int = RATE,
-        aggressiveness: int = 2,
+        aggressiveness: int = 3,
         frame_ms: int = 20,
         start_frames: int = 3,
         end_frames: int = 50,
