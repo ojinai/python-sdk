@@ -15,6 +15,10 @@ on:
   push:
     branches: [main]
     paths: ["pyproject.toml"]
+  # Manual re-publish of the version currently on main — e.g. after fixing a
+  # failed verify, when the auto-trigger won't re-fire because the version is
+  # unchanged. Forces build+publish of whatever version main is at.
+  workflow_dispatch:
 
 concurrency:
   group: release
@@ -35,9 +39,13 @@ jobs:
         with:
           python-version: "3.12"
       - id: v
+        env:
+          # Manual (workflow_dispatch) runs force a publish of the current main
+          # version; pushes only publish when the version actually changed.
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && '--force' || '' }}
         run: |
           python .ci/release_check.py extract_current_version
-          python .ci/release_check.py check_build
+          python .ci/release_check.py check_build $FORCE
 
   # 2) Run the same checks reviewers run; never publish a red main.
   #    Skipped (and so is everything after it) when the version didn't change.
@@ -49,8 +57,11 @@ jobs:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v5
       - run: uv sync --all-extras
-      - run: uv run ruff format --check .
-      - run: uv run ruff check .
+      # Scope to the shipped package: examples/ are standalone teaching projects
+      # with their own requirements.txt and aren't part of the ojin-client wheel,
+      # so their lint/format debt must not block a library release.
+      - run: uv run ruff format --check src tests
+      - run: uv run ruff check src tests
       - run: uv run pytest tests/stv # hermetic unit suite; skips live integration
       # Advisory only: src/ojin carries known pyright type debt (untyped params,
       # missing super().__init__ calls). Surfaced here for cleanup, but it does
