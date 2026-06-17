@@ -605,6 +605,38 @@ class OjinSTVClient:
         tr.counter("loop_lag_ms", round(max(0.0, lag_ms), 1))
         work_ms = (time.perf_counter() - tick_start) * 1000.0
         tr.counter("tick_work_ms", round(work_ms, 1))
+        self._trace_pipeline_depths(tr)
+
+    def _trace_pipeline_depths(self, tr: Tracer) -> None:
+        """Emit receive-pipeline depth gauges to localize where frames back up.
+
+        When the fixed-25fps synchronizer starves (repeated frames / lipsync drift),
+        exactly one stage is the bottleneck. These counters, read upstream→downstream,
+        point straight at it:
+
+        - ``recv_sock_bytes`` grows → the event loop can't read the socket fast enough
+          (e.g. starved by the playback busy-wait); TCP is delivering but we're behind.
+        - ``recv_ws_frames`` near 16 / ``recv_ws_paused`` = 1 → websockets read-
+          backpressure engaged; the ``async for`` receive loop is the bottleneck.
+        - ``recv_server_msgs`` grows → parsing keeps up but downstream consumption
+          (decode/playback) lags; this unbounded queue is what hides upstream
+          backpressure (why the proxy still egresses a steady 25fps).
+        - ``recv_decode_in`` grows → the cv2 decode worker can't keep up.
+        - ``recv_decode_out`` grows → the synchronizer drain is behind (rare; it drains
+          fully each tick).
+        - all ≈ 0 while frames still arrive < 25fps → frames simply aren't being
+          delivered faster (upstream network/proxy), not a client-side backlog.
+
+        The final stage, the synchronizer deque, is the pre-existing
+        ``pending_video_frames`` counter.
+        """
+        probe = getattr(self._client, "debug_queue_depths", None)
+        depths = probe() if probe is not None else {}
+        for name in ("sock_bytes", "ws_frames", "ws_paused", "server_msgs"):
+            if name in depths:
+                tr.counter(f"recv_{name}", depths[name])
+        tr.counter("recv_decode_in", self._decode_in.qsize())
+        tr.counter("recv_decode_out", self._decode_out.qsize())
 
     async def _emit_video(self, result, pts: int) -> None:
         """Emit a video frame for this tick (new, or a repeat of the last RGB)."""

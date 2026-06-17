@@ -359,8 +359,38 @@ def test_emit_tick_records_rich_counters_and_lanes() -> None:
             "idle_backlog_skips_total",
             "loop_lag_ms",
             "tick_work_ms",
+            "recv_decode_in",
+            "recv_decode_out",
         } <= counters
         assert any(lane == "play_audio" for (lane, _n, _a) in tr.instants)
+
+    asyncio.run(run())
+
+
+def test_emit_tick_forwards_client_pipeline_depths() -> None:
+    """Receive-pipeline depth gauges from the client are emitted with a recv_ prefix."""
+
+    async def run() -> None:
+        fc = FakeOjinClient()
+        fc.queue_depths = {"ws_frames": 5, "ws_paused": 1, "server_msgs": 3}
+        tr = RecordingTracer()
+        c = OjinSTVClient(
+            client=fc,
+            output=ListOutput(),
+            tracer=tr,
+            config=STVConfig(loop_stall_watchdog_ms=0, stall_probe_ms=0),
+        )
+        buf = AudioBuffer(sample_rate=16000)
+        buf.bytes_.extend(b"\x01\x02" * 2000)
+        c._synchronizer.current_buffer = buf
+        await c._emit_tick()
+        depths = dict(tr.counters)
+        assert depths["recv_ws_frames"] == 5
+        assert depths["recv_ws_paused"] == 1
+        assert depths["recv_server_msgs"] == 3
+        # Owned-queue gauges are always present, independent of the client probe.
+        assert "recv_decode_in" in depths
+        assert "recv_decode_out" in depths
 
     asyncio.run(run())
 

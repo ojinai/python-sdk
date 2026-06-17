@@ -1,5 +1,6 @@
 """WebSocket client for OJIN Speech-To-Video service."""
 
+import array
 import asyncio
 import contextlib
 import json
@@ -7,6 +8,13 @@ import logging
 import socket
 import time
 from typing import Dict, Optional, Type, TypeVar
+
+try:  # FIONREAD socket probe is Unix-only; absent on Windows.
+    import fcntl
+    import termios
+except ImportError:  # pragma: no cover - non-Unix platforms
+    fcntl = None  # type: ignore[assignment]
+    termios = None  # type: ignore[assignment]
 
 import websockets
 from pydantic import BaseModel
@@ -448,3 +456,56 @@ class OjinClient(IOjinClient):
     def is_connected(self) -> bool:
         """Check if the client is connected to the WebSocket."""
         return self._running and self._ws is not None and self._ws.open
+
+    def debug_queue_depths(self) -> dict[str, int]:
+        """Best-effort receive-pipeline depth gauges (diagnostic only).
+
+        Returns the depth of each buffering stage this client owns so a tracer can
+        localize where frames back up between the wire and the consumer. Every probe
+        is independently guarded: a websockets-internals change, a closed socket, or
+        a non-Unix platform yields a missing key rather than an exception, so this is
+        safe to call from a hot trace path.
+
+        The keys, when present, are:
+
+        - ``sock_bytes``: bytes ACKed by TCP but not yet read by us (kernel recv
+          buffer, via ``FIONREAD``). Grows when the event loop can't read fast
+          enough — e.g. starved by the playback busy-wait.
+        - ``ws_frames``: frames assembled by ``websockets`` but not yet consumed by
+          the ``async for`` receive loop. Capped at ``max_queue`` (default 16)
+          before read-backpressure pauses the wire.
+        - ``ws_paused``: ``1`` when ``websockets`` has paused reading (the cap was
+          hit and TCP backpressure is engaged), else ``0``.
+        - ``server_msgs``: parsed responses sitting in the (unbounded) queue awaiting
+          :meth:`receive_message`. Grows when downstream consumption (decode/
+          playback) lags — the absorber that hides backpressure upstream.
+
+        Returns:
+            Mapping of gauge name to depth; a key is present only when readable.
+
+        """
+        depths: dict[str, int] = {}
+        ws = self._ws
+        if ws is not None:
+            with contextlib.suppress(Exception):
+                # websockets' asyncio Assembler buffers frames in a custom SimpleQueue
+                # that supports len() but not qsize(); the stdlib queue.SimpleQueue is
+                # the reverse. Try len() first, fall back to qsize().
+                frames = ws.recv_messages.frames
+                try:
+                    depths["ws_frames"] = len(frames)
+                except TypeError:
+                    depths["ws_frames"] = frames.qsize()  # pyright: ignore[reportAttributeAccessIssue]
+            with contextlib.suppress(Exception):
+                depths["ws_paused"] = int(ws.recv_messages.paused)
+            if fcntl is not None and termios is not None:
+                with contextlib.suppress(Exception):
+                    transport = ws.transport
+                    sock = transport.get_extra_info("socket") if transport else None
+                    if sock is not None:
+                        buf = array.array("i", [0])
+                        fcntl.ioctl(sock.fileno(), termios.FIONREAD, buf)
+                        depths["sock_bytes"] = buf[0]
+        with contextlib.suppress(Exception):
+            depths["server_msgs"] = self._available_response_messages_queue.qsize()
+        return depths
