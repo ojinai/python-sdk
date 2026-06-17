@@ -1,6 +1,6 @@
 [project]
 name = "ojin-client"
-version = "0.7.0"
+version = "0.7.1"
 description = "Ojin platform services"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -78,17 +78,26 @@ known-first-party = ["ojin"]
 
 [tool.ruff.lint.per-file-ignores]
 "__init__.py" = ["F401", "D104"]
-"**/{tests,docs,tools}/*" = ["E402", "ARG001", "PLR2004", "ARG002", "E722"]
+# Test/docs/tools files (incl. nested dirs like tests/stv, tests/integration) get a
+# relaxed ruleset: lazy/guarded imports (PLC0415, e.g. multiprocessing entry points)
+# and the test-only allowances below are fine here.
+"**/{tests,docs,tools}/**" = ["E402", "ARG001", "PLR2004", "ARG002", "E722", "PLC0415"]
 # Examples are standalone teaching projects: allow long instructional help strings
 # (E501), literal CLI indices (PLR2004), and the tiny .env-parser loop var (PLW2901).
 "examples/**/*.py" = ["E501", "PLR2004", "PLW2901"]
 
 [tool.pyright]
+# Resolve imports (numpy / cv2 / soxr / ...) from the uv-managed virtualenv, so the
+# CLI (`uvx pyright`) and IDEs all type-check against the same installed deps.
+venvPath = "."
+venv = ".venv"
 reportMissingSuperCall = "error"
 reportMissingParameterType = "error"
 # Examples are standalone projects with their own requirements.txt (fastapi,
-# webrtcvad, ...) that aren't installed in the SDK dev env — don't type-check them.
-exclude = ["examples", "**/node_modules", "**/__pycache__", "**/.*"]
+# webrtcvad, ...) that aren't installed in the SDK dev env. Tests use untyped
+# pytest fixtures (monkeypatch / tmp_path) by design — type-check the shipped
+# package (src/ojin), not these.
+exclude = ["examples", "tests", "**/node_modules", "**/__pycache__", "**/.*"]
 
 [tool.pytest.ini_options]
 minversion = "8.0"

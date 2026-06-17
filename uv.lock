@@ -825,7 +825,7 @@ wheels = [
 
 [[package]]
 name = "ojin-client"
-version = "0.6.7"
+version = "0.7.1"
 source = { editable = "." }
 dependencies = [
     { name = "async-lru" },

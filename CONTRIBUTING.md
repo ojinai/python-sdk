@@ -58,7 +58,7 @@ tests/                        # pytest suite
 
 ## Checks: run these before you push
 
-All four must pass. There's no PR CI yet, so run them locally before every push — they're what reviewers will run (and what the release pipeline re-runs before it publishes).
+Run these locally before every push — there's no PR CI yet, and they're what reviewers will run. The release pipeline **gates publishing on formatting, lint, and tests**. `pyright` runs there too but is **advisory** for now: `src/ojin` carries known type debt, so it's a cleanup target rather than a hard gate — expect it to report errors until that's worked through.
 
 ```bash
 uv run ruff format --check .   # formatting
