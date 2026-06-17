@@ -20,6 +20,12 @@ would produce, so nothing downstream knows the difference:
     UserStartedSpeakingFrame
     TranscriptionFrame(text=<canned>, finalized=True)
     UserStoppedSpeakingFrame   # ExternalUserTurnStopStrategy finalizes -> LLM runs
+
+The driver is fully event-driven off ``BotStoppedSpeakingFrame``: it fires the next turn
+each time the bot finishes speaking. The very first turn is bootstrapped the same way —
+``OjinAvatarService`` emits a ``BotStoppedSpeakingFrame`` upstream once its STV session is
+*ready*, so the opening turn can never race ahead of the avatar and get its audio dropped
+(which would stall the whole loop). No start-up timer, no race.
 """
 
 from __future__ import annotations
@@ -63,15 +69,15 @@ DEFAULT_UTTERANCES = [
 class AutonomousUserDriver(FrameProcessor):
     """Synthesize the user side of the conversation so the bot self-converses.
 
-    Place first in the pipeline. Bootstraps the first turn shortly after start, then
-    fires the next synthetic user turn after each ``BotStoppedSpeakingFrame``.
+    Place first in the pipeline. Fully event-driven: fires the next synthetic user turn
+    after each ``BotStoppedSpeakingFrame``. The first turn is bootstrapped by the
+    avatar's session-ready ``BotStoppedSpeakingFrame`` (see module docstring).
     """
 
     def __init__(
         self,
         *,
         utterances: list[str] | None = None,
-        initial_delay_s: float = 3.0,
         inter_turn_delay_s: float = 0.6,
         max_turns: int | None = None,
     ) -> None:
@@ -80,8 +86,6 @@ class AutonomousUserDriver(FrameProcessor):
         Args:
             utterances: Canned user turns, rotated round-robin. Defaults to
                 :data:`DEFAULT_UTTERANCES`.
-            initial_delay_s: Delay after ``StartFrame`` before the first synthetic
-                turn (lets the transport + avatar connect first).
             inter_turn_delay_s: Pause after the bot stops speaking before the next
                 synthetic turn, so each turn has a clean gap.
             max_turns: Stop driving after this many synthetic turns (``None`` = run
@@ -90,7 +94,6 @@ class AutonomousUserDriver(FrameProcessor):
         """
         super().__init__(name="autonomous-user-driver")
         self._utterances = utterances or DEFAULT_UTTERANCES
-        self._initial_delay_s = initial_delay_s
         self._inter_turn_delay_s = inter_turn_delay_s
         self._max_turns = max_turns
         self._turn_index = 0
@@ -98,14 +101,12 @@ class AutonomousUserDriver(FrameProcessor):
         self._pending: asyncio.Task | None = None
 
     async def process_frame(self, frame: Frame, direction: FrameDirection) -> None:
-        """Pass frames through; bootstrap on Start, drive on each bot-stopped."""
+        """Pass frames through; drive a new turn on each bot-stopped."""
         await super().process_frame(frame, direction)
 
         if isinstance(frame, StartFrame):
-            # Push Start through first, then arm the opening turn.
-            await self.push_frame(frame, direction)
             self._started = True
-            self._schedule_turn(self._initial_delay_s)
+            await self.push_frame(frame, direction)
             return
 
         if isinstance(frame, (EndFrame, CancelFrame)):
@@ -113,9 +114,10 @@ class AutonomousUserDriver(FrameProcessor):
             await self.push_frame(frame, direction)
             return
 
-        # Each completed bot turn arms the next synthetic user turn. BotStopped is
-        # pushed both up- and downstream by the output transport; react once and only
-        # when nothing is already queued (so a double-fire can't stack two turns).
+        # Each completed bot turn arms the next synthetic user turn — including the
+        # first, bootstrapped by the avatar's session-ready BotStopped. BotStopped is
+        # pushed both up- and downstream; react once and only when nothing is already
+        # queued (so a double-fire can't stack two turns).
         if isinstance(frame, BotStoppedSpeakingFrame):
             await self.push_frame(frame, direction)
             if self._started and (self._pending is None or self._pending.done()):

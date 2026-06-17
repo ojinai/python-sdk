@@ -51,7 +51,8 @@ speak. With `-t daily` it runs fully headless (the bot joins the room itself); w
 `-t webrtc` open the page to watch (the page's mic is ignored).
 
 Tuning knobs live on `AutonomousUserDriver(...)` in [`bot.py`](./bot.py): `utterances`,
-`initial_delay_s`, `inter_turn_delay_s`, and `max_turns` (default: run forever).
+`inter_turn_delay_s`, and `max_turns` (default: run forever). The first turn is gated on
+the avatar's STV session-ready signal, so it never races startup.
 
 ## Reading the trace
 

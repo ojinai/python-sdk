@@ -24,6 +24,7 @@ import uuid
 from datetime import datetime, timezone
 
 from pipecat.frames.frames import (
+    BotStoppedSpeakingFrame,
     CancelFrame,
     EndFrame,
     Frame,
@@ -147,6 +148,16 @@ class OjinAvatarService(FrameProcessor):
         @self._stv.on(STVEvent.BOT_STARTED_SPEAKING)
         async def _started(**_: object) -> None:
             await self.stop_ttfb_metrics()  # first avatar frame => stop TTFB timer
+
+        @self._stv.on(STVEvent.SESSION_READY)
+        async def _ready(**_: object) -> None:
+            # Bootstrap signal for the autonomous driver (05-autonomous-bot): the STV
+            # session is now ready, so the avatar can accept TTS audio. Emit an
+            # "idle & ready" BotStoppedSpeakingFrame upstream so the driver fires the
+            # opening turn only now — never racing ahead of session-ready (which would
+            # drop the first turn's audio and stall the loop). Harmless with a human
+            # driver: nothing upstream reacts to a bot-stopped before any speech.
+            await self.push_frame(BotStoppedSpeakingFrame(), FrameDirection.UPSTREAM)
 
         @self._stv.on(STVEvent.ERROR)
         async def _error(message: str = "", fatal: bool = False, **_: object) -> None:
