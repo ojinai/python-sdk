@@ -629,12 +629,27 @@ class OjinSTVClient:
 
         The final stage, the synchronizer deque, is the pre-existing
         ``pending_video_frames`` counter.
+
+        The ``tcp_*`` gauges (RTT/loss/window on the client end of the proxy→client TCP
+        connection) further split that last case: a steady < 25fps with all queues ≈ 0
+        but climbing ``tcp_retrans_total`` or high/jittery ``tcp_rtt_us`` indicates the
+        *local* path (e.g. WSL2 NAT / WAN) is throttling delivery, not the proxy/server.
         """
         probe = getattr(self._client, "debug_queue_depths", None)
         depths = probe() if probe is not None else {}
         for name in ("sock_bytes", "ws_frames", "ws_paused", "server_msgs"):
             if name in depths:
                 tr.counter(f"recv_{name}", depths[name])
+        for name in (
+            "tcp_rtt_us",
+            "tcp_rttvar_us",
+            "tcp_retrans_total",
+            "tcp_retransmits",
+            "tcp_snd_cwnd",
+            "tcp_rcv_space",
+        ):
+            if name in depths:
+                tr.counter(name, depths[name])
         tr.counter("recv_decode_in", self._decode_in.qsize())
         tr.counter("recv_decode_out", self._decode_out.qsize())
 

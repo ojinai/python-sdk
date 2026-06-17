@@ -6,6 +6,7 @@ import contextlib
 import json
 import logging
 import socket
+import struct
 import time
 from typing import Dict, Optional, Type, TypeVar
 
@@ -60,6 +61,37 @@ def _configure_tcp_nodelay(ws: ClientConnection) -> None:
                 sock.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
     except Exception as e:
         logger.warning("Failed to set TCP_NODELAY: %s", e)
+
+
+# ``struct tcp_info`` (linux/tcp.h) prefix: 8 x u8 then 24 x u32 (rto..total_retrans).
+# Stable across kernels; later u64 fields move by version so we don't read them. Lets us
+# see the *receive* side of the proxy->client TCP connection from inside the client
+# (e.g. WSL2): RTT, loss/retransmits, and the receive-window estimate the client offers.
+_TCP_INFO_FMT = "<8B24I"
+_TCP_INFO_LEN = struct.calcsize(_TCP_INFO_FMT)  # 104 bytes
+_TCP_INFO_FIELDS = {
+    "tcp_retransmits": 2,  # u8: hard retransmit count
+    "tcp_rtt_us": 23,  # smoothed RTT to the proxy (microseconds)
+    "tcp_rttvar_us": 24,  # RTT variance (microseconds)
+    "tcp_snd_cwnd": 26,  # send congestion window (MSS units)
+    "tcp_rcv_space": 30,  # receive-window estimate this end advertises (bytes)
+    "tcp_retrans_total": 31,  # cumulative segment retransmissions
+}
+
+
+def _read_tcp_info(sock: socket.socket) -> dict[str, int]:
+    """Return selected ``tcp_info`` fields for ``sock`` (``{}`` if unavailable)."""
+    tcp_info_opt = getattr(socket, "TCP_INFO", None)
+    if tcp_info_opt is None:
+        return {}
+    try:
+        raw = sock.getsockopt(socket.IPPROTO_TCP, tcp_info_opt, _TCP_INFO_LEN)
+        if len(raw) < _TCP_INFO_LEN:
+            return {}
+        t = struct.unpack(_TCP_INFO_FMT, raw[:_TCP_INFO_LEN])
+        return {name: int(t[idx]) for name, idx in _TCP_INFO_FIELDS.items()}
+    except Exception:
+        return {}
 
 
 class OjinClient(IOjinClient):
@@ -479,6 +511,12 @@ class OjinClient(IOjinClient):
         - ``server_msgs``: parsed responses sitting in the (unbounded) queue awaiting
           :meth:`receive_message`. Grows when downstream consumption (decode/
           playback) lags — the absorber that hides backpressure upstream.
+        - ``tcp_rtt_us`` / ``tcp_rttvar_us`` / ``tcp_retrans_total`` /
+          ``tcp_snd_cwnd`` / ``tcp_rcv_space``: TCP path conditions (from
+          ``TCP_INFO``) on the client end of the proxy→client connection. High
+          ``tcp_rtt_us``/``tcp_rttvar_us`` or a climbing ``tcp_retrans_total``
+          point to a lossy/throttled local path (e.g. WSL2 NAT / WAN) rather
+          than the proxy or server. Linux-only; absent elsewhere.
 
         Returns:
             Mapping of gauge name to depth; a key is present only when readable.
@@ -498,14 +536,20 @@ class OjinClient(IOjinClient):
                     depths["ws_frames"] = frames.qsize()  # pyright: ignore[reportAttributeAccessIssue]
             with contextlib.suppress(Exception):
                 depths["ws_paused"] = int(ws.recv_messages.paused)
-            if fcntl is not None and termios is not None:
-                with contextlib.suppress(Exception):
-                    transport = ws.transport
-                    sock = transport.get_extra_info("socket") if transport else None
-                    if sock is not None:
+            with contextlib.suppress(Exception):
+                transport = ws.transport
+                sock = transport.get_extra_info("socket") if transport else None
+                if sock is not None:
+                    if fcntl is not None and termios is not None:
                         buf = array.array("i", [0])
                         fcntl.ioctl(sock.fileno(), termios.FIONREAD, buf)
                         depths["sock_bytes"] = buf[0]
+                    # TCP_INFO on the client end of the proxy->client conn:
+                    # surfaces the *receive*-side path conditions (RTT/loss/
+                    # window) so a sub-25fps delivery can be attributed to the
+                    # local network (e.g. WSL2 NAT) vs the proxy. Empty on
+                    # non-Linux / if the option is unavailable.
+                    depths.update(_read_tcp_info(sock))
         with contextlib.suppress(Exception):
             depths["server_msgs"] = self._available_response_messages_queue.qsize()
         return depths
