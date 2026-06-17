@@ -58,7 +58,7 @@ tests/                        # pytest suite
 
 ## Checks: run these before you push
 
-All four must pass. There is no CI yet, so run them locally before every push — they're what reviewers will run.
+All four must pass. There's no PR CI yet, so run them locally before every push — they're what reviewers will run (and what the release pipeline re-runs before it publishes).
 
 ```bash
 uv run ruff format --check .   # formatting
@@ -139,18 +139,21 @@ BREAKING CHANGE: OjinClient now takes `config_id` instead of `avatar_config_id`.
 
 ## Release process
 
-Releases publish the `ojin-client` package to PyPI and are gated on a version bump.
+Releases are **automated**. Publishing `ojin-client` to PyPI is gated on a version bump and runs from GitHub Actions ([`.github/workflows/release.yml`](.github/workflows/release.yml)) on every push to `main`. To cut a release:
 
 1. Bump `version` in `pyproject.toml` (follow the SemVer rules above).
 2. Move the `CHANGELOG.md` entries under the new version with the date.
-3. Merge to `main` and tag the release: `git tag vX.Y.Z && git push --tags`.
-4. Build and publish:
-   ```bash
-   uv run python -m build      # produces sdist + wheel in dist/
-   uv run twine upload dist/*  # publish to PyPI
-   ```
+3. Open a PR and merge to `main` (we squash-merge).
 
-> Publishing is **manual today** — there is no release automation, so the `build` + `twine upload` steps above are required. (If CI takes over publishing later, this section will be updated.)
+That's the whole manual part. On merge, the pipeline:
+
+- detects whether `pyproject.toml`'s version changed vs the previous commit ([`.ci/release_check.py`](.ci/release_check.py)) — if it didn't, the run stops and nothing is published;
+- runs the full check suite (format, lint, type-check, unit tests) so a red `main` never ships;
+- builds the sdist + wheel (`uv build`);
+- publishes to PyPI via [Trusted Publishing](https://docs.pypi.org/trusted-publishers/) (OIDC — **no API tokens are stored**); and
+- tags the release `vX.Y.Z` and pushes the tag.
+
+Because publishing keys off the version, a normal feature merge that doesn't touch `version` publishes nothing — it's safe. PyPI also rejects re-uploading an existing version, so each release must bump to a **new** version.
 
 ## Reporting bugs & requesting features
 

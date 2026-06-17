@@ -66,6 +66,8 @@ dev = [
 lint.select = ["E", "F", "D", "I", "N", "B", "C4", "ARG", "SIM", "TID", "TD", "PL", "RUF", "PERF", "ERA", "FAST", "G"]
 lint.ignore = ["D203", "D213"]
 target-version = "py310"
+# CI helper scripts are not shipped product code — keep them out of the SDK linter.
+extend-exclude = [".ci"]
 
 [tool.ruff.format]
 docstring-code-format=true
