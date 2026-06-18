@@ -49,28 +49,13 @@ jobs:
 
   # 2) Run the same checks reviewers run; never publish a red main.
   #    Skipped (and so is everything after it) when the version didn't change.
+  #    Calls the shared reusable workflow so this gate and the PR check (pr-check.yml)
+  #    run identical steps and can never drift — a green PR guarantees a green release
+  #    verify. See .github/workflows/ci-verify.yml.
   verify:
     needs: check
     if: needs.check.outputs.should_publish == 'true'
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
-      - run: uv sync --all-extras
-      # Scope to the shipped package: examples/ are standalone teaching projects
-      # with their own requirements.txt and aren't part of the ojin-client wheel,
-      # so their lint/format debt must not block a library release.
-      - run: uv run ruff format --check src tests
-      - run: uv run ruff check src tests
-      - run: uv run pytest tests/stv # hermetic unit suite; skips live integration
-      # Advisory only: src/ojin carries known pyright type debt (untyped params,
-      # missing super().__init__ calls). Surfaced here for cleanup, but it does
-      # NOT block publishing — releases have never gated on pyright.
-      - name: Type-check (advisory, non-blocking)
-        continue-on-error: true
-        run: |
-          source .venv/bin/activate
-          uvx pyright
+    uses: ./.github/workflows/ci-verify.yml
 
   # 3) Build sdist + wheel with uv, hand them to the publish job as an artifact.
   build:
