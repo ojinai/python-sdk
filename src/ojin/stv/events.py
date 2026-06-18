@@ -35,6 +35,7 @@ class EventEmitter:
 
     def __init__(self) -> None:
         """Create an emitter with no listeners."""
+        super().__init__()
         self._listeners: Dict[STVEvent, List[EventCallback]] = {}
 
     def on(self, event: STVEvent) -> Callable[[EventCallback], EventCallback]:
@@ -56,7 +57,7 @@ class EventEmitter:
         if handlers and cb in handlers:
             handlers.remove(cb)
 
-    async def emit(self, event: STVEvent, **kwargs) -> None:
+    async def emit(self, event: STVEvent, **kwargs: object) -> None:
         """Call every handler for ``event``; await coroutines; isolate failures."""
         for cb in list(self._listeners.get(event, [])):
             await self._dispatch(event, cb, kwargs)

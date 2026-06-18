@@ -25,6 +25,7 @@ from websockets.exceptions import (
     ConnectionClosedOK,
     WebSocketException,
 )
+from websockets.protocol import State
 
 from ojin.entities.interaction_messages import (
     CancelInteractionMessage,
@@ -487,7 +488,7 @@ class OjinClient(IOjinClient):
 
     def is_connected(self) -> bool:
         """Check if the client is connected to the WebSocket."""
-        return self._running and self._ws is not None and self._ws.open
+        return self._running and self._ws is not None and self._ws.state == State.OPEN
 
     def debug_queue_depths(self) -> dict[str, int]:
         """Best-effort receive-pipeline depth gauges (diagnostic only).

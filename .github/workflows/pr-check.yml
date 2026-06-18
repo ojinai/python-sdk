@@ -1,0 +1,53 @@
+name: PR Check
+
+# Runs the CI checks on every pull request to main — everything the release pipeline
+# verifies EXCEPT artifact upload and publish. Two top-level jobs so they surface as
+# two flat checks on the PR:
+#   * "PR Check / verify" — lint, format-check and unit tests (shared ci-verify
+#     composite action, also used by release.yml so the two can't drift)
+#   * "PR Check / build"  — uv build, proving the package builds (sdist + wheel)
+# A green PR check means the branch is ready to merge and the release pipeline's own
+# verify gate will pass too. Per-step logs are in the Actions tab and the PR's Checks
+# panel. Publishing (PyPI) and tagging never run here.
+
+on:
+  pull_request:
+    branches: [main]
+
+# Newer pushes to the same PR cancel in-flight runs.
+concurrency:
+  group: pr-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci-verify
+
+  # Own stage (own check on the PR; mirrors release.yml's build job). Blocking: proves
+  # the package builds so packaging errors — bad pyproject metadata, files missing from
+  # the sdist, build-backend misconfig — surface at PR time, not at release. Builds
+  # nothing for distribution: no artifact upload, no publish; the output is discarded.
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
+
+  # PR-only bug-lint on examples/ — they're standalone teaching projects (own deps,
+  # not in the wheel) and are excluded from verify/release so their style debt can't
+  # block a library release. This catches *real* mistakes without enforcing style or
+  # installing each example's deps: F = pyflakes (undefined names, unused/dup imports),
+  # E9 = syntax errors. Deliberately NOT in release.yml, so a broken example never
+  # blocks a publish. Runs in parallel with verify (no needs). uvx pulls ruff
+  # standalone — fast, and F/E9 are stable rules.
+  examples:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uvx ruff check --select F,E9 examples

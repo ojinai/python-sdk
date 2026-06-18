@@ -37,7 +37,7 @@ class STVOutput(Protocol):
         """Emit one avatar video frame."""
         ...
 
-    def on_event(self, event: STVEvent, **kwargs) -> None:
+    def on_event(self, event: STVEvent, **kwargs: object) -> None:
         """Receive a lifecycle event (optional; default no-op)."""
         ...
 
@@ -52,6 +52,7 @@ class QueueOutput:
 
     def __init__(self, max_video: int = 60) -> None:
         """Create an empty output buffer bounding queued video to ``max_video``."""
+        super().__init__()
         self._max_video = max_video
         self._items: deque[Tuple[str, STVFrame]] = deque()
         self._video_count = 0
@@ -73,7 +74,7 @@ class QueueOutput:
                 self._drop_oldest_video()
             self._cond.notify()
 
-    def on_event(self, event: STVEvent, **kwargs) -> None:
+    def on_event(self, event: STVEvent, **kwargs: object) -> None:
         """Ignore lifecycle events (consumers can subclass to observe them)."""
 
     def _drop_oldest_video(self) -> None:

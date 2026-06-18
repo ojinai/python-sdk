@@ -31,6 +31,8 @@ import time
 from collections import deque
 from typing import AsyncIterator, Callable, Optional
 
+from pydantic import BaseModel
+
 from ojin.entities.interaction_messages import ErrorResponseMessage
 from ojin.ojin_client import OjinClient
 from ojin.ojin_client_messages import (
@@ -94,6 +96,7 @@ class OjinSTVClient:
         :meth:`output_stream`), and a no-op tracer. Emitted video frames carry
         whatever resolution the server sends (see :class:`STVVideoFrame`).
         """
+        super().__init__()
         self._config = config or STVConfig()
 
         self._client: IOjinClient = client or OjinClient(
@@ -229,7 +232,7 @@ class OjinSTVClient:
         await self.start()
         return self
 
-    async def __aexit__(self, *exc) -> None:
+    async def __aexit__(self, *exc: object) -> None:
         """Context-manager exit: :meth:`close`."""
         await self.close()
 
@@ -374,7 +377,7 @@ class OjinSTVClient:
                     "Error handling %s — continuing", type(message).__name__
                 )
 
-    async def _handle_message(self, message) -> None:
+    async def _handle_message(self, message: BaseModel) -> None:
         """Route one server message (session ready / interaction / error)."""
         if isinstance(message, OjinSessionReadyMessage):
             if message.parameters is not None:
@@ -654,7 +657,7 @@ class OjinSTVClient:
         tr.counter("recv_decode_in", self._decode_in.qsize())
         tr.counter("recv_decode_out", self._decode_out.qsize())
 
-    async def _emit_video(self, result, pts: int) -> None:
+    async def _emit_video(self, result: TickResult, pts: int) -> None:
         """Emit a video frame for this tick (new, or a repeat of the last RGB)."""
         vframe = result.video_frame
         rgb = self._last_played_rgb
@@ -709,7 +712,7 @@ class OjinSTVClient:
             )
         )
 
-    async def _emit_audio(self, result, pts: int) -> None:
+    async def _emit_audio(self, result: TickResult, pts: int) -> None:
         """Emit exactly one audio frame this tick (real chunk or silence)."""
         sample_rate, num_channels = self._last_audio_shape
         pcm = result.audio_chunk

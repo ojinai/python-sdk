@@ -17,7 +17,7 @@ import itertools
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, Optional
+from typing import Callable, Deque, Optional
 
 from ojin.ojin_client_messages import FrameType
 from ojin.stv.audio_utils import fade_chunk, rms_int16
@@ -112,7 +112,9 @@ class TickResult:
 class Synchronizer:
     """Owns the audio-buffer queue and the decoded-video deque; steps per tick."""
 
-    def __init__(self, config: STVConfig, clock=time.monotonic) -> None:
+    def __init__(
+        self, config: STVConfig, clock: Callable[[], float] = time.monotonic
+    ) -> None:
         """Create an idle synchronizer bound to ``config``.
 
         Args:
@@ -120,6 +122,7 @@ class Synchronizer:
             clock: monotonic seconds source (injectable for deterministic tests).
 
         """
+        super().__init__()
         self._config = config
         self._clock = clock
         self._frame_duration = 1.0 / config.fps
