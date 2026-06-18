@@ -30,12 +30,6 @@ jobs:
       - run: uv run ruff format --check src tests
       - run: uv run ruff check src tests
       - run: uv run pytest tests/stv # hermetic unit suite; skips live integration
-      # Blocking: prove the package actually builds (sdist + wheel). Catches
-      # packaging errors — bad pyproject metadata, files missing from the sdist,
-      # build-backend misconfig — at PR time instead of at release time in
-      # release.yml's build job. The output is discarded here (not uploaded, not
-      # published); we only care that the build succeeds.
-      - run: uv build
       # Advisory only: src/ojin carries known pyright type debt (untyped params,
       # missing super().__init__ calls). Surfaced here for cleanup, but it does
       # NOT block the PR or a release — CI has never gated on pyright.
@@ -44,3 +38,16 @@ jobs:
         run: |
           source .venv/bin/activate
           uvx pyright
+
+  # Its own stage so it surfaces as a separate check on the PR (and mirrors
+  # release.yml's build job). Blocking: proves the package builds (sdist + wheel),
+  # so packaging errors — bad pyproject metadata, files missing from the sdist,
+  # build-backend misconfig — surface at PR time, not at release. Builds nothing
+  # for distribution: no artifact upload, no publish; the output is discarded.
+  build:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv build
