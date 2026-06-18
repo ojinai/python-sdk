@@ -110,9 +110,9 @@ app.mount("/static", StaticFiles(directory=HERE / "static"), name="static")
 async def avatar(ws: WebSocket) -> None:
     """Bridge one browser session to one Ojin avatar session."""
     await ws.accept()
-    client = OjinSTVClient(
-        api_key=CREDS.api_key, config_id=CREDS.config_id, image_size=(512, 512)
-    )
+    # Frames come back at the server's native size; the browser scales them into
+    # the 512x512 panel via CSS (object-fit).
+    client = OjinSTVClient(api_key=CREDS.api_key, config_id=CREDS.config_id)
 
     # The pump task and the error relay both write this socket, so funnel every
     # browser-bound message through one lock-guarded sender.

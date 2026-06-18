@@ -53,8 +53,9 @@ logger = logging.getLogger("ojin-avatar-bot")
 
 HERE = pathlib.Path(__file__).parent
 
-# The avatar video size. It MUST match the transport's video_out_width/height
-# below and your Face model's output size — a mismatch shows up as garbled video.
+# The output video track size for the transport (video_out_width/height below).
+# The avatar emits frames at your Face model's native resolution; set this to that
+# resolution so the transport forwards them without rescaling.
 AVATAR_SIZE = (512, 512)
 
 # Spoken-conversation system prompt: keep replies short and free of formatting.
@@ -132,7 +133,6 @@ async def run_bot(transport: BaseTransport, runner_args: RunnerArguments) -> Non
     avatar = OjinAvatarService(
         api_key=CREDS.api_key,
         config_id=CREDS.config_id,
-        image_size=AVATAR_SIZE,
     )
 
     messages = [

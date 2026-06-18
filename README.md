@@ -112,7 +112,6 @@ async def main() -> None:
     async with OjinSTVClient(
         api_key=os.environ["OJIN_API_KEY"],
         config_id=os.environ["OJIN_CONFIG_ID"],
-        image_size=(1024, 1024),
     ) as client:
         # Events may be sync or async; register with a decorator or add_listener().
         client.add_listener(STVEvent.SESSION_READY, lambda **_: ready.set())
@@ -198,19 +197,16 @@ import numpy as np
 
 from ojin.stv import OjinSTVClient, STVEvent, STVVideoFrame
 
-WIDTH, HEIGHT, FPS = 1024, 1024, 25
+FPS = 25
 
 
 async def render(wav_path: str, out_path: str) -> None:
     ready, done = asyncio.Event(), asyncio.Event()
-    writer = cv2.VideoWriter(
-        out_path, cv2.VideoWriter_fourcc(*"mp4v"), FPS, (WIDTH, HEIGHT)
-    )
+    writer = None  # created on the first frame, sized to whatever the server sends
 
     async with OjinSTVClient(
         api_key=os.environ["OJIN_API_KEY"],
         config_id=os.environ["OJIN_CONFIG_ID"],
-        image_size=(WIDTH, HEIGHT),
     ) as client:
         client.add_listener(STVEvent.SESSION_READY, lambda **_: ready.set())
         client.add_listener(STVEvent.BOT_STOPPED_SPEAKING, lambda **_: done.set())
@@ -225,8 +221,16 @@ async def render(wav_path: str, out_path: str) -> None:
             )
 
         async def consume() -> None:
+            nonlocal writer
             async for frame in client.output_stream():
                 if isinstance(frame, STVVideoFrame) and frame.rgb is not None:
+                    if writer is None:  # size the file to the server's native frame
+                        writer = cv2.VideoWriter(
+                            out_path,
+                            cv2.VideoWriter_fourcc(*"mp4v"),
+                            FPS,
+                            (frame.width, frame.height),
+                        )
                     rgb = np.frombuffer(frame.rgb, np.uint8)
                     rgb = rgb.reshape(frame.height, frame.width, 3)
                     writer.write(cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
@@ -236,7 +240,8 @@ async def render(wav_path: str, out_path: str) -> None:
         await asyncio.sleep(0.5)
         consumer.cancel()
 
-    writer.release()
+    if writer is not None:
+        writer.release()
 
 
 asyncio.run(render("hello.wav", "avatar.mp4"))
@@ -268,7 +273,7 @@ from ojin.stv import (
 client = OjinSTVClient(
     api_key=os.environ["OJIN_API_KEY"],
     config_id=os.environ["OJIN_CONFIG_ID"],
-    config=STVConfig(fps=25, image_size=(720, 720), interrupt_audio_fade_s=0.5),
+    config=STVConfig(fps=25, interrupt_audio_fade_s=0.5),
     resampler=SoxrResampler(),       # or NumpyLinearResampler() for zero native deps
     decoder=PassthroughDecoder(),    # skip JPEG decode; read frame.source_bytes yourself
 )
@@ -286,7 +291,6 @@ With a `PassthroughDecoder`, `STVVideoFrame.rgb` is `None` and the raw JPEG arri
 |---|---|---|
 | `client_connect_max_retries` | `3` | Connect attempts before giving up |
 | `client_reconnect_delay` | `3.0` | Seconds between connect attempts |
-| `image_size` | `(1280, 720)` | Output frame size `(width, height)` |
 | `fps` | `25` | Playback frame rate (40 ms tick) |
 | `initial_buffer_frames` | `6` | Video frames buffered before playback starts |
 | `max_buffered_video_frames` | `700` | Hard cap on queued video frames |
@@ -294,7 +298,7 @@ With a `PassthroughDecoder`, `STVVideoFrame.rgb` is `None` and the raw JPEG arri
 | `interrupt_audio_fade_s` | `0.75` | Fade length applied on barge-in |
 | `lipsync_trace_enabled` | `False` | Emit the per-tick A/V-sync diagnostics |
 
-The `image_size` shortcut on the constructor overrides `STVConfig.image_size`. Set `OJIN_MODE=dev` in the environment to attach the dev-mode query flag when connecting with the default transport.
+Video frames are emitted at the server's native resolution — read `STVVideoFrame.width`/`height` per frame rather than configuring an output size. Set `OJIN_MODE=dev` in the environment to attach the dev-mode query flag when connecting with the default transport.
 
 ---
 

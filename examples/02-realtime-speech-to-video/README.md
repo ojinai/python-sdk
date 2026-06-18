@@ -61,8 +61,9 @@ Click **Start**, allow the mic + camera, and talk.
   utterance end it calls `client.say(audio)`; on the next utterance start it calls
   `client.interrupt()`. Avatar frames are forwarded to the browser as they arrive.
 
-Worth tweaking in `server.py`: the VAD `aggressiveness` (0–3), `end_frames` (how
-much trailing silence ends a turn), and the avatar `image_size`.
+Worth tweaking in `server.py`: the VAD `aggressiveness` (0–3) and `end_frames` (how
+much trailing silence ends a turn). The avatar video comes back at whatever size the
+server sends; the browser scales it into the 512×512 panel via CSS.
 
 ## Notes
 

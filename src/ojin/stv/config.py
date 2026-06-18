@@ -9,7 +9,6 @@ client constructor, not here.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Tuple
 
 
 @dataclass
@@ -20,8 +19,8 @@ class STVConfig:
     client_connect_max_retries: int = 3
     client_reconnect_delay: float = 3.0
 
-    # Video framing
-    image_size: Tuple[int, int] = (1280, 720)
+    # Video framing — emitted frames carry the server's native resolution; only
+    # the playback rate is configurable here.
     fps: int = 25
 
     # Video buffering

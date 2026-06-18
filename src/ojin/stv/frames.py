@@ -36,6 +36,9 @@ class STVVideoFrame:
     last decoded frame on those ticks, so render from ``rgb`` for seamless video and
     skip empty ``source_bytes`` if you forward the JPEG instead.
 
+    ``width`` / ``height`` are the frame's **native resolution as sent by the
+    server** (decoded from the JPEG, not a client-configured size).
+
     ``volume`` is the RMS amplitude of the audio the server bundled with this frame
     (the lip-sync target) — i.e. the amplitude of the audio timeline the video was
     generated for. It is ``0`` on a repeated/held frame (no new server frame this
