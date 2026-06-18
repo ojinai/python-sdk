@@ -49,13 +49,17 @@ jobs:
 
   # 2) Run the same checks reviewers run; never publish a red main.
   #    Skipped (and so is everything after it) when the version didn't change.
-  #    Calls the shared reusable workflow so this gate and the PR check (pr-check.yml)
-  #    run identical steps and can never drift — a green PR guarantees a green release
-  #    verify. See .github/workflows/ci-verify.yml.
+  #    Uses the shared ci-verify composite action so this gate and the PR check
+  #    (pr-check.yml) run identical checks and can never drift — a green PR guarantees
+  #    a green release verify. The build step lives in the `build` job below.
+  #    See .github/actions/ci-verify.
   verify:
     needs: check
     if: needs.check.outputs.should_publish == 'true'
-    uses: ./.github/workflows/ci-verify.yml
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./.github/actions/ci-verify
 
   # 3) Build sdist + wheel with uv, hand them to the publish job as an artifact.
   build:

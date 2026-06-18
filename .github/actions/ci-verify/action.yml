@@ -1,0 +1,31 @@
+name: CI Verify
+description: >-
+  Lint, format-check and unit-test the ojin-client package (src + tests). No build,
+  no publish. Shared by pr-check.yml and release.yml so the PR gate and the release
+  verify gate run identical checks and can never drift. A composite action (not a
+  reusable workflow) so callers keep flat job names on the PR (e.g. "PR Check / verify"
+  rather than "PR Check / verify / verify").
+
+runs:
+  using: composite
+  steps:
+    - uses: astral-sh/setup-uv@v5
+    - run: uv sync --all-extras
+      shell: bash
+    # Scope to the shipped package: examples/ are standalone teaching projects with
+    # their own requirements.txt and aren't part of the ojin-client wheel, so their
+    # lint/format debt must not block a PR or a library release.
+    - run: uv run ruff format --check src tests
+      shell: bash
+    - run: uv run ruff check src tests
+      shell: bash
+    - run: uv run pytest tests/stv # hermetic unit suite; skips live integration
+      shell: bash
+    # Advisory only: src/ojin carries known pyright type debt (untyped params, missing
+    # super().__init__ calls). Surfaced for cleanup but never blocks — composite steps
+    # don't support continue-on-error, so `|| true` keeps it non-blocking.
+    - name: Type-check (advisory, non-blocking)
+      shell: bash
+      run: |
+        source .venv/bin/activate
+        uvx pyright || true
