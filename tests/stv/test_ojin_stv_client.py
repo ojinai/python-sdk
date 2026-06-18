@@ -185,6 +185,7 @@ def test_interrupt_suppressed_while_one_is_ongoing() -> None:
 
     async def run() -> None:
         c, fc, _out = make_client()
+        c._initialized = True  # a live turn only exists once the session is ready
         c._synchronizer.current_buffer = _live_buffer()
         await c.interrupt()
         assert c._interruption_ongoing is True
@@ -211,6 +212,7 @@ def test_interrupt_window_closes_on_idle_or_fadeout_frame() -> None:
     async def run() -> None:
         for end_frame in (FrameType.IDLE, FrameType.FADE_OUT):
             c, fc, _out = make_client()
+            c._initialized = True  # a live turn only exists once the session is ready
             c._synchronizer.current_buffer = _live_buffer()
             await c.interrupt()
             assert c._interruption_ongoing is True
