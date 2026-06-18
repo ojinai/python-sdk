@@ -19,7 +19,7 @@ example runs standalone.
 from __future__ import annotations
 
 import logging
-import ostt
+import os
 import uuid
 from datetime import datetime, timezone
 
