@@ -115,7 +115,9 @@ async def run_experiment(*, n_chunks: int, consume_s: float, pace_audio: bool) -
 
     try:
         for _ in range(n_chunks):
-            await client.send_message(OjinAudioInputMessage(audio_int16_bytes=_AUDIO_CHUNK))
+            await client.send_message(
+                OjinAudioInputMessage(audio_int16_bytes=_AUDIO_CHUNK)
+            )
             if pace_audio:
                 await asyncio.sleep(consume_s)
 
@@ -154,8 +156,12 @@ async def run_experiment(*, n_chunks: int, consume_s: float, pace_audio: bool) -
 async def main() -> int:
     """Run flood vs paced and print the contrast that localises the latency."""
     n_chunks, consume_s = 20, 0.08
-    flood = await run_experiment(n_chunks=n_chunks, consume_s=consume_s, pace_audio=False)
-    paced = await run_experiment(n_chunks=n_chunks, consume_s=consume_s, pace_audio=True)
+    flood = await run_experiment(
+        n_chunks=n_chunks, consume_s=consume_s, pace_audio=False
+    )
+    paced = await run_experiment(
+        n_chunks=n_chunks, consume_s=consume_s, pace_audio=True
+    )
 
     def fmt(r: dict) -> str:
         lat = r["cancel_latency_s"]
@@ -165,7 +171,9 @@ async def main() -> int:
             f" {r['audio_received_before_cancel']}/{r['n_chunks']})"
         )
 
-    print(f"Backpressure repro — {n_chunks} chunks, sink drains 1 chunk / {consume_s*1000:.0f}ms")
+    print(
+        f"Backpressure repro — {n_chunks} chunks, sink drains 1 chunk / {consume_s * 1000:.0f}ms"
+    )
     print("─" * 70)
     print(f"FLOOD (audio pushed ~as fast as TTS, like prod):\n{fmt(flood)}")
     print(f"PACED (audio metered to ~realtime, the fix shape):\n{fmt(paced)}")
@@ -174,7 +182,7 @@ async def main() -> int:
     reproduced = fl is not None and pl is not None and fl > 0.4 and fl > 4 * pl
     print(
         f"DELIVERY-SIDE LATENCY REPRODUCED: {reproduced}  "
-        f"(flood {fl*1000:.0f}ms vs paced {pl*1000:.0f}ms — pacing collapses it)"
+        f"(flood {fl * 1000:.0f}ms vs paced {pl * 1000:.0f}ms — pacing collapses it)"
     )
     return 0 if reproduced else 1
 

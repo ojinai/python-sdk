@@ -129,7 +129,9 @@ class AutonomousUserDriver(FrameProcessor):
     def _schedule_turn(self, delay_s: float) -> None:
         """Arm the next synthetic user turn after ``delay_s`` seconds."""
         if self._max_turns is not None and self._turn_index >= self._max_turns:
-            logger.info("Autonomous driver reached max_turns=%s; stopping", self._max_turns)
+            logger.info(
+                "Autonomous driver reached max_turns=%s; stopping", self._max_turns
+            )
             return
         self._cancel_pending()
         self._pending = self.create_task(self._emit_turn_after(delay_s))
