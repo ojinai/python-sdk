@@ -1,7 +1,8 @@
 name: CI Verify
 
-# The single source of truth for "is this code releasable?" — lint, format and the
-# hermetic unit suite. It builds and publishes NOTHING; it only verifies.
+# The single source of truth for "is this code releasable?" — lint, format, the
+# hermetic unit suite, and a packaging build. It PUBLISHES nothing; it only verifies
+# (the sdist/wheel built here are discarded — no artifact upload, no PyPI).
 #
 # Reusable (workflow_call) so the exact same checks run in two places and can never
 # drift apart:
@@ -29,6 +30,12 @@ jobs:
       - run: uv run ruff format --check src tests
       - run: uv run ruff check src tests
       - run: uv run pytest tests/stv # hermetic unit suite; skips live integration
+      # Blocking: prove the package actually builds (sdist + wheel). Catches
+      # packaging errors — bad pyproject metadata, files missing from the sdist,
+      # build-backend misconfig — at PR time instead of at release time in
+      # release.yml's build job. The output is discarded here (not uploaded, not
+      # published); we only care that the build succeeds.
+      - run: uv build
       # Advisory only: src/ojin carries known pyright type debt (untyped params,
       # missing super().__init__ calls). Surfaced here for cleanup, but it does
       # NOT block the PR or a release — CI has never gated on pyright.
