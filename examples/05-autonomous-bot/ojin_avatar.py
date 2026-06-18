@@ -113,7 +113,6 @@ class OjinAvatarService(FrameProcessor):
         *,
         api_key: str,
         config_id: str,
-        image_size: tuple[int, int] = (512, 512),
         ws_url: str = "wss://models.ojin.foo/realtime",
     ) -> None:
         """Build the avatar service and wire the client's lifecycle events.
@@ -121,8 +120,6 @@ class OjinAvatarService(FrameProcessor):
         Args:
             api_key: Ojin API key.
             config_id: Ojin Face-model config id (the avatar to drive).
-            image_size: Avatar frame size; must match the transport's
-                ``video_out_width``/``video_out_height``.
             ws_url: Ojin realtime websocket URL.
 
         """
@@ -140,7 +137,6 @@ class OjinAvatarService(FrameProcessor):
             api_key=api_key,
             config_id=config_id,
             ws_url=ws_url,
-            image_size=image_size,  # must match the transport's video_out_width/height
             output=_AvatarOutput(self),  # push model — do NOT call output_stream()
             tracer=self._trace,  # None => the client falls back to a NullTracer
         )

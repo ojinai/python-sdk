@@ -31,4 +31,3 @@ def test_config_defaults() -> None:
     assert c.interrupt_audio_fade_s == 0.75
     assert c.align_audio_on_swap is True
     assert c.idle_buffer_target_frames == 6
-    assert c.image_size == (1280, 720)

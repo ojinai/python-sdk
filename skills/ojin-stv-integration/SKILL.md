@@ -64,7 +64,6 @@ async def main():
     client = OjinSTVClient(
         api_key=creds.api_key,
         config_id=creds.config_id,
-        image_size=(512, 512),     # match your face model's output size
     )
 
     @client.on(STVEvent.SESSION_READY)
@@ -121,7 +120,7 @@ server's):
 |---|---|
 | `rgb` | decoded RGB pixels (`bytes`), or `None` — **use this to render** |
 | `source_bytes` | the raw JPEG from the server; **empty (`b""`) on held/repeat ticks** |
-| `width`, `height` | frame size (from `config.image_size`) |
+| `width`, `height` | frame size — the server's native resolution |
 | `format` | pixel format, `"RGB"` |
 | `frame_type` | `FrameType`: `IDLE=0`, `SPEECH=1`, `FADE_OUT=2`, `START_OF_SPEECH=3` |
 | `volume` | RMS of the audio this frame was generated for; `0.0` on a held tick (a verification aid, **not** a playback gain) |
@@ -218,8 +217,9 @@ them — read from env/`.env`.
 - **Feed natural TTS chunks, not tiny one-frame messages.** The server needs a
   steady audio timeline; very small chunks make it return idle (still-mouth) frames.
   Let your TTS stream in its native chunk sizes.
-- **Set `image_size` to your face model's output.** Emitted frames are tagged with
-  `config.image_size`; a mismatch produces stretched/garbled video downstream.
+- **Video frames come at the server's native size.** Each `STVVideoFrame` carries its
+  own `width`/`height` (the resolution the server sent) — read them per frame rather
+  than assuming a fixed size, and size your downstream sink/transport to match.
 
 ## Verify against your installed version
 

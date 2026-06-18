@@ -80,7 +80,6 @@ class OjinSTVClient:
         api_key: str = "",
         config_id: str = "",
         ws_url: str = _DEFAULT_WS_URL,
-        image_size: Optional[tuple] = None,
         output: Optional[STVOutput] = None,
         resampler: Optional[Resampler] = None,
         decoder: Optional[VideoDecoder] = None,
@@ -92,11 +91,10 @@ class OjinSTVClient:
 
         Defaults make it work standalone: a WebSocket ``OjinClient``, the bundled
         resampler, an opencv decoder, a :class:`QueueOutput` (drained via
-        :meth:`output_stream`), and a no-op tracer.
+        :meth:`output_stream`), and a no-op tracer. Emitted video frames carry
+        whatever resolution the server sends (see :class:`STVVideoFrame`).
         """
         self._config = config or STVConfig()
-        if image_size is not None:
-            self._config.image_size = image_size
 
         self._client: IOjinClient = client or OjinClient(
             ws_url=ws_url,
@@ -116,6 +114,7 @@ class OjinSTVClient:
         self._waiting_for_first_tts = False
         self._last_audio_shape = (OJIN_PERSONA_SAMPLE_RATE, 1)
         self._last_played_rgb: Optional[bytes] = None
+        self._last_played_size: Optional[tuple[int, int]] = None  # native (w, h)
         # Barge-in in flight: set when a cancel is sent, cleared when the server's
         # first idle/fade-out frame acknowledges it. While set, further interrupts
         # are dropped so a re-fire (e.g. VAD flap, or a new turn that swapped in
@@ -331,7 +330,7 @@ class OjinSTVClient:
         await self.start_turn()
         await self.send_tts_audio(pcm, sample_rate, num_channels)
 
-    async def interrupt(self) -> None:
+    async def interrupt(self) -> bool:
         """Barge-in: fade the current turn and cancel it server-side if playing.
 
         No-op while an interruption is already in flight: the window stays open from
@@ -340,13 +339,15 @@ class OjinSTVClient:
         """
         if self._interruption_ongoing:
             self._tracer.instant("interruption", "interrupt_suppressed")
-            return
+            return False
         if self._synchronizer.interrupt():
             self._interruption_ongoing = True
             await self._client.send_message(OjinCancelInteractionMessage())
             self._tr_interrupt_start = self._tracer.mark()
             self._tracer.instant("interruption", "cancel_sent")
             await self._events.emit(STVEvent.INTERRUPTED)
+            return True
+        return False
 
     # ------------------------------------------------------------------
     # Receive loop
@@ -657,6 +658,7 @@ class OjinSTVClient:
         """Emit a video frame for this tick (new, or a repeat of the last RGB)."""
         vframe = result.video_frame
         rgb = self._last_played_rgb
+        size = self._last_played_size
         source_bytes = b""
         frame_type = 0
         volume = 0.0
@@ -666,7 +668,9 @@ class OjinSTVClient:
             volume = float(vframe.volume)
             if vframe.out_rgb is not None:
                 rgb = vframe.out_rgb
+                size = vframe.out_size
                 self._last_played_rgb = rgb
+                self._last_played_size = size
             self._tracer.instant(
                 play_lane_for_frame_type(vframe.frame_type),
                 "video_emit",
@@ -690,9 +694,9 @@ class OjinSTVClient:
                     args={"played_ms": latency_ms},
                 )
 
-        if rgb is None:
+        if rgb is None or size is None:
             return
-        width, height = self._config.image_size
+        width, height = size  # the server's native frame size for this frame
         await self._output.write_video(
             STVVideoFrame(
                 rgb=rgb,
@@ -742,16 +746,16 @@ class OjinSTVClient:
         thread.join(timeout=1.0)
 
     def _decode_worker(self) -> None:
-        """Decode queued JPEG frames to RGB off the event loop, in order."""
-        target_w, target_h = self._config.image_size
+        """Decode queued JPEG frames to native-size RGB off the event loop, in order."""
         while True:
             frame = self._decode_in.get()
             if frame is None:  # shutdown sentinel
                 break
             try:
-                frame.out_rgb = self._decoder.decode(
-                    frame.image_bytes, target_w, target_h
-                )
+                decoded = self._decoder.decode(frame.image_bytes)
+                if decoded is not None:
+                    frame.out_rgb, w, h = decoded
+                    frame.out_size = (w, h)
             except Exception as exc:  # never let a bad frame kill the worker
                 frame.out_rgb = None
                 logger.warning("frame decode failed: %s", exc)

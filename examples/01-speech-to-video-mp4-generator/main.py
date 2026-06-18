@@ -19,7 +19,6 @@ from ojin import MissingCredentialsError, load_env, resolve_credentials
 from ojin.stv import OjinSTVClient, QueueOutput, STVEvent, STVVideoFrame
 
 FPS = 25
-SIZE = (512, 512)  # avatar frame size (width, height)
 
 
 def read_mono_wav(path: pathlib.Path) -> tuple[bytes, int]:
@@ -59,7 +58,6 @@ async def render(
     client = OjinSTVClient(
         api_key=creds.api_key,
         config_id=creds.config_id,
-        image_size=SIZE,
         output=QueueOutput(max_video=10**9),
     )
     client.add_listener(STVEvent.SESSION_READY, lambda **_: ready.set())
@@ -83,16 +81,21 @@ async def render(
             )
 
         await client.say(pcm, sample_rate=rate, num_channels=1)
-        writer = Mp4Writer(out, *SIZE, fps=FPS, audio_wav=wav_path)
 
         async def consume() -> None:
-            """Feed each returned RGB frame to the MP4 writer."""
+            """Feed each returned RGB frame to the MP4 writer (built on the first one)."""
+            nonlocal writer
             async for frame in client.output_stream():
                 if (
                     isinstance(frame, STVVideoFrame)
                     and frame.rgb is not None
                     and frame.frame_type != 0  # speech frames only
                 ):
+                    if writer is None:
+                        # Size the MP4 to whatever the server sends (first frame wins).
+                        writer = Mp4Writer(
+                            out, frame.width, frame.height, fps=FPS, audio_wav=wav_path
+                        )
                     writer.write(frame.rgb)
                     print(
                         f"\r  rendering... {writer.frames} frames", end="", flush=True
@@ -119,6 +122,11 @@ async def render(
 
     if error:
         sys.exit(f"\n  Stopped: {error['message']}\n")
+    if writer is None:
+        sys.exit(
+            "\n  No video frames were produced — the audio may be too short or too\n"
+            "  quiet to drive speech. Try a longer, louder clip.\n"
+        )
     secs = writer.frames / FPS
     print(f"\n  Done -> {out}  ({writer.frames} frames, {secs:.1f}s, audio included)\n")
 

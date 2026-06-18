@@ -304,7 +304,6 @@ def test_interaction_response_renders_decoded_video() -> None:
             client=fc,
             output=out,
             tracer=RecordingTracer(),
-            image_size=(32, 32),
             config=STVConfig(
                 initial_buffer_frames=0, loop_stall_watchdog_ms=0, stall_probe_ms=0
             ),
@@ -326,7 +325,11 @@ def test_interaction_response_renders_decoded_video() -> None:
         )
         await asyncio.sleep(0.2)  # decode worker + a few playback ticks
         assert out.video, "expected a decoded video frame to be emitted"
-        assert out.video[0].rgb is not None and len(out.video[0].rgb) == 32 * 32 * 3
+        # The frame is emitted at the server's native size (the 64x48 JPEG above),
+        # not resized — image_size is gone.
+        vf = out.video[0]
+        assert vf.rgb is not None and len(vf.rgb) == 64 * 48 * 3
+        assert (vf.width, vf.height) == (64, 48)
         await c.close()
 
     asyncio.run(run())

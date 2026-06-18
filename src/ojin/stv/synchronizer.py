@@ -66,8 +66,10 @@ class AudioBuffer:
 class VideoFrame:
     """One video frame from the inference server, with bundled audio.
 
-    ``out_rgb`` is filled by the client's decode worker before the frame reaches
-    :meth:`Synchronizer.tick`; ``None`` means "not decoded / decode failed" and the
+    ``out_rgb`` / ``out_size`` are filled together by the client's decode worker
+    before the frame reaches :meth:`Synchronizer.tick`: ``out_rgb`` is the decoded
+    RGB bytes and ``out_size`` is its ``(width, height)`` at the server's native
+    resolution. ``out_rgb`` ``None`` means "not decoded / decode failed" and the
     client repeats the last frame.
     """
 
@@ -77,6 +79,7 @@ class VideoFrame:
     is_final: bool
     volume: int
     out_rgb: Optional[bytes] = None
+    out_size: Optional[tuple[int, int]] = None
 
     def is_silence(self) -> bool:
         """Whether this is an idle/silence frame (frame_type 0)."""

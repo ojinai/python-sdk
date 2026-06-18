@@ -55,7 +55,6 @@ pip install "ojin-client[stv]"     # or: uv add "ojin-client[stv]"
 avatar = OjinAvatarService(
     api_key=os.environ["OJIN_API_KEY"],
     config_id=os.environ["OJIN_CONFIG_ID"],   # your Face-model id from ojin.ai
-    image_size=(512, 512),
 )
 
 pipeline = Pipeline([
@@ -67,11 +66,13 @@ pipeline = Pipeline([
 ])
 ```
 
-**3. Turn on video output on the transport** (mirror the Simli example's params; the
-size must match `image_size`):
+**3. Turn on video output on the transport** (mirror the Simli example's params).
+The avatar emits frames at your Face model's **native resolution**; set
+`video_out_width`/`video_out_height` to that resolution so the transport forwards
+them without rescaling:
 
 ```python
-# Daily:
+# Daily (use your Face model's output size; 512x512 shown):
 DailyParams(audio_in_enabled=True, audio_out_enabled=True,
             video_out_enabled=True, video_out_is_live=True,
             video_out_width=512, video_out_height=512)
@@ -146,15 +147,13 @@ class OjinAvatarService(FrameProcessor):
     after barge-in) lives in ojin.stv.OjinSTVClient; this class is just the mapping.
     """
 
-    def __init__(self, *, api_key, config_id, image_size=(512, 512),
-                 ws_url="wss://models.ojin.ai/realtime"):
+    def __init__(self, *, api_key, config_id, ws_url="wss://models.ojin.ai/realtime"):
         super().__init__(name="ojin-avatar")
         self._waiting_for_first_tts = False
         self._stv = OjinSTVClient(
             api_key=api_key,
             config_id=config_id,
             ws_url=ws_url,
-            image_size=image_size,        # must match the transport's video_out_width/height
             output=_AvatarOutput(self),   # push model — do NOT call output_stream()
         )
 
@@ -220,8 +219,11 @@ Client event → adapter action:
 
 ## Gotchas
 
-- **The transport's `video_out_width`/`video_out_height` must equal `image_size`.** A
-  mismatch shows up as stretched/garbled video. Use the same numbers in both places.
+- **The avatar emits the server's native resolution.** Each `OutputImageRawFrame`
+  carries `frame.width`/`frame.height` (no client-side resize). Set the transport's
+  `video_out_width`/`video_out_height` to your Face model's native size so the
+  transport forwards frames without rescaling; a mismatch makes the transport resize
+  every frame (works, but wastes CPU and can soften the image).
 - **Your transport must carry a video track.** Daily and SmallWebRTC (`-t webrtc`)
   support `video_out_*`; a phone/audio-only transport (e.g. Twilio) has no video out.
 - **Feed `TTSAudioRawFrame` as-is.** Pass `frame.sample_rate`/`frame.num_channels`
