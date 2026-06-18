@@ -88,6 +88,7 @@ class OjinSTVClient:
         tracer: Optional[Tracer] = None,
         client: Optional[IOjinClient] = None,
         config: Optional[STVConfig] = None,
+        buffer_preinit_tts_audio: bool = True,
     ) -> None:
         """Create a client; pass your own transport/resampler/decoder/tracer/output.
 
@@ -95,6 +96,14 @@ class OjinSTVClient:
         resampler, an opencv decoder, a :class:`QueueOutput` (drained via
         :meth:`output_stream`), and a no-op tracer. Emitted video frames carry
         whatever resolution the server sends (see :class:`STVVideoFrame`).
+
+        When ``buffer_preinit_tts_audio`` is ``True`` (default), input turns and
+        TTS audio sent via :meth:`start_turn` / :meth:`send_tts_audio` before the
+        session is ready (``SESSION_READY``) are queued in order and replayed once
+        it is, instead of being dropped — so a caller can start speaking during the
+        cold-start handshake (e.g. an opening line) without losing audio. Set it to
+        ``False`` to restore the previous behaviour: input before initialization is
+        dropped with a warning.
         """
         super().__init__()
         self._config = config or STVConfig()
@@ -115,6 +124,13 @@ class OjinSTVClient:
         self._initialized = False
         self._session_data: Optional[dict] = None
         self._waiting_for_first_tts = False
+
+        # Pre-initialization input buffer: when enabled, start_turn / send_tts_audio
+        # calls that arrive before SESSION_READY are recorded here (in order) and
+        # replayed once the session is ready, instead of being dropped. Entries are
+        # ("turn",) or ("audio", pcm, sample_rate, num_channels).
+        self._buffer_preinit_tts_audio = buffer_preinit_tts_audio
+        self._preinit_inputs: list[tuple] = []
         self._last_audio_shape = (OJIN_PERSONA_SAMPLE_RATE, 1)
         self._last_played_rgb: Optional[bytes] = None
         self._last_played_size: Optional[tuple[int, int]] = None  # native (w, h)
@@ -240,6 +256,8 @@ class OjinSTVClient:
         """Tear down loops, decode worker, and transport; record the session span."""
         was_initialized = self._initialized
         self._initialized = False
+        # Drop any input buffered before init; we never became ready to replay it.
+        self._preinit_inputs.clear()
         self._diagnostics.stop()
         self._stop_decode_worker()
         if was_initialized:
@@ -269,6 +287,14 @@ class OjinSTVClient:
 
     async def start_turn(self) -> None:
         """Open a new audio buffer for the next utterance (≈ TTSStartedFrame)."""
+        if not self._initialized and self._buffer_preinit_tts_audio:
+            # Defer until the session is ready so this turn boundary is replayed in
+            # order with its audio (see _flush_preinit_inputs). Opening a buffer now
+            # would strand it: add_audio always targets the tail buffer, so audio
+            # replayed later would collapse into the most recent pre-init turn.
+            self._preinit_inputs.append(("turn",))
+            self._tracer.instant("tts_input", "tts_started_buffered")
+            return
         buf = self._synchronizer.open_turn()
         self._waiting_for_first_tts = True
         self._tracer.instant(
@@ -285,7 +311,16 @@ class OjinSTVClient:
         the server for lip-sync inference.
         """
         if not self._initialized:
-            logger.warning("send_tts_audio before session ready — dropping")
+            if self._buffer_preinit_tts_audio:
+                # Queue verbatim; replayed in order once the session is ready.
+                self._preinit_inputs.append(
+                    ("audio", pcm, sample_rate, num_channels)
+                )
+                self._tracer.instant(
+                    "tts_input", "tts_audio_buffered", args={"bytes": len(pcm)}
+                )
+            else:
+                logger.warning("send_tts_audio before session ready — dropping")
             return
 
         duration = len(pcm) / (sample_rate * num_channels * 2)
@@ -333,6 +368,24 @@ class OjinSTVClient:
         await self.start_turn()
         await self.send_tts_audio(pcm, sample_rate, num_channels)
 
+    async def _flush_preinit_inputs(self) -> None:
+        """Replay input buffered before the session was ready, in arrival order.
+
+        Called once from the ``SESSION_READY`` handler after the audio seed, with
+        ``_initialized`` already ``True`` — so the replayed ``start_turn`` /
+        ``send_tts_audio`` calls take their normal path (the guards that buffered
+        them no longer trip) and won't re-enqueue.
+        """
+        pending, self._preinit_inputs = self._preinit_inputs, []
+        if not pending:
+            return
+        logger.info("Replaying %d buffered pre-init input op(s)", len(pending))
+        for op in pending:
+            if op[0] == "turn":
+                await self.start_turn()
+            else:  # ("audio", pcm, sample_rate, num_channels)
+                await self.send_tts_audio(op[1], op[2], op[3])
+
     async def interrupt(self) -> bool:
         """Barge-in: fade the current turn and cancel it server-side if playing.
 
@@ -342,6 +395,13 @@ class OjinSTVClient:
         """
         if self._interruption_ongoing:
             self._tracer.instant("interruption", "interrupt_suppressed")
+            return False
+        if not self._initialized and self._buffer_preinit_tts_audio:
+            # Barge-in before the buffered turn ever played: drop the queued input
+            # so a not-yet-spoken line doesn't replay after the user interrupted.
+            if self._preinit_inputs:
+                self._preinit_inputs.clear()
+                self._tracer.instant("interruption", "preinit_buffer_cleared")
             return False
         if self._synchronizer.interrupt():
             self._interruption_ongoing = True
@@ -394,6 +454,8 @@ class OjinSTVClient:
                 OjinAudioInputMessage(audio_int16_bytes=b"\x00" * BYTES_PER_FRAME)
             )
             self._tracer.instant("to_server", "seed_sent")
+            # Replay any input that arrived during the cold-start handshake.
+            await self._flush_preinit_inputs()
 
         elif isinstance(message, OjinInteractionResponseMessage):
             self._on_interaction_response(message)
