@@ -12,6 +12,7 @@ class FPSTracker:
     """Track frames-per-second statistics for streaming workloads."""
 
     def __init__(self, id: str) -> None:  # noqa: D107
+        super().__init__()
         self.id = id
         self.last_update_time = time.perf_counter() - 0.04
         self.total_frames = 0

@@ -65,6 +65,7 @@ class OjinSessionTrace:
         max_events: int = 500_000,
     ) -> None:
         """Create an empty session trace bound to a monotonic ``clock``."""
+        super().__init__()
         self.session_id = session_id
         self.config_id = config_id
         self._pid = pid

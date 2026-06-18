@@ -27,7 +27,7 @@ from __future__ import annotations
 import importlib
 import importlib.util
 import time
-from typing import Protocol, runtime_checkable
+from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
 
@@ -62,10 +62,11 @@ class SoxrStreamResampler:
 
     def __init__(self) -> None:
         """Initialize an empty stream; the SoX stream is built on first use."""
+        super().__init__()
         self._in_rate: int | None = None
         self._out_rate: int | None = None
         self._last_resample_time: float = 0.0
-        self._stream = None  # soxr.ResampleStream | None (lazy)
+        self._stream: Any = None  # soxr.ResampleStream | None (lazy)
 
     def _ensure_stream(self, in_rate: int, out_rate: int) -> None:
         """(Re)build the SoX stream, or clear stale history after a gap.

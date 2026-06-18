@@ -177,7 +177,7 @@ class OjinTextInputMessage(OjinMessage):
 
     text: str
     params: Optional[Dict[str, Any]] = Field(
-        None,
+        default=None,
         description="Optional. Additional parameters for the interaction",
     )
 
@@ -213,7 +213,7 @@ class OjinAudioInputMessage(OjinMessage):
 
     audio_int16_bytes: bytes
     params: Optional[Dict[str, Any]] = Field(
-        None,
+        default=None,
         description="Optional. Additional parameters for the interaction",
     )
 

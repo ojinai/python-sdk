@@ -20,7 +20,7 @@ import logging
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +34,10 @@ class LoopDiagnostics:
         watchdog_ms: float = 0.0,
         tick_warn_ms: float = 80.0,
         stall_probe_ms: float = 0.0,
-        clock=time.perf_counter,
+        clock: Callable[[], float] = time.perf_counter,
     ) -> None:
         """Configure the diagnostics; construction starts nothing."""
+        super().__init__()
         self._watchdog_ms = watchdog_ms
         self._tick_warn_ms = tick_warn_ms
         self._stall_probe_ms = stall_probe_ms
@@ -161,7 +162,8 @@ class LoopDiagnostics:
                         info[key] = get_extra(key)
                 with contextlib.suppress(Exception):
                     sock = get_extra("socket")
-                    info["fd"] = sock.fileno() if sock is not None else None
+                    fileno = getattr(sock, "fileno", None)
+                    info["fd"] = fileno() if callable(fileno) else None
             exc = context.get("exception")
             logger.warning(
                 "[ojin-stv-loop-exc] msg=%r exc=%s:%s transport_info=%s",
