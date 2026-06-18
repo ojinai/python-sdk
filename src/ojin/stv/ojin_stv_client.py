@@ -313,9 +313,7 @@ class OjinSTVClient:
         if not self._initialized:
             if self._buffer_preinit_tts_audio:
                 # Queue verbatim; replayed in order once the session is ready.
-                self._preinit_inputs.append(
-                    ("audio", pcm, sample_rate, num_channels)
-                )
+                self._preinit_inputs.append(("audio", pcm, sample_rate, num_channels))
                 self._tracer.instant(
                     "tts_input", "tts_audio_buffered", args={"bytes": len(pcm)}
                 )

@@ -104,14 +104,18 @@ def analyze(client: dict, server: dict) -> dict:
     """Reconstruct the interruption timeline and the cancel→fade lag from both traces."""
     cancel_us = _first_ts(client, "interruption", "cancel_sent")
     if cancel_us is None:
-        raise ValueError("client trace has no cancel_sent — not an interruption session")
+        raise ValueError(
+            "client trace has no cancel_sent — not an interruption session"
+        )
 
     fade_us = _counter_first_ts(client, "recv_frame_type", _FADE)
     interrupt_ended_us = _first_ts(client, "interruption", "interrupt_ended")
 
     # audio_sent enqueues after the cancel (should be a *new* turn, not the old one)
     audio_after_cancel = [
-        e["ts"] for e in _instants(client, "to_server", "audio_sent") if e["ts"] > cancel_us
+        e["ts"]
+        for e in _instants(client, "to_server", "audio_sent")
+        if e["ts"] > cancel_us
     ]
 
     # cross-clock alignment on the first audio chunk
@@ -146,7 +150,10 @@ def analyze(client: dict, server: dict) -> dict:
         "cancel_to_server_interrupt_ms": cancel_to_server_interrupt_ms,
         "server_fade_latency_ms": ms(s_fade_us, s_interrupt_us),
         # verdict
-        "bug_reproduced": (fade_us is not None and (fade_us - cancel_us) / 1000.0 > BUG_LAG_THRESHOLD_MS)
+        "bug_reproduced": (
+            fade_us is not None
+            and (fade_us - cancel_us) / 1000.0 > BUG_LAG_THRESHOLD_MS
+        )
         or (
             cancel_to_server_interrupt_ms is not None
             and cancel_to_server_interrupt_ms > BUG_LAG_THRESHOLD_MS
