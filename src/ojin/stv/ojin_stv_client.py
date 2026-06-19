@@ -281,6 +281,11 @@ class OjinSTVClient:
             with contextlib.suppress(asyncio.CancelledError, Exception):
                 await self._batch_flush_task
             self._batch_flush_task = None
+        if was_initialized and self._config.server_feed_batching_enabled:
+            pending = self._batcher.drain()
+            if pending is not None:
+                with contextlib.suppress(Exception):
+                    await self._send_audio_message(pending)
         try:
             await self._client.close()
         except Exception as exc:  # never let teardown raise
@@ -319,6 +324,11 @@ class OjinSTVClient:
         self._tracer.instant(
             "tts_input", "tts_started", args={"buffer_id": buf.buffer_id}
         )
+        if self._config.server_feed_batching_enabled:
+            pending = self._batcher.drain()
+            if pending is not None:
+                await self._send_audio_message(pending)
+            self._batcher.rearm_initial()
 
     async def _send_audio_message(self, pcm: bytes) -> None:
         """Send one server-bound audio payload and record the to_server trace."""
@@ -431,6 +441,8 @@ class OjinSTVClient:
         if self._synchronizer.interrupt():
             self._interruption_ongoing = True
             await self._client.send_message(OjinCancelInteractionMessage())
+            if self._config.server_feed_batching_enabled:
+                self._batcher.reset()
             self._tr_interrupt_start = self._tracer.mark()
             self._tracer.instant("interruption", "cancel_sent")
             await self._events.emit(STVEvent.INTERRUPTED)

@@ -501,6 +501,83 @@ def test_idle_timeout_flushes_subthreshold_tail() -> None:
     asyncio.run(run())
 
 
+def test_start_turn_flushes_previous_tail_and_rearms_initial() -> None:
+    """start_turn sends the prior turn's tail, then requires a fresh initial chunk."""
+
+    async def run() -> None:
+        c, fc, _out = make_client(
+            server_feed_initial_chunk_ms=1000,
+            server_feed_min_chunk_ms=400,
+            server_feed_flush_idle_ms=10000,  # large: isolate from the idle flush
+        )
+        await c.start()
+        await asyncio.sleep(0.02)
+        fc.sent.clear()
+        await c.start_turn()
+        frame = b"\x01\x02" * 640
+        for _ in range(5):  # 200 ms tail, below initial → not size-sent
+            await c.send_tts_audio(frame, 16000, 1)
+        assert not [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        await c.start_turn()  # flushes the 200 ms tail, re-arms initial
+        audio = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(audio) == 1 and len(audio[0].audio_int16_bytes) == 6400
+        for _ in range(10):  # 400 ms — would hit min, but initial is armed → no send
+            await c.send_tts_audio(frame, 16000, 1)
+        audio = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(audio) == 1  # still just the flushed tail
+        await c.close()
+
+    asyncio.run(run())
+
+
+def test_interrupt_discards_pending_batch() -> None:
+    """Barge-in throws away un-sent audio of the cancelled turn."""
+
+    async def run() -> None:
+        c, fc, _out = make_client(
+            server_feed_initial_chunk_ms=1000, server_feed_flush_idle_ms=10000
+        )
+        await c.start()
+        await asyncio.sleep(0.02)
+        c._synchronizer.current_buffer = AudioBuffer(sample_rate=16000)
+        c._synchronizer.current_buffer.bytes_.extend(b"\x01\x02" * 100)  # interruptible
+        fc.sent.clear()
+        await c.start_turn()
+        frame = b"\x01\x02" * 640
+        for _ in range(5):  # 200 ms pending in the batcher
+            await c.send_tts_audio(frame, 16000, 1)
+        assert c._batcher.pending_bytes == 6400
+        await c.interrupt()
+        assert c._batcher.pending_bytes == 0  # discarded
+        audio = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert not audio  # the cancelled turn's audio was never sent
+        await c.close()
+
+    asyncio.run(run())
+
+
+def test_close_flushes_final_tail() -> None:
+    """Close best-effort flushes a buffered tail before the transport closes."""
+
+    async def run() -> None:
+        c, fc, _out = make_client(
+            server_feed_initial_chunk_ms=1000, server_feed_flush_idle_ms=10000
+        )
+        await c.start()
+        await asyncio.sleep(0.02)
+        fc.sent.clear()
+        await c.start_turn()
+        frame = b"\x01\x02" * 640
+        for _ in range(3):  # 120 ms tail, below initial and idle window won't fire
+            await c.send_tts_audio(frame, 16000, 1)
+        assert not [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        await c.close()
+        audio = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(audio) == 1 and len(audio[0].audio_int16_bytes) == 3840  # 3 * 1280
+
+    asyncio.run(run())
+
+
 def test_close_ends_output_stream() -> None:
     """With the default QueueOutput, close() terminates a live output_stream()."""
 
