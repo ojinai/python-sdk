@@ -34,10 +34,19 @@ def build(correlation_id: str = "oc-1700000000000-w1dget01") -> dict:
     t["now"] += 0.30
     tr.span("lifecycle", "connect", conn_start)
 
-    # 6 turns: response latency + a live lipsync offset stream within each turn.
+    # 6 turns: per-service latency decomposition (STT->LLM->TTS->video, the
+    # §6 "STT and LLM latency not decomposed" gap) + response latency + a live
+    # lipsync offset stream within each turn. Service durations are deterministic.
     for turn in range(6):
         tts_start = tr.now_us()
-        t["now"] += 0.10 + 0.02 * turn
+        # Per-service compute spans on their own lanes, in pipeline order.
+        svc_start = tr.now_us()
+        for svc, dur_s in (("stt", 0.05 + 0.005 * turn), ("llm", 0.18 + 0.01 * turn),
+                           ("tts", 0.06 + 0.004 * turn), ("video", 0.04)):
+            s0 = tr.now_us()
+            t["now"] += dur_s
+            tr.span("latency", svc, s0, args={"service": svc})
+        _ = svc_start
         tr.record_response_latency("recv", tts_start)
         t["now"] += 0.01
         tr.record_response_latency("played", tts_start)
