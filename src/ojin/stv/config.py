@@ -19,7 +19,7 @@ class STVConfig:
     client_connect_max_retries: int = 3
     client_reconnect_delay: float = 3.0
 
-    # Video framing — emitted frames carry the server's native fps (25); only
+    # Video framing — emitted frames are always at 25 fps; only
     # the playback rate is configurable here.
     fps: int = 25
 
