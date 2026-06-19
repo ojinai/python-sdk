@@ -275,6 +275,12 @@ class OjinSTVClient:
         self._stop_decode_worker()
         if was_initialized:
             self._tracer.span("lifecycle", "session", self._tr_session_start)
+        # Stop the batch-flush task before the transport closes.
+        if self._batch_flush_task is not None:
+            self._batch_flush_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._batch_flush_task
+            self._batch_flush_task = None
         try:
             await self._client.close()
         except Exception as exc:  # never let teardown raise
@@ -376,7 +382,7 @@ class OjinSTVClient:
 
         if self._config.server_feed_batching_enabled:
             to_send = self._batcher.add(resampled)
-            self._batch_added.set()  # reset the idle-flush debounce timer
+            self._batch_added.set()  # any arrival resets the idle-flush timer
             if to_send is not None:
                 await self._send_audio_message(to_send)
         else:
@@ -465,6 +471,11 @@ class OjinSTVClient:
             self._tracer.span("lifecycle", "connect", self._tr_connect_start)
             if self._playback_task is None:
                 self._playback_task = asyncio.create_task(self._video_playback_loop())
+            if (
+                self._config.server_feed_batching_enabled
+                and self._batch_flush_task is None
+            ):
+                self._batch_flush_task = asyncio.create_task(self._batch_flush_loop())
             await self._events.emit(
                 STVEvent.SESSION_READY, session_data=self._session_data
             )
@@ -553,6 +564,40 @@ class OjinSTVClient:
             next_tick += frame_duration
             self._diagnostics.note_tick()
             await self._emit_tick()
+
+    async def _batch_flush_tick(self, idle: float) -> None:
+        """Run one debounce tick: wait for audio or fire a tail flush on timeout.
+
+        Extracted from the loop so the ``try``/``except`` does not sit directly
+        inside ``while`` (avoids PERF203).  Raises ``asyncio.CancelledError``
+        so the caller loop can exit cleanly; all other exceptions are swallowed
+        and logged so one bad send never kills the loop.
+        """
+        try:
+            await asyncio.wait_for(self._batch_added.wait(), timeout=idle)
+            self._batch_added.clear()  # new audio arrived → restart the timer
+        except asyncio.TimeoutError:
+            if self._batcher.flush_due():
+                pending = self._batcher.drain()
+                if pending is not None:
+                    await self._send_audio_message(pending)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # never let one bad send kill the loop
+            logger.exception("batch flush loop error — continuing")
+
+    async def _batch_flush_loop(self) -> None:
+        """Flush a sub-threshold audio tail after the idle gap, off the playback clock.
+
+        Debounces on ``_batch_added``: each new chunk restarts the timer, so a
+        flush only fires once TTS has been quiet for ``server_feed_flush_idle_ms``
+        (turn end / short turn). Runs as its own task so a blocking websocket send
+        never jitters the 25 fps playback loop. Re-arm of the initial threshold is
+        NOT done here — that is tied to ``start_turn``.
+        """
+        idle = self._config.server_feed_flush_idle_ms / 1000.0
+        while self._initialized:
+            await self._batch_flush_tick(idle)
 
     async def _emit_tick(self) -> None:
         """Run one tick: drain decode output, step the synchronizer, emit frames.

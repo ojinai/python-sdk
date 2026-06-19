@@ -475,6 +475,32 @@ def test_null_tracer_disables_per_tick_bookkeeping() -> None:
     asyncio.run(run())
 
 
+def test_idle_timeout_flushes_subthreshold_tail() -> None:
+    """A turn shorter than the initial threshold flushes its tail after idle."""
+
+    async def run() -> None:
+        c, fc, _out = make_client(
+            server_feed_initial_chunk_ms=1000,
+            server_feed_min_chunk_ms=400,
+            server_feed_flush_idle_ms=60,
+        )
+        await c.start()
+        await asyncio.sleep(0.02)
+        fc.sent.clear()
+        await c.start_turn()
+        frame = b"\x01\x02" * 640  # 40 ms @ 16 kHz
+        for _ in range(5):  # 200 ms < 1000 ms initial → no size send
+            await c.send_tts_audio(frame, 16000, 1)
+        assert not [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        await asyncio.sleep(0.15)  # > flush_idle (60 ms) → idle flush fires
+        audio = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(audio) == 1
+        assert len(audio[0].audio_int16_bytes) == 6400  # 5 * 1280 = 200 ms tail
+        await c.close()
+
+    asyncio.run(run())
+
+
 def test_close_ends_output_stream() -> None:
     """With the default QueueOutput, close() terminates a live output_stream()."""
 
