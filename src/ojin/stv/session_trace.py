@@ -182,6 +182,18 @@ class OjinSessionTrace:
             self._response_latencies[kind].append(latency_ms)
         return round(latency_ms, 1)
 
+    def record_lipsync_offset(self, offset_ms: float) -> None:
+        """Emit a LIVE audio-video alignment offset on the ``lipsync`` lane.
+
+        Previously the SDK only computed A/V alignment offline (cross-correlation),
+        so no live, comparable lipsync metric was emitted (autoresearch reqs §6).
+        This records the current offset (ms; positive = audio ahead of video) as a
+        lipsync-lane instant *and* a counter line-plot, mirroring the widget's
+        ``av_offset_ms`` so the bot and browser drivers are directly comparable.
+        """
+        self.instant("lipsync", "av_offset", args={"offset_ms": round(offset_ms, 3)})
+        self.counter("lipsync_offset_ms", round(offset_ms, 3))
+
     def set_other_data(self, key: str, value: object) -> None:
         """Attach an extra ``otherData`` entry (e.g. the A/V-sync verdict)."""
         self._other[key] = value

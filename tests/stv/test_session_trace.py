@@ -93,6 +93,17 @@ def test_correlation_id_emitted_for_stitching() -> None:
     assert corr and corr[0]["args"]["ojin_correlation_id"] == "oc-1700000000000-abcd1234"
 
 
+def test_record_lipsync_offset_emits_live_offset() -> None:
+    """record_lipsync_offset emits a live A/V offset on the lipsync lane (instant
+    with offset_ms) plus a counter line-plot (§6: lipsync now emitted live)."""
+    tr, _clk = _trace()
+    tr.record_lipsync_offset(7.5)
+    evs = tr.build()["traceEvents"]
+    inst = [e for e in evs if e.get("ph") == "i" and e.get("name") == "av_offset"]
+    assert inst and inst[0]["args"]["offset_ms"] == 7.5
+    assert any(e.get("ph") == "C" and e.get("name") == "lipsync_offset_ms" for e in evs)
+
+
 def test_correlation_id_absent_by_default() -> None:
     """Backward compatible: no correlation id unless one is supplied."""
     tr, _clk = _trace()
