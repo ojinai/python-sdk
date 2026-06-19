@@ -1,5 +1,7 @@
 """Unit tests for the pure SendBatcher state machine."""
 
+from typing import Callable, Optional
+
 from ojin.stv.send_batcher import SendBatcher
 
 
@@ -20,7 +22,10 @@ class FakeClock:
 
 
 def make_batcher(
-    initial: int = 1000, min_: int = 400, idle: float = 0.2, clock=None
+    initial: int = 1000,
+    min_: int = 400,
+    idle: float = 0.2,
+    clock: Optional[Callable[[], float]] = None,
 ) -> SendBatcher:
     """Build a batcher sized in raw bytes (1 byte == 1 unit for easy math)."""
     return SendBatcher(
@@ -39,7 +44,7 @@ def test_below_initial_threshold_returns_none() -> None:
 
 
 def test_initial_threshold_emits_all_buffered() -> None:
-    """Reaching initial threshold drains all buffered bytes."""
+    """Reaching the initial threshold drains ALL buffered bytes, not just threshold."""
     b = make_batcher(initial=1000, min_=400)
     assert b.add(b"\x01" * 600) is None
     out = b.add(b"\x02" * 500)  # total 1100 >= 1000
@@ -110,3 +115,12 @@ def test_empty_add_is_noop() -> None:
     b = make_batcher()
     assert b.add(b"") is None
     assert b.pending_bytes == 0
+
+
+def test_drain_does_not_change_initial_flag() -> None:
+    """Drain does not touch the initial flag — min threshold survives a drain."""
+    b = make_batcher(initial=1000, min_=400)
+    b.add(b"\x00" * 1000)  # emit → now on min threshold
+    b.add(b"\x00" * 200)  # sub-min tail
+    b.drain()  # flush tail, should leave the flag alone
+    assert b.add(b"\x00" * 400) is not None  # 400 >= min, not initial
