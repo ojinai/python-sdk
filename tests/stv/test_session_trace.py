@@ -81,6 +81,26 @@ def test_build_emits_lane_metadata() -> None:
     assert {"recv:speech", "play:idle", "play_audio", "latency"} <= lane_names
 
 
+def test_correlation_id_emitted_for_stitching() -> None:
+    """A correlation id rides otherData + a metadata event so the trace can be
+    stitched to the browser/proxy/server traces of the same session."""
+    tr = OjinSessionTrace(session_id="sess", correlation_id="oc-1700000000000-abcd1234")
+    doc = tr.build()
+    assert doc["otherData"]["ojin_correlation_id"] == "oc-1700000000000-abcd1234"
+    assert doc["otherData"]["ojin_service"] == "ojin-stv-client"
+    corr = [e for e in doc["traceEvents"]
+            if e.get("ph") == "M" and e.get("name") == "ojin_correlation"]
+    assert corr and corr[0]["args"]["ojin_correlation_id"] == "oc-1700000000000-abcd1234"
+
+
+def test_correlation_id_absent_by_default() -> None:
+    """Backward compatible: no correlation id unless one is supplied."""
+    tr, _clk = _trace()
+    doc = tr.build()
+    assert doc["otherData"]["ojin_correlation_id"] == ""
+    assert not any(e.get("name") == "ojin_correlation" for e in doc["traceEvents"])
+
+
 def test_record_response_latency_returns_ms_and_spans() -> None:
     """record_response_latency draws a response span and returns the ms value."""
     tr, clk = _trace()

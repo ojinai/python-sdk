@@ -60,14 +60,22 @@ class OjinSessionTrace:
         *,
         session_id: str = "",
         config_id: str = "",
+        correlation_id: str = "",
         pid: int = 1,
         clock: Callable[[], float] = time.perf_counter,
         max_events: int = 500_000,
     ) -> None:
-        """Create an empty session trace bound to a monotonic ``clock``."""
+        """Create an empty session trace bound to a monotonic ``clock``.
+
+        ``correlation_id`` is the one shared end-to-end id (browser -> bot ->
+        proxy -> inference). When set it is emitted into ``otherData`` and as a
+        metadata event, so this trace can be stitched to the browser/proxy/server
+        traces of the same session instead of being correlated by hand.
+        """
         super().__init__()
         self.session_id = session_id
         self.config_id = config_id
+        self.correlation_id = correlation_id
         self._pid = pid
         self._clock = clock
         self._t0 = clock()
@@ -204,6 +212,19 @@ class OjinSessionTrace:
                 "args": {"name": "ojin_stv"},
             }
         ]
+        if self.correlation_id:
+            meta.append(
+                {
+                    "name": "ojin_correlation",
+                    "ph": "M",
+                    "pid": 0,
+                    "tid": 0,
+                    "args": {
+                        "ojin_correlation_id": self.correlation_id,
+                        "service": "ojin-stv-client",
+                    },
+                }
+            )
         meta.extend(
             {
                 "name": "thread_name",
@@ -219,6 +240,8 @@ class OjinSessionTrace:
             "producer": "ojin_stv_client",
             "session_id": self.session_id,
             "config_id": self.config_id,
+            "ojin_correlation_id": self.correlation_id,
+            "ojin_service": "ojin-stv-client",
             "duration_s": round(self._clock() - self._t0, 3),
             "event_count": len(self._events),
             "events_evicted_overflow": self._evicted,
