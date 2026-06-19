@@ -50,6 +50,7 @@ from ojin.stv.events import EventEmitter, STVEvent
 from ojin.stv.frames import STVAudioFrame, STVVideoFrame
 from ojin.stv.output import QueueOutput, STVOutput
 from ojin.stv.resampler import Resampler, default_resampler
+from ojin.stv.send_batcher import SendBatcher
 from ojin.stv.synchronizer import (
     BYTES_PER_FRAME,
     OJIN_PERSONA_SAMPLE_RATE,
@@ -71,6 +72,7 @@ _DEFAULT_WS_URL = "wss://models.ojin.ai/realtime"
 _HALF_SECOND = 0.5
 _HALF_SECOND_TOL = 0.01
 _ONE_SEC_US = 1_000_000  # rolling window for the playback_fps counter
+_BYTES_PER_MS_16K = OJIN_PERSONA_SAMPLE_RATE * 2 / 1000.0  # 32 B/ms mono int16
 
 
 class OjinSTVClient:
@@ -120,6 +122,17 @@ class OjinSTVClient:
         self._output: STVOutput = output or QueueOutput()
         self._events = EventEmitter()
         self._synchronizer = Synchronizer(self._config)
+        self._batcher = SendBatcher(
+            initial_chunk_bytes=int(
+                self._config.server_feed_initial_chunk_ms * _BYTES_PER_MS_16K
+            ),
+            min_chunk_bytes=int(
+                self._config.server_feed_min_chunk_ms * _BYTES_PER_MS_16K
+            ),
+            flush_idle_s=self._config.server_feed_flush_idle_ms / 1000.0,
+        )
+        self._batch_added = asyncio.Event()
+        self._batch_flush_task: Optional[asyncio.Task] = None
 
         self._initialized = False
         self._session_data: Optional[dict] = None
@@ -301,6 +314,11 @@ class OjinSTVClient:
             "tts_input", "tts_started", args={"buffer_id": buf.buffer_id}
         )
 
+    async def _send_audio_message(self, pcm: bytes) -> None:
+        """Send one server-bound audio payload and record the to_server trace."""
+        await self._client.send_message(OjinAudioInputMessage(audio_int16_bytes=pcm))
+        self._tracer.instant("to_server", "audio_sent", args={"bytes": len(pcm)})
+
     async def send_tts_audio(
         self, pcm: bytes, sample_rate: int, num_channels: int
     ) -> None:
@@ -356,10 +374,13 @@ class OjinSTVClient:
             if input_rms is not None:
                 self._tracer.counter("input_audio_rms", round(input_rms, 1))
 
-        await self._client.send_message(
-            OjinAudioInputMessage(audio_int16_bytes=resampled)
-        )
-        self._tracer.instant("to_server", "audio_sent", args={"bytes": len(resampled)})
+        if self._config.server_feed_batching_enabled:
+            to_send = self._batcher.add(resampled)
+            self._batch_added.set()  # reset the idle-flush debounce timer
+            if to_send is not None:
+                await self._send_audio_message(to_send)
+        else:
+            await self._send_audio_message(resampled)
 
     async def say(self, pcm: bytes, sample_rate: int, num_channels: int) -> None:
         """Open a turn and send one audio payload (one-shot helper)."""

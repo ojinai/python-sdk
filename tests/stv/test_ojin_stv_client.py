@@ -19,15 +19,17 @@ from ojin.stv.synchronizer import AudioBuffer
 from tests.stv.fakes import FakeOjinClient, ListOutput, RecordingTracer
 
 
-def make_client():
-    """Build a client wired to in-memory fakes."""
+def make_client(**config_overrides):
+    """Build a client wired to in-memory fakes (config overrides optional)."""
     fc = FakeOjinClient()
     out = ListOutput()
     c = OjinSTVClient(
         client=fc,
         output=out,
         tracer=RecordingTracer(),
-        config=STVConfig(loop_stall_watchdog_ms=0, stall_probe_ms=0),
+        config=STVConfig(
+            loop_stall_watchdog_ms=0, stall_probe_ms=0, **config_overrides
+        ),
     )
     return c, fc, out
 
@@ -59,17 +61,45 @@ def test_start_emits_session_ready_and_seeds() -> None:
 
 
 def test_send_tts_audio_buffers_original_and_sends_resampled() -> None:
-    """send_tts_audio buffers the original PCM and sends a resampled copy."""
+    """With batching off, send_tts_audio buffers the original and sends each chunk."""
 
     async def run() -> None:
-        c, fc, _out = make_client()
+        c, fc, _out = make_client(server_feed_batching_enabled=False)
         await c.start()
         await asyncio.sleep(0.02)
         fc.sent.clear()
         await c.start_turn()
-        await c.send_tts_audio(b"\x01\x02" * 480, 24000, 1)  # 0.02 s @ 24 kHz
+        await c.send_tts_audio(b"\x01\x02" * 640, 16000, 1)  # 40 ms @ 16 kHz (identity)
         assert c._synchronizer.audio_buffers[-1].bytes_  # original buffered
-        assert any(isinstance(m, OjinAudioInputMessage) for m in fc.sent)
+        audio = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(audio) == 1 and len(audio[0].audio_int16_bytes) == 1280
+        await c.close()
+
+    asyncio.run(run())
+
+
+def test_batching_coalesces_to_initial_then_min() -> None:
+    """Batching emits one ~1000 ms initial chunk, then ~400 ms min chunks."""
+
+    async def run() -> None:
+        c, fc, _out = make_client(
+            server_feed_initial_chunk_ms=1000, server_feed_min_chunk_ms=400
+        )
+        await c.start()
+        await asyncio.sleep(0.02)
+        fc.sent.clear()
+        await c.start_turn()
+        frame = b"\x01\x02" * 640  # 40 ms @ 16 kHz = 1280 bytes, non-silent
+        for _ in range(25):  # 25 * 40 ms = 1000 ms = initial threshold
+            await c.send_tts_audio(frame, 16000, 1)
+        audio = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(audio) == 1
+        assert len(audio[0].audio_int16_bytes) == 32000  # one 1000 ms batch
+        for _ in range(10):  # 10 * 40 ms = 400 ms = min threshold
+            await c.send_tts_audio(frame, 16000, 1)
+        audio = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(audio) == 2
+        assert len(audio[1].audio_int16_bytes) == 12800  # one 400 ms batch
         await c.close()
 
     asyncio.run(run())

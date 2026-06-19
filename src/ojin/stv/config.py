@@ -19,7 +19,7 @@ class STVConfig:
     client_connect_max_retries: int = 3
     client_reconnect_delay: float = 3.0
 
-    # Video framing — emitted frames carry the server's native resolution; only
+    # Video framing — emitted frames carry the server's native fps (25); only
     # the playback rate is configurable here.
     fps: int = 25
 
@@ -34,6 +34,17 @@ class STVConfig:
 
     # Barge-in
     interrupt_audio_fade_s: float = 0.75
+
+    # Server-feed audio batching. TTS providers that stream small (~40 ms)
+    # chunks at realtime starve the inference server (no supply lead builds at
+    # 25 fps-in == 25 fps-out) and churn sub-frame residues. Coalesce the
+    # resampled server-bound copy into larger sends: a lead-establishing initial
+    # chunk per turn, then a steady-state minimum. Disable to restore per-chunk
+    # sends. (Playback of the original audio is unaffected.)
+    server_feed_batching_enabled: bool = True
+    server_feed_initial_chunk_ms: int = 1000
+    server_feed_min_chunk_ms: int = 400
+    server_feed_flush_idle_ms: int = 200
 
     # Diagnostics — off by default; a published SDK should be quiet. Each tier
     # dumps every thread's stack to stderr when a playback tick stalls past its
