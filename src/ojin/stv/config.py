@@ -37,7 +37,7 @@ class STVConfig:
 
     # Server-feed audio batching. TTS providers that stream small (~40 ms)
     # chunks at realtime starve the inference server (no supply lead builds at
-    # 25 fps-in == 25 fps-out) and churn sub-frame residues. Coalesce the
+    # 25 fps-in == 25 fps-out) and churn sub-frame residues. Combine the
     # resampled server-bound copy into larger sends: a lead-establishing initial
     # chunk per turn, then a steady-state minimum. Disable to restore per-chunk
     # sends. (Playback of the original audio is unaffected.)

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Make `OjinSTVClient` coalesce server-bound TTS audio into larger chunks (a ~1000 ms lead per turn, ≥400 ms steady-state, with an idle-timeout tail flush) so providers that stream 40 ms chunks no longer starve the inference server or churn sub-frame residues.
+**Goal:** Make `OjinSTVClient` combine server-bound TTS audio into larger chunks (a ~1000 ms lead per turn, ≥400 ms steady-state, with an idle-timeout tail flush) so providers that stream 40 ms chunks no longer starve the inference server or churn sub-frame residues.
 
 **Architecture:** A new pure, synchronous `SendBatcher` state machine owns the resampled 16 kHz server-bound byte buffer and decides *when* a batch is ready. `OjinSTVClient` resamples per arriving chunk (keeping the streaming resampler warm), feeds the resampled bytes to the batcher, sends whatever the batcher emits, and runs a small debounce task to flush a sub-threshold tail when TTS goes quiet. No `inference-server` changes; the avatar playback path is untouched.
 
@@ -168,7 +168,7 @@ Expected: FAIL — `ModuleNotFoundError: No module named 'ojin.stv.send_batcher'
 Create `src/ojin/stv/send_batcher.py`:
 
 ```python
-"""Server-feed audio batcher: coalesce TTS chunks into larger sends.
+"""Server-feed audio batcher: combine TTS chunks into larger sends.
 
 A pure, synchronous state machine (no I/O, no asyncio) — the testable seam for
 ``OjinSTVClient``'s server-bound audio. TTS providers stream small (~40 ms)
@@ -319,7 +319,7 @@ In `src/ojin/stv/config.py`, add to the `STVConfig` dataclass (after the `Barge-
 ```python
     # Server-feed audio batching. TTS providers that stream small (~40 ms)
     # chunks at realtime starve the inference server (no supply lead builds at
-    # 25 fps-in == 25 fps-out) and churn sub-frame residues. Coalesce the
+    # 25 fps-in == 25 fps-out) and churn sub-frame residues. Combine the
     # resampled server-bound copy into larger sends: a lead-establishing initial
     # chunk per turn, then a steady-state minimum. Disable to restore per-chunk
     # sends. (Playback of the original audio is unaffected.)
@@ -331,7 +331,7 @@ In `src/ojin/stv/config.py`, add to the `STVConfig` dataclass (after the `Barge-
 
 - [ ] **Step 2: Write the failing tests**
 
-In `tests/stv/test_ojin_stv_client.py`: (a) update `make_client` to accept config overrides; (b) replace `test_send_tts_audio_buffers_original_and_sends_resampled` with a deterministic batching-disabled version; (c) add a coalesce test.
+In `tests/stv/test_ojin_stv_client.py`: (a) update `make_client` to accept config overrides; (b) replace `test_send_tts_audio_buffers_original_and_sends_resampled` with a deterministic batching-disabled version; (c) add a combine test.
 
 Replace the existing `make_client` (lines 22-32) with:
 
@@ -375,7 +375,7 @@ def test_send_tts_audio_buffers_original_and_sends_resampled() -> None:
 Add this new test below it:
 
 ```python
-def test_batching_coalesces_to_initial_then_min() -> None:
+def test_batching_combines_to_initial_then_min() -> None:
     """Batching emits one ~1000 ms initial chunk, then ~400 ms min chunks."""
 
     async def run() -> None:
@@ -404,8 +404,8 @@ def test_batching_coalesces_to_initial_then_min() -> None:
 
 - [ ] **Step 3: Run the new/changed tests to verify they fail**
 
-Run: `uv run pytest tests/stv/test_ojin_stv_client.py -k "buffers_original or coalesces" -v`
-Expected: `test_batching_coalesces_to_initial_then_min` FAILS — batching isn't wired yet, so 25 chunks produce 25 sends (or 0 if treated differently), not 1 batch of 32000.
+Run: `uv run pytest tests/stv/test_ojin_stv_client.py -k "buffers_original or combines" -v`
+Expected: `test_batching_combines_to_initial_then_min` FAILS — batching isn't wired yet, so 25 chunks produce 25 sends (or 0 if treated differently), not 1 batch of 32000.
 
 - [ ] **Step 4: Wire the batcher into the client**
 
@@ -471,7 +471,7 @@ with:
 
 - [ ] **Step 5: Run the tests to verify they pass**
 
-Run: `uv run pytest tests/stv/test_ojin_stv_client.py -k "buffers_original or coalesces" -v`
+Run: `uv run pytest tests/stv/test_ojin_stv_client.py -k "buffers_original or combines" -v`
 Expected: PASS (2 passed).
 
 - [ ] **Step 6: Run the full stv suite to catch regressions**

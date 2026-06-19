@@ -1,4 +1,4 @@
-"""Server-feed audio batcher: coalesce TTS chunks into larger sends.
+"""Server-feed audio batcher: combine TTS chunks into larger sends.
 
 A pure, synchronous state machine (no I/O, no asyncio) — the testable seam for
 ``OjinSTVClient``'s server-bound audio. TTS providers stream small (~40 ms)

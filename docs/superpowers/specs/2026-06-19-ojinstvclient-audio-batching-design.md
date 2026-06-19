@@ -41,7 +41,7 @@ covers the real-world traffic without touching the server.
 
 - Accumulate an **initial chunk** (default 1000 ms) before the first send of a
   turn, re-armed on every `start_turn()`, to establish the server's supply lead.
-- Coalesce steady-state sends to a **minimum of 400 ms** each.
+- Combine steady-state sends to a **minimum of 400 ms** each.
 - Flush a sub-threshold **tail** promptly when TTS goes quiet (turn ends / short
   turns), so the end of an utterance is never stranded.
 - Preserve audio/video sync and the existing playback path.

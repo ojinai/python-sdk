@@ -78,7 +78,7 @@ def test_send_tts_audio_buffers_original_and_sends_resampled() -> None:
     asyncio.run(run())
 
 
-def test_batching_coalesces_to_initial_then_min() -> None:
+def test_batching_combines_to_initial_then_min() -> None:
     """Batching emits one ~1000 ms initial chunk, then ~400 ms min chunks."""
 
     async def run() -> None:

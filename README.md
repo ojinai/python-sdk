@@ -162,7 +162,7 @@ asyncio.run(main())
 
 **Turns.** A turn is one spoken utterance. Open it with `start_turn()`, then push audio with `send_tts_audio(pcm, sample_rate, num_channels)` as many times as you like. The client buffers and plays the **original** audio you sent while a 16 kHz copy goes to the server for lip-sync — so the voice the user hears is always exactly yours. Because the original is what's played back, you can feed **higher-quality** TTS (e.g. 24 kHz) for better sound and lip-sync still works on the 16 kHz copy — just set your player to the `sample_rate` each `STVAudioFrame` reports.
 
-**Input shaping.** Feed audio at whatever cadence your TTS produces — even tiny 40 ms fragments. The client takes care of the input shape to optimize latency and stability: it primes a ~1 s lead after each `start_turn()`, then coalesces your audio into **≥400 ms** chunks before forwarding it to the server, so the inference head never starves and lip-sync stays stable. It's automatic — tune it (or restore per-chunk sends) with the `server_feed_*` fields on [`STVConfig`](#configuration).
+**Input shaping.** Feed audio at whatever cadence your TTS produces — even tiny 40 ms fragments. The client takes care of the input shape to optimize latency and stability: it primes a ~1 s lead after each `start_turn()`, then combines your audio into **≥400 ms** chunks before forwarding it to the server, so the inference head never starves and lip-sync stays stable. It's automatic — tune it (or restore per-chunk sends) with the `server_feed_*` fields on [`STVConfig`](#configuration).
 
 **Audio is the clock.** The playback loop emits **exactly one audio frame every tick** (real audio or silence so the consumer never starves) plus a video frame whenever one is ready, at `STVConfig.fps` (default 25 → a 40 ms tick). Video falls back to repeating the last frame rather than stalling.
 
@@ -301,7 +301,7 @@ With a `PassthroughDecoder`, `STVVideoFrame.rgb` is `None` and the raw JPEG arri
 | `align_audio_on_swap` | `True` | Re-align audio/video at buffer swaps |
 | `interrupt_audio_fade_s` | `0.75` | Fade length applied on barge-in |
 | `lipsync_trace_enabled` | `False` | Emit the per-tick A/V-sync diagnostics |
-| `server_feed_batching_enabled` | `True` | Prime + coalesce the server-bound audio feed (`False` = send each chunk as-is) |
+| `server_feed_batching_enabled` | `True` | Prime + combine the server-bound audio feed (`False` = send each chunk as-is) |
 | `server_feed_initial_chunk_ms` | `1000` | Initial lead accumulated after each `start_turn()` |
 | `server_feed_min_chunk_ms` | `400` | Steady-state minimum send size |
 | `server_feed_flush_idle_ms` | `200` | Quiet time before flushing a sub-threshold tail |
