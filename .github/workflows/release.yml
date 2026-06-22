@@ -32,10 +32,10 @@ jobs:
       should_publish: ${{ steps.v.outputs.SHOULD_BUILD }}
       version: ${{ steps.v.outputs.VERSION }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 2 # need HEAD~1 to diff the version
-      - uses: actions/setup-python@v5
+      - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
       - id: v
@@ -58,7 +58,7 @@ jobs:
     if: needs.check.outputs.should_publish == 'true'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: ./.github/actions/ci-verify
 
   # 3) Build sdist + wheel with uv, hand them to the publish job as an artifact.
@@ -66,10 +66,10 @@ jobs:
     needs: verify
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: astral-sh/setup-uv@v5
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v7
       - run: uv build
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: dist
           path: dist/
@@ -82,7 +82,7 @@ jobs:
     permissions:
       id-token: write # mint the OIDC token PyPI trusts
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           name: dist
           path: dist/
@@ -95,7 +95,7 @@ jobs:
     permissions:
       contents: write # push the tag
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Tag the release commit
         env:
           VERSION: ${{ needs.check.outputs.version }}
