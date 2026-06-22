@@ -4,6 +4,22 @@ All notable changes to `ojin-client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0 — see CONTRIBUTING.md).
 
+## 0.8.0 - 2026-06-19
+
+### Added
+- `OjinSTVClient` now batches the audio it sends to the inference server instead
+  of forwarding every TTS chunk immediately. Providers that stream small (~40 ms)
+  chunks at realtime previously starved the server's 25 fps timeline (no supply
+  lead builds when input rate equals output rate) and churned sub-frame residues
+  that disrupted buffer swaps and lip-sync. The client now accumulates a
+  lead-establishing initial chunk per `start_turn` (`server_feed_initial_chunk_ms`,
+  default 1000 ms), then steady-state chunks of at least `server_feed_min_chunk_ms`
+  (default 400 ms), and flushes a sub-threshold tail after
+  `server_feed_flush_idle_ms` of quiet (default 200 ms). A barge-in discards the
+  un-sent tail; `close` flushes it best-effort. Set
+  `server_feed_batching_enabled=False` to restore per-chunk sends. The avatar
+  playback path is unchanged — only the server-bound resampled copy is batched.
+
 ## 0.7.0 - 2026-06-18
 
 ### Added

@@ -91,6 +91,8 @@ client = OjinSTVClient(api_key=creds.api_key, config_id=creds.config_id)
 
 By default the client connects to `wss://models.ojin.ai/realtime`. Override it with the `ws_url` argument if you're pointed at another environment.
 
+> **Run it server-side.** The realtime transport is a WebSocket built for **server-to-server** delivery over a stable connection — run the client on your backend (not an end-user device), ideally in **US East** near Ojin's inference, and relay the final media to your users over a realtime transport such as WebRTC.
+
 ---
 
 ## Quickstart
@@ -158,7 +160,9 @@ asyncio.run(main())
 
 ## Core concepts
 
-**Turns.** A turn is one spoken utterance. Open it with `start_turn()`, then push audio with `send_tts_audio(pcm, sample_rate, num_channels)` as many times as you like. The client buffers and plays the **original** audio you sent while a 16 kHz copy goes to the server for lip-sync — so the voice the user hears is always exactly yours.
+**Turns.** A turn is one spoken utterance. Open it with `start_turn()`, then push audio with `send_tts_audio(pcm, sample_rate, num_channels)` as many times as you like. The client buffers and plays the **original** audio you sent while a 16 kHz copy goes to the server for lip-sync — so the voice the user hears is always exactly yours. Because the original is what's played back, you can feed **higher-quality** TTS (e.g. 24 kHz) for better sound and lip-sync still works on the 16 kHz copy — just set your player to the `sample_rate` each `STVAudioFrame` reports.
+
+**Input shaping.** Feed audio at whatever cadence your TTS produces — even tiny 40 ms fragments. The client takes care of the input shape to optimize latency and stability: it primes a ~1 s lead after each `start_turn()`, then combines your audio into **≥400 ms** chunks before forwarding it to the server, so the inference head never starves and lip-sync stays stable. It's automatic — tune it (or restore per-chunk sends) with the `server_feed_*` fields on [`STVConfig`](#configuration).
 
 **Audio is the clock.** The playback loop emits **exactly one audio frame every tick** (real audio or silence so the consumer never starves) plus a video frame whenever one is ready, at `STVConfig.fps` (default 25 → a 40 ms tick). Video falls back to repeating the last frame rather than stalling.
 
@@ -292,11 +296,15 @@ With a `PassthroughDecoder`, `STVVideoFrame.rgb` is `None` and the raw JPEG arri
 | `client_connect_max_retries` | `3` | Connect attempts before giving up |
 | `client_reconnect_delay` | `3.0` | Seconds between connect attempts |
 | `fps` | `25` | Playback frame rate (40 ms tick) |
-| `initial_buffer_frames` | `6` | Video frames buffered before playback starts |
+| `initial_buffer_frames` | `6` | Video frames buffered before playback starts (the small jitter buffer) |
 | `max_buffered_video_frames` | `700` | Hard cap on queued video frames |
 | `align_audio_on_swap` | `True` | Re-align audio/video at buffer swaps |
 | `interrupt_audio_fade_s` | `0.75` | Fade length applied on barge-in |
 | `lipsync_trace_enabled` | `False` | Emit the per-tick A/V-sync diagnostics |
+| `server_feed_batching_enabled` | `True` | Prime + combine the server-bound audio feed (`False` = send each chunk as-is) |
+| `server_feed_initial_chunk_ms` | `1000` | Initial lead accumulated after each `start_turn()` |
+| `server_feed_min_chunk_ms` | `400` | Steady-state minimum send size |
+| `server_feed_flush_idle_ms` | `200` | Quiet time before flushing a sub-threshold tail |
 
 Video frames are emitted at the server's native resolution — read `STVVideoFrame.width`/`height` per frame rather than configuring an output size. Set `OJIN_MODE=dev` in the environment to attach the dev-mode query flag when connecting with the default transport.
 
@@ -372,10 +380,10 @@ async def main(pcm_16k_mono: bytes) -> None:
 ## Troubleshooting
 
 - **`No backend servers available`** — capacity is momentarily exhausted; retry shortly. Surfaced as an `ERROR` event with code `NO_BACKEND_SERVER_AVAILABLE`.
-- **Avatar mouth stays still** — you're likely too less audio and the server cannot keep up with 25fps for speech, resulting in idle frames being introduced in between. 
-We recommend sending as much audio as possible upfront with a minimum of 1s, then keep up with a 25fps natural audio input timeline from there on, with as big chunk size as possible
+- **Avatar mouth stays still / only idle frames** — the server is starved of audio and can't sustain 25 fps speech, so it emits idle frames in between. `OjinSTVClient` shapes the input to prevent this (see **Input shaping** above); it should only surface if you set `server_feed_batching_enabled=False` or drive the low-level `OjinClient` — then send a ~1 s lead up front, followed by the largest chunks you can.
 - **`Inference Server is not ready`** (low-level) — wait for `OjinSessionReadyMessage` before calling `send_message()`.
 - **Choppy playback** — keep the event loop free; the SDK already decodes JPEG off-loop, but heavy synchronous work in your frame handlers will stall the 40 ms tick. Enable `STVConfig(lipsync_trace_enabled=True)` to inspect per-tick timing.
+- **Latency higher than expected** — the WebSocket transport is built for **server-to-server** use over a stable connection. Run the client on a backend (not an end-user device), ideally in **US East**, close to Ojin's inference; deliver the final media to end users over a realtime transport such as WebRTC. The client keeps a small video buffer (`initial_buffer_frames`) to absorb network jitter, since the server delivers at realtime 25 fps.
 
 ---
 

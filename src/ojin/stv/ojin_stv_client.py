@@ -50,6 +50,7 @@ from ojin.stv.events import EventEmitter, STVEvent
 from ojin.stv.frames import STVAudioFrame, STVVideoFrame
 from ojin.stv.output import QueueOutput, STVOutput
 from ojin.stv.resampler import Resampler, default_resampler
+from ojin.stv.send_batcher import SendBatcher
 from ojin.stv.synchronizer import (
     BYTES_PER_FRAME,
     OJIN_PERSONA_SAMPLE_RATE,
@@ -71,6 +72,7 @@ _DEFAULT_WS_URL = "wss://models.ojin.ai/realtime"
 _HALF_SECOND = 0.5
 _HALF_SECOND_TOL = 0.01
 _ONE_SEC_US = 1_000_000  # rolling window for the playback_fps counter
+_BYTES_PER_MS_16K = OJIN_PERSONA_SAMPLE_RATE * 2 / 1000.0  # 32 B/ms mono int16
 
 
 class OjinSTVClient:
@@ -120,6 +122,17 @@ class OjinSTVClient:
         self._output: STVOutput = output or QueueOutput()
         self._events = EventEmitter()
         self._synchronizer = Synchronizer(self._config)
+        self._batcher = SendBatcher(
+            initial_chunk_bytes=int(
+                self._config.server_feed_initial_chunk_ms * _BYTES_PER_MS_16K
+            ),
+            min_chunk_bytes=int(
+                self._config.server_feed_min_chunk_ms * _BYTES_PER_MS_16K
+            ),
+            flush_idle_s=self._config.server_feed_flush_idle_ms / 1000.0,
+        )
+        self._batch_added = asyncio.Event()
+        self._batch_flush_task: Optional[asyncio.Task] = None
 
         self._initialized = False
         self._session_data: Optional[dict] = None
@@ -262,6 +275,17 @@ class OjinSTVClient:
         self._stop_decode_worker()
         if was_initialized:
             self._tracer.span("lifecycle", "session", self._tr_session_start)
+        # Stop the batch-flush task before the transport closes.
+        if self._batch_flush_task is not None:
+            self._batch_flush_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError, Exception):
+                await self._batch_flush_task
+            self._batch_flush_task = None
+        if was_initialized and self._config.server_feed_batching_enabled:
+            pending = self._batcher.drain()
+            if pending is not None:
+                with contextlib.suppress(Exception):
+                    await self._send_audio_message(pending)
         try:
             await self._client.close()
         except Exception as exc:  # never let teardown raise
@@ -300,6 +324,16 @@ class OjinSTVClient:
         self._tracer.instant(
             "tts_input", "tts_started", args={"buffer_id": buf.buffer_id}
         )
+        if self._config.server_feed_batching_enabled:
+            pending = self._batcher.drain()
+            if pending is not None:
+                await self._send_audio_message(pending)
+            self._batcher.rearm_initial()
+
+    async def _send_audio_message(self, pcm: bytes) -> None:
+        """Send one server-bound audio payload and record the to_server trace."""
+        await self._client.send_message(OjinAudioInputMessage(audio_int16_bytes=pcm))
+        self._tracer.instant("to_server", "audio_sent", args={"bytes": len(pcm)})
 
     async def send_tts_audio(
         self, pcm: bytes, sample_rate: int, num_channels: int
@@ -356,10 +390,13 @@ class OjinSTVClient:
             if input_rms is not None:
                 self._tracer.counter("input_audio_rms", round(input_rms, 1))
 
-        await self._client.send_message(
-            OjinAudioInputMessage(audio_int16_bytes=resampled)
-        )
-        self._tracer.instant("to_server", "audio_sent", args={"bytes": len(resampled)})
+        if self._config.server_feed_batching_enabled:
+            to_send = self._batcher.add(resampled)
+            self._batch_added.set()  # any arrival resets the idle-flush timer
+            if to_send is not None:
+                await self._send_audio_message(to_send)
+        else:
+            await self._send_audio_message(resampled)
 
     async def say(self, pcm: bytes, sample_rate: int, num_channels: int) -> None:
         """Open a turn and send one audio payload (one-shot helper)."""
@@ -404,6 +441,8 @@ class OjinSTVClient:
         if self._synchronizer.interrupt():
             self._interruption_ongoing = True
             await self._client.send_message(OjinCancelInteractionMessage())
+            if self._config.server_feed_batching_enabled:
+                self._batcher.reset()
             self._tr_interrupt_start = self._tracer.mark()
             self._tracer.instant("interruption", "cancel_sent")
             await self._events.emit(STVEvent.INTERRUPTED)
@@ -444,6 +483,11 @@ class OjinSTVClient:
             self._tracer.span("lifecycle", "connect", self._tr_connect_start)
             if self._playback_task is None:
                 self._playback_task = asyncio.create_task(self._video_playback_loop())
+            if (
+                self._config.server_feed_batching_enabled
+                and self._batch_flush_task is None
+            ):
+                self._batch_flush_task = asyncio.create_task(self._batch_flush_loop())
             await self._events.emit(
                 STVEvent.SESSION_READY, session_data=self._session_data
             )
@@ -532,6 +576,40 @@ class OjinSTVClient:
             next_tick += frame_duration
             self._diagnostics.note_tick()
             await self._emit_tick()
+
+    async def _batch_flush_tick(self, idle: float) -> None:
+        """Run one debounce tick: wait for audio or fire a tail flush on timeout.
+
+        Extracted from the loop so the ``try``/``except`` does not sit directly
+        inside ``while`` (avoids PERF203).  Raises ``asyncio.CancelledError``
+        so the caller loop can exit cleanly; all other exceptions are swallowed
+        and logged so one bad send never kills the loop.
+        """
+        try:
+            await asyncio.wait_for(self._batch_added.wait(), timeout=idle)
+            self._batch_added.clear()  # new audio arrived → restart the timer
+        except asyncio.TimeoutError:
+            if self._batcher.flush_due():
+                pending = self._batcher.drain()
+                if pending is not None:
+                    await self._send_audio_message(pending)
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # never let one bad send kill the loop
+            logger.exception("batch flush loop error — continuing")
+
+    async def _batch_flush_loop(self) -> None:
+        """Flush a sub-threshold audio tail after the idle gap, off the playback clock.
+
+        Debounces on ``_batch_added``: each new chunk restarts the timer, so a
+        flush only fires once TTS has been quiet for ``server_feed_flush_idle_ms``
+        (turn end / short turn). Runs as its own task so a blocking websocket send
+        never jitters the 25 fps playback loop. Re-arm of the initial threshold is
+        NOT done here — that is tied to ``start_turn``.
+        """
+        idle = self._config.server_feed_flush_idle_ms / 1000.0
+        while self._initialized:
+            await self._batch_flush_tick(idle)
 
     async def _emit_tick(self) -> None:
         """Run one tick: drain decode output, step the synchronizer, emit frames.
