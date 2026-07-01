@@ -319,6 +319,11 @@ class OjinSTVClient:
             self._preinit_inputs.append(("turn",))
             self._tracer.instant("tts_input", "tts_started_buffered")
             return
+        # Flush the previous turn's resampler tail (soxr holds back ~30 ms of
+        # filter delay). Dropping it makes the 16 kHz server feed shorter than the
+        # played 24 kHz audio and drifts lip-sync; instead send it as the trailing
+        # audio of the turn that just ended, before the new turn's buffer opens.
+        tail = self._flush_resampler()
         buf = self._synchronizer.open_turn()
         self._waiting_for_first_tts = True
         self._tracer.instant(
@@ -326,9 +331,24 @@ class OjinSTVClient:
         )
         if self._config.server_feed_batching_enabled:
             pending = self._batcher.drain()
-            if pending is not None:
-                await self._send_audio_message(pending)
+            payload = (pending or b"") + tail
+            if payload:
+                await self._send_audio_message(payload)
             self._batcher.rearm_initial()
+        elif tail:
+            await self._send_audio_message(tail)
+
+    def _flush_resampler(self) -> bytes:
+        """Drain the streaming resampler's held tail at a turn boundary.
+
+        Guarded so an injected resampler without ``flush`` degrades gracefully to
+        the old drop-the-tail behaviour rather than raising.
+        """
+        flush = getattr(self._resampler, "flush", None)
+        if not callable(flush):
+            return b""
+        tail = flush()
+        return tail if isinstance(tail, bytes) else b""
 
     async def _send_audio_message(self, pcm: bytes) -> None:
         """Send one server-bound audio payload and record the to_server trace."""
@@ -443,6 +463,9 @@ class OjinSTVClient:
             await self._client.send_message(OjinCancelInteractionMessage())
             if self._config.server_feed_batching_enabled:
                 self._batcher.reset()
+            # Drop the cancelled turn's resampler tail so it can't bleed into the
+            # next turn's feed; the next turn starts from a clean filter.
+            self._flush_resampler()
             self._tr_interrupt_start = self._tracer.mark()
             self._tracer.instant("interruption", "cancel_sent")
             await self._events.emit(STVEvent.INTERRUPTED)

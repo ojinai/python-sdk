@@ -26,15 +26,9 @@ from __future__ import annotations
 
 import importlib
 import importlib.util
-import time
 from typing import Any, Protocol, runtime_checkable
 
 import numpy as np
-
-# A streaming resampler keeps filter history between chunks. When the gap since
-# the last chunk exceeds this, the history is stale (a new turn / silence) and is
-# cleared so old audio cannot bleed into the next turn's first samples.
-_CLEAR_HISTORY_AFTER_S = 0.2
 
 
 @runtime_checkable
@@ -45,16 +39,33 @@ class Resampler(Protocol):
         """Return ``pcm`` resampled from ``in_rate`` to ``out_rate`` Hz."""
         ...
 
+    def flush(self) -> bytes:
+        """Drain any buffered tail at a content boundary (new turn / interrupt).
+
+        A streaming resampler holds back a filter-delay tail that depends on
+        future input; ``flush`` emits it and resets, so the caller can send it as
+        the end of the segment just finished. Stateless resamplers return ``b""``.
+        """
+        ...
+
 
 class SoxrStreamResampler:
     """Streaming resampler backed by ``soxr.ResampleStream`` (VHQ, lazy-imported).
 
-    Faithful port of pipecat's ``SOXRStreamAudioResampler``. It keeps the SoX
-    resampler's internal filter history across calls, so feeding a chunked stream
-    produces the same waveform as resampling the whole signal at once — no clicks
-    at chunk boundaries. The trade-off is a small constant filter delay (~500
-    samples at 24→16 kHz VHQ); it is not flushed, so the last ~30 ms of each turn
-    stays buffered until the next chunk (inaudible on the lip-sync feed).
+    Ported from pipecat's ``SOXRStreamAudioResampler`` (diverging in how history
+    is reset, below). It keeps the SoX resampler's internal filter history across
+    calls, so feeding a chunked stream produces the same waveform as resampling
+    the whole signal at once — no clicks at chunk boundaries. The output depends
+    only on the audio fed, never on the wall-clock timing of the calls.
+
+    The stream holds back a small constant filter delay (~500 samples at
+    24→16 kHz VHQ) that depends on future input. :meth:`flush` drains it and
+    resets, so at a real content boundary (a new turn / interruption) the caller
+    can emit the tail as the end of the segment just finished and start the next
+    one clean. This keeps the resample duration-preserving. (pipecat's version
+    instead resets history on a wall-clock gap and *discards* the tail; on a
+    real-time TTS feed — chunks ~1 s apart — that fired on every chunk, dropping
+    ~1.7% of duration each time and drifting lip-sync ~16 ms/s.)
 
     This is the right default for the server-feed: it is called once per client
     with a fixed sample-rate pair and a stream of TTS chunks. Mono int16 only.
@@ -65,11 +76,10 @@ class SoxrStreamResampler:
         super().__init__()
         self._in_rate: int | None = None
         self._out_rate: int | None = None
-        self._last_resample_time: float = 0.0
         self._stream: Any = None  # soxr.ResampleStream | None (lazy)
 
     def _ensure_stream(self, in_rate: int, out_rate: int) -> None:
-        """(Re)build the SoX stream, or clear stale history after a gap.
+        """(Re)build the SoX stream on first use or a sample-rate change.
 
         Unlike pipecat's resampler — which raises if reused with a different
         sample-rate pair — this is a library default, so a rate change simply
@@ -87,9 +97,6 @@ class SoxrStreamResampler:
                 quality="VHQ",
                 dtype="int16",
             )
-        elif time.monotonic() - self._last_resample_time > _CLEAR_HISTORY_AFTER_S:
-            self._stream.clear()
-        self._last_resample_time = time.monotonic()
 
     async def resample(self, pcm: bytes, in_rate: int, out_rate: int) -> bytes:
         """Resample one chunk of mono int16 PCM; identity when rates match."""
@@ -99,6 +106,21 @@ class SoxrStreamResampler:
         samples = np.frombuffer(pcm, dtype="<i2")
         out = self._stream.resample_chunk(samples)
         return out.astype("<i2").tobytes()
+
+    def flush(self) -> bytes:
+        """Drain the held filter-delay tail and reset the stream.
+
+        Call at a content boundary (new turn / interruption). Returns the tail
+        PCM (bytes) that soxr was holding for the segment just fed — emit it as
+        that segment's final audio so the feed's duration matches its source.
+        The next :meth:`resample` starts a fresh stream. Returns ``b""`` when
+        nothing is buffered.
+        """
+        if self._stream is None:
+            return b""
+        tail = self._stream.resample_chunk(np.zeros(0, dtype="<i2"), last=True)
+        self._stream = None
+        return tail.astype("<i2").tobytes()
 
 
 class SoxrResampler:
@@ -120,6 +142,10 @@ class SoxrResampler:
         out = soxr.resample(samples, in_rate, out_rate, quality="VHQ")
         return out.astype("<i2").tobytes()
 
+    def flush(self) -> bytes:
+        """Stateless: nothing is buffered, so there is no tail to drain."""
+        return b""
+
 
 class NumpyLinearResampler:
     """Pure-numpy linear-interpolation fallback (no extra dependency)."""
@@ -136,6 +162,10 @@ class NumpyLinearResampler:
         x_new = np.linspace(0, len(samples) - 1, n_out)
         out = np.interp(x_new, x_old, samples)
         return np.clip(np.round(out), -32768, 32767).astype("<i2").tobytes()
+
+    def flush(self) -> bytes:
+        """Stateless: nothing is buffered, so there is no tail to drain."""
+        return b""
 
 
 def default_resampler() -> Resampler:

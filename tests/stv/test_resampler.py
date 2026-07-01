@@ -138,3 +138,109 @@ def test_numpy_linear_identity_and_empty() -> None:
     pcm = np.arange(100, dtype="<i2").tobytes()
     assert asyncio.run(NumpyLinearResampler().resample(pcm, 16000, 16000)) == pcm
     assert asyncio.run(NumpyLinearResampler().resample(b"", SR_IN, SR_OUT)) == b""
+
+
+class _FakeClock:
+    """Fake ``time`` for the resampler module.
+
+    Lets tests drive the inter-chunk gap that decides history clearing, without
+    real sleeps.
+    """
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.t = start
+
+    def monotonic(self) -> float:
+        return self.t
+
+    def advance(self, dt: float) -> None:
+        self.t += dt
+
+
+@requires_soxr
+def test_inter_chunk_gaps_do_not_change_output(monkeypatch) -> None:
+    """Gapped delivery must resample identically to back-to-back delivery.
+
+    Output depends only on the audio fed, never on the wall-clock timing of the
+    calls. Regression for the Hume/24 kHz lip-sync drift: the resampler used to reset
+    its filter history whenever the wall-clock gap since the last chunk exceeded
+    a threshold. On a real-time TTS feed every chunk tripped that reset, so each
+    was resampled from cold and the soxr group-delay tail was dropped — the feed
+    came out ~1.7% short and the mouth ran ahead of the played audio at ~16 ms/s.
+    """
+    import ojin.stv.resampler as resampler_mod
+
+    src = _broadband_24k(seconds=6.0)
+    raw = src.tobytes()
+    step = SR_IN * 2  # 1 s of 24 kHz int16 per chunk
+    chunks = [raw[i : i + step] for i in range(0, len(raw), step)]
+
+    def run(gap_s: float) -> bytes:
+        clock = _FakeClock()
+        # Inert now (the resampler consults no clock); if a wall-clock reset is
+        # ever reintroduced this patch makes the two runs diverge and fail.
+        monkeypatch.setattr(resampler_mod, "time", clock, raising=False)
+        resampler = SoxrStreamResampler()
+        out = bytearray()
+        for c in chunks:
+            clock.advance(gap_s)  # simulate arrival gap between chunks
+            out += asyncio.run(resampler.resample(c, SR_IN, SR_OUT))
+        return bytes(out)
+
+    realtime = run(1.0)  # >0.2 s between chunks (real-time streaming)
+    back_to_back = run(0.01)  # bulk delivery, no meaningful gap
+
+    assert realtime == back_to_back, (
+        f"inter-chunk timing changed the resample ({len(realtime)} vs "
+        f"{len(back_to_back)} bytes) — output must depend only on the audio"
+    )
+
+
+@requires_soxr
+def test_flush_drains_filter_tail_to_exact_duration() -> None:
+    """flush() drains the held filter tail so a turn's feed is duration-exact.
+
+    No missing sub-frame tail is left behind to accumulate into drift.
+    """
+    resampler = SoxrStreamResampler()
+    src = _broadband_24k(seconds=5.0)
+    raw = src.tobytes()
+    step = SR_IN * 2
+    chunks = [raw[i : i + step] for i in range(0, len(raw), step)]
+
+    out = bytearray()
+    for c in chunks:
+        out += asyncio.run(resampler.resample(c, SR_IN, SR_OUT))
+    tail = resampler.flush()
+    out += tail
+
+    in_samples = len(raw) // 2
+    out_samples = len(out) // 2
+    ideal = round(in_samples * SR_OUT / SR_IN)
+    assert tail, "flush() should emit the held filter tail"
+    assert abs(out_samples - ideal) <= 4, (
+        f"flushed stream {out_samples} samples vs exact {ideal}"
+    )
+
+
+@requires_soxr
+def test_flush_is_empty_and_resets_stream() -> None:
+    """flush() drains once after feeding, then resets so a repeat flush is empty.
+
+    A fresh stream flushes to nothing; after resampling it yields the tail once,
+    then the next chunk starts a new segment.
+    """
+    resampler = SoxrStreamResampler()
+    assert resampler.flush() == b""  # nothing fed yet
+    asyncio.run(
+        resampler.resample(np.zeros(SR_IN, dtype="<i2").tobytes(), SR_IN, SR_OUT)
+    )
+    assert resampler.flush()  # tail available after feeding
+    assert resampler.flush() == b""  # already drained + reset
+
+
+def test_stateless_resamplers_flush_empty() -> None:
+    """The batch and numpy resamplers hold no state, so flush() is always empty."""
+    assert NumpyLinearResampler().flush() == b""
+    if HAS_SOXR:
+        assert SoxrResampler().flush() == b""
