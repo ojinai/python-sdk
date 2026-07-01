@@ -530,6 +530,62 @@ def test_start_turn_flushes_previous_tail_and_rearms_initial() -> None:
     asyncio.run(run())
 
 
+def test_start_turn_flushes_resampler_tail_to_server() -> None:
+    """A new turn drains the previous turn's *resampler* tail to the server.
+
+    The streaming resampler holds back a filter-delay tail; if it were dropped at
+    the turn boundary the 16 kHz server feed would be a hair shorter than the
+    played 24 kHz audio, drifting lip-sync. A fake resampler makes the tail
+    observable in the sent messages.
+    """
+    tail_marker = b"\xab\xcd" * 8
+
+    class _TailResampler:
+        def __init__(self) -> None:
+            self.pending = False
+            self.flushes = 0
+
+        async def resample(self, pcm: bytes, in_rate: int, out_rate: int) -> bytes:
+            self.pending = True  # a tail becomes available once audio is fed
+            return pcm
+
+        def flush(self) -> bytes:
+            self.flushes += 1
+            if self.pending:
+                self.pending = False
+                return tail_marker
+            return b""
+
+    async def run() -> None:
+        fc = FakeOjinClient()
+        rs = _TailResampler()
+        c = OjinSTVClient(
+            client=fc,
+            output=ListOutput(),
+            tracer=RecordingTracer(),
+            resampler=rs,
+            config=STVConfig(
+                loop_stall_watchdog_ms=0,
+                stall_probe_ms=0,
+                server_feed_batching_enabled=False,
+            ),
+        )
+        await c.start()
+        await asyncio.sleep(0.02)
+        await c.start_turn()
+        await c.send_tts_audio(b"\x03\x04" * 480, 24000, 1)  # 20 ms @ 24 kHz
+        fc.sent.clear()
+        await c.start_turn()  # turn boundary → flush prior turn's resampler tail
+        sent = [
+            m.audio_int16_bytes for m in fc.sent if isinstance(m, OjinAudioInputMessage)
+        ]
+        assert rs.flushes >= 1
+        assert tail_marker in sent, f"resampler tail not sent at boundary: {sent}"
+        await c.close()
+
+    asyncio.run(run())
+
+
 def test_interrupt_discards_pending_batch() -> None:
     """Barge-in throws away un-sent audio of the cancelled turn."""
 
