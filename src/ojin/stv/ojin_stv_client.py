@@ -160,6 +160,9 @@ class OjinSTVClient:
         self._tr_underruns = 0
         self._tr_idle_skips = 0
         self._prev_tick_perf = 0.0
+        # (cumulative ingress bytes, perf_counter) at the previous tick — the
+        # delta between ticks drives the ingress-bandwidth counter lane.
+        self._tr_prev_ingress: "tuple[int, float] | None" = None
 
         # Off-loop JPEG decode pipeline.
         self._decode_in: "queue.Queue[Optional[VideoFrame]]" = queue.Queue()
@@ -547,13 +550,22 @@ class OjinSTVClient:
         )
         self._decode_in.put(video_frame)
 
+        payload_bytes = len(message.video_frame_bytes) + len(message.audio_frame_bytes)
         self._tracer.instant(
             recv_lane_for_frame_type(frame_type),
             "frame_recv",
             cat=str(frame_type),
-            args={"frame_type": frame_type, "volume": volume},
+            args={"frame_type": frame_type, "volume": volume, "bytes": payload_bytes},
         )
         self._tracer.counter("recv_frame_type", frame_type)
+        # Per-frame transit delay: local wall clock minus the server's send
+        # hand-off stamp from the wire header. The bot↔server clock offset
+        # shifts the whole lane by a constant — read the SHAPE, not the
+        # absolute value: a flat lane is healthy pacing; a ramp is frames
+        # aging in transit (network/proxy holding them); a step is a stall.
+        if message.timestamp > 0:
+            transit_ms = time.time() * 1000.0 - float(message.timestamp)
+            self._tracer.counter("frame_transit_ms", round(transit_ms, 1))
         # End the barge-in window on the first idle/fade-out frame after a cancel —
         # the server's acknowledgement that the interruption took effect. Re-enables
         # interrupt() for the next turn.
@@ -812,9 +824,24 @@ class OjinSTVClient:
             "tcp_retransmits",
             "tcp_snd_cwnd",
             "tcp_rcv_space",
+            "tcp_bytes_received",
+            "tcp_min_rtt_us",
+            "tcp_rcv_ooopack",
         ):
             if name in depths:
                 tr.counter(name, depths[name])
+        # Ingress bandwidth: cumulative app-level bytes off the websocket plus
+        # a per-tick rate lane. Compared with ``tcp_bytes_received`` (kernel
+        # cumulative) this splits "network delivered late" from "read late".
+        if "ingress_bytes_total" in depths:
+            total = int(depths["ingress_bytes_total"])
+            now = time.perf_counter()
+            tr.counter("recv_ingress_bytes_total", total)
+            prev = self._tr_prev_ingress
+            if prev is not None and now > prev[1]:
+                rate_mbps = (total - prev[0]) * 8.0 / (now - prev[1]) / 1e6
+                tr.counter("recv_ingress_mbps", round(max(0.0, rate_mbps), 3))
+            self._tr_prev_ingress = (total, now)
         tr.counter("recv_decode_in", self._decode_in.qsize())
         tr.counter("recv_decode_out", self._decode_out.qsize())
 

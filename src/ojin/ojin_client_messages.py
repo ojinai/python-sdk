@@ -84,6 +84,9 @@ class OjinInteractionResponseMessage(OjinMessage):
     is_final_response: bool = False
     index: int
     frame_type: FrameType = FrameType.SPEECH
+    # Server-side send hand-off time (ms since Unix epoch, from the wire
+    # header). Lets the client plot per-frame transit delay; 0 when absent.
+    timestamp: int = 0
 
     @classmethod
     def from_proxy_message(cls, proxy_message: InteractionResponseMessage):
@@ -127,6 +130,7 @@ class OjinInteractionResponseMessage(OjinMessage):
             is_final_response=proxy_message.payload.is_final_response,
             index=proxy_message.payload.index,
             frame_type=frame_type,
+            timestamp=int(getattr(proxy_message.payload, "timestamp", 0) or 0),
         )
 
 
