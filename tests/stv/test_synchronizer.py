@@ -150,15 +150,20 @@ def test_align_trims_dropped_leading_speech() -> None:
     """With enough anchors, align trims leading audio to match the server's frame."""
     s = make_sync()
     fb = int(16000 * (1 / 25)) * 2  # 1280 bytes per 40 ms frame
-    # Buffer = 3 quiet frames then a loud region; server dropped the 3 quiet frames.
-    quiet = (b"\x00\x05" * (fb // 2)) * 3
-    loud = (b"\x00\x40" * (fb // 2)) * 8
+
+    def frame_of(v: int) -> bytes:
+        return v.to_bytes(2, "little", signed=True) * (fb // 2)
+
+    # Buffer = 3 quiet frames then a varying loud region (a flat envelope would
+    # match at several offsets and be rejected as ambiguous — real speech varies).
+    loud_seq = [16000, 9000, 13000, 6000, 11000, 15000, 8000, 12000]
+    quiet = frame_of(1280) * 3
     s.current_buffer = AudioBuffer(sample_rate=16000)
-    s.current_buffer.bytes_.extend(quiet + loud)
-    # 5 loud anchor frames already buffered as upcoming speech frames.
-    for _ in range(5):
-        s.video_frames.append(vf(1, audio=b"\x00\x40" * (fb // 2)))
-    trigger = vf(3, audio=b"\x00\x40" * (fb // 2))
+    s.current_buffer.bytes_.extend(quiet + b"".join(frame_of(v) for v in loud_seq))
+    # The server dropped the 3 quiet frames: its frames start at the loud onset.
+    for v in loud_seq[1:6]:
+        s.video_frames.append(vf(1, audio=frame_of(v)))
+    trigger = vf(3, audio=frame_of(loud_seq[0]))
     trimmed = s.align_current_buffer_to_frame(trigger)
     assert trimmed == 3  # the 3 quiet frames were trimmed
 
@@ -430,11 +435,14 @@ def test_align_silent_head_and_buffer_lead_nets_out() -> None:
     s = make_sync()
     s.current_buffer = AudioBuffer(sample_rate=16000)
     zero_frames = bytes(3 * FB)  # 3 near-zero frames the server never rendered...
-    loud = (b"\x00\x40" * (FB // 2)) * 8
+    loud_seq = [16000, 9000, 13000, 6000, 11000, 15000, 8000, 12000]  # varying
+    loud = b"".join(v.to_bytes(2, "little", signed=True) * (FB // 2) for v in loud_seq)
     s.current_buffer.bytes_.extend(zero_frames + loud)
     before = len(s.current_buffer.bytes_)
-    for _ in range(5):
-        s.video_frames.append(vf(1, audio=b"\x00\x40" * (FB // 2)))
+    for v in loud_seq[:5]:
+        s.video_frames.append(
+            vf(1, audio=v.to_bytes(2, "little", signed=True) * (FB // 2))
+        )
     # ...while the server emits 1 near-zero head frame: net trim = 3 - 1 = 2.
     shift = s.align_current_buffer_to_frame(vf(3, audio=b"\x00\x00" * (FB // 2)))
     assert shift == 2
@@ -474,3 +482,166 @@ def test_tick_natural_end_swap_aligns_padded_head() -> None:
     assert r.swapped is True
     assert r.align_trim_frames == -3  # audio delayed: 3 frames of silence prepended
     assert r.audio_chunk == bytes(FB)  # first drained chunk is the prepended silence
+
+
+# ----------------------------------------------------------------------
+# Deferred swap alignment (anchor starvation at just-in-time turn entry)
+# ----------------------------------------------------------------------
+
+
+def pcm_frame(rms: float, fb: int = FB) -> bytes:
+    """One 40 ms frame of constant int16 samples whose RMS equals `rms`."""
+    v = round(rms)
+    return v.to_bytes(2, "little", signed=True) * (fb // 2)
+
+
+def test_deferred_align_fires_after_anchors_arrive() -> None:
+    """A starved swap defers alignment and applies the shift a few ticks later.
+
+    At a real turn entry the video queue is 1-2 frames deep, so the swap tick
+    cannot build a 4-frame anchor. The old guard silently skipped alignment,
+    leaving ±1-frame skews for the whole turn. Now the head is snapshotted and
+    the shift lands once enough frames have popped.
+    """
+    s = make_sync(initial_buffer_frames=0)
+    s.current_buffer = AudioBuffer(sample_rate=16000)  # drained → replaceable
+    s.open_turn()
+    # Buffer: 1 near-zero frame the server dropped, then distinct loud frames.
+    rms_buf = [0, 5000, 12000, 15000, 9000, 6000, 13000, 8000, 11000, 7000]
+    s.audio_buffers[-1].bytes_.extend(b"".join(pcm_frame(v) for v in rms_buf))
+    before = len(s.audio_buffers[-1].bytes_)
+    # Server frames arrive one per tick, starting at the buffer's 2nd frame
+    # (the server dropped the near-zero head): trigger swap with only it queued.
+    server_rms = rms_buf[1:]
+    s.video_frames.append(vf(1, audio=pcm_frame(server_rms[0])))
+    r = s.tick()  # swap fires, anchor starved (1 audible frame) → deferred
+    assert r.swapped is True and r.align_trim_frames == 0
+    shifts = []
+    for v in server_rms[1:5]:
+        s.video_frames.append(vf(1, audio=pcm_frame(v)))
+        shifts.append(s.tick().align_trim_frames)
+    # 4th audible anchor completes on the 3rd follow-up tick → trim of 1 frame.
+    assert +1 in shifts
+    cur = s.current_buffer
+    assert cur is not None
+    drained = 5 * FB  # 5 ticks drained one chunk each
+    assert len(cur.bytes_) == before - drained - 1 * FB  # plus the 1-frame trim
+
+
+def test_deferred_align_gives_up_after_window() -> None:
+    """Deferred alignment stops waiting after _ALIGN_DEFER_MAX_TICKS."""
+    s = make_sync(initial_buffer_frames=0)
+    s.current_buffer = AudioBuffer(sample_rate=16000)
+    s.open_turn()
+    s.audio_buffers[-1].bytes_.extend(pcm_frame(9000) * 30)
+    s.video_frames.append(vf(1, audio=pcm_frame(9000)))
+    s.tick()  # swap, starved → pending
+    assert s._pending_align is not None
+    for _ in range(9):  # feed only near-silent speech frames: never enough anchors
+        s.video_frames.append(vf(1, audio=pcm_frame(0)))
+        s.tick()
+    assert s._pending_align is None  # gave up quietly
+
+
+def test_deferred_align_reset_on_interrupt() -> None:
+    """A barge-in cancels any pending alignment of the cancelled turn."""
+    s = make_sync(initial_buffer_frames=0)
+    s.current_buffer = AudioBuffer(sample_rate=16000)
+    s.open_turn()
+    s.audio_buffers[-1].bytes_.extend(pcm_frame(9000) * 30)
+    s.video_frames.append(vf(1, audio=pcm_frame(9000)))
+    s.tick()
+    assert s._pending_align is not None
+    assert s.interrupt() is True
+    assert s._pending_align is None
+
+
+# ----------------------------------------------------------------------
+# Regression fixtures: REAL RMS envelopes from staging session 4e35f6826fa5
+# (the two turn entries that stayed ±40 ms off because alignment never fired)
+# ----------------------------------------------------------------------
+
+# Run 4 (+40 ms, post-barge-in): the server dropped the buffer's near-zero head
+# frame; SOS arrives loud immediately. True shift: trim +1.
+RUN4_BUFFER = [
+    0.7,
+    5454.8,
+    12847.3,
+    15372.4,
+    12332.1,
+    6281.4,
+    12637.9,
+    13634.0,
+    11398.3,
+    14984.5,
+    13269.9,
+    8580.5,
+]
+RUN4_FRAMES = [5413.9, 12845.9, 15372.0, 12330.6, 6090.4, 12529.3, 13624.6]
+
+# Run 2 (-40 ms, natural entry): the server emitted 2 near-zero speech head
+# frames while the buffer has 1. True shift: prepend 1 (net -1).
+RUN2_BUFFER = [
+    0.8,
+    6117.4,
+    13390.6,
+    577.2,
+    7061.3,
+    10377.8,
+    15811.8,
+    10566.7,
+    795.0,
+    3629.6,
+    1189.5,
+    17878.1,
+]
+RUN2_FRAMES = [0.4, 0.3, 7782.9, 12476.1, 448.1, 7094.6, 11730.0, 15376.1]
+
+
+def _run_session_entry(buffer_rms, frame_rms, trigger_type=1):
+    """Replay a turn entry: starved queue, frames arriving one per tick."""
+    s = make_sync(initial_buffer_frames=0)
+    s.current_buffer = AudioBuffer(sample_rate=16000)
+    s.open_turn()
+    s.audio_buffers[-1].bytes_.extend(b"".join(pcm_frame(v) for v in buffer_rms))
+    s.video_frames.append(vf(trigger_type, audio=pcm_frame(frame_rms[0])))
+    first = s.tick()
+    assert first.swapped is True
+    shifts = [first.align_trim_frames]
+    for v in frame_rms[1:]:
+        s.video_frames.append(vf(1, audio=pcm_frame(v)))
+        shifts.append(s.tick().align_trim_frames)
+    return shifts
+
+
+def test_real_envelope_run4_post_barge_in_trims_one() -> None:
+    """Session 4e35f6826fa5 run 4: +40 ms skew → deferred trim of +1 frame."""
+    shifts = _run_session_entry(RUN4_BUFFER, RUN4_FRAMES, trigger_type=3)
+    assert +1 in shifts and -1 not in shifts
+
+
+def test_real_envelope_run2_natural_entry_prepends_one() -> None:
+    """Session 4e35f6826fa5 run 2: -40 ms skew → deferred prepend of 1 frame."""
+    shifts = _run_session_entry(RUN2_BUFFER, RUN2_FRAMES, trigger_type=1)
+    assert -1 in shifts and +1 not in shifts
+
+
+def test_ambiguous_match_shifts_nothing() -> None:
+    """Two equally-good windows (periodic envelope) fail the margin → no shift."""
+    s = make_sync(initial_buffer_frames=0)
+    s.current_buffer = AudioBuffer(sample_rate=16000)
+    s.open_turn()
+    # Perfectly periodic buffer: the anchor matches at d=2 AND d=4 equally.
+    pattern = [9000.0, 2000.0]
+    s.audio_buffers[-1].bytes_.extend(b"".join(pcm_frame(v) for v in pattern * 8))
+    before = len(s.audio_buffers[-1].bytes_)
+    frames = [2000.0, 9000.0, 2000.0, 9000.0, 2000.0]  # off-phase vs head
+    s.video_frames.append(vf(1, audio=pcm_frame(frames[0])))
+    s.tick()
+    for v in frames[1:]:
+        s.video_frames.append(vf(1, audio=pcm_frame(v)))
+        r = s.tick()
+        assert r.align_trim_frames == 0
+    cur = s.current_buffer
+    assert cur is not None
+    assert len(cur.bytes_) == before - 5 * FB  # only the 5 drained chunks

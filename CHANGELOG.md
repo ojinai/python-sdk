@@ -7,6 +7,22 @@ All notable changes to `ojin-client` are documented here. The format follows
 ## 0.8.3 - 2026-07-10
 
 ### Fixed
+- Lip-sync: swap-time alignment now actually fires at real turn entries. Two
+  production blockers, measured from staging traces: (a) at a real turn entry
+  the video queue is only 1-2 frames deep (just-in-time delivery), so the swap
+  tick never had the 4 audible frames the anchor guard demands — alignment was
+  silently skipped on every turn (0 `swap_align_trim` events across whole
+  sessions), leaving ±1-frame (±40 ms) whole-turn skews uncorrected. Alignment
+  is now DEFERRED: the buffer head is snapshotted at the swap and the anchor
+  keeps growing from the frames popped on the following ticks, applying the
+  shift a few ticks late (a skew is a constant offset, so the remainder of the
+  turn still aligns). (b) The 5% absolute error tolerance was too strict for
+  cross-sample-rate RMS envelopes (true offsets measured up to 4.5x it; wrong
+  offsets 87-374x): a non-head match is now accepted on a best-vs-second-best
+  margin (8x) under a loose sanity cap (25%), so confidence comes from how
+  uniquely the signature localizes, not from an absolute error bar. Regression
+  tests replay the exact RMS envelopes captured from the two misaligned turn
+  entries of staging session 4e35f6826fa5.
 - Lip-sync: `start_turn` no longer sends the previous turn's resampler tail to
   the server. The tail (last ~30-70 ms held by the soxr filter) belongs to
   audio that played seconds ago; sending it at the next turn boundary landed it
