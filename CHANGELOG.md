@@ -4,6 +4,29 @@ All notable changes to `ojin-client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0 — see CONTRIBUTING.md).
 
+## 0.8.3 - 2026-07-10
+
+### Fixed
+- Lip-sync: mid-speech video stalls are now repaid instead of shifting the video
+  timeline permanently. When speech audio drained on a tick with no fresh video
+  frame (a delivery stall → repeated frame), the video fell 40 ms behind the
+  audio per repeat and never caught up — a single 300 ms network hiccup desynced
+  the rest of the turn. The synchronizer now tracks the owed frames (capped at
+  1 s) and skips one extra plain-speech frame per tick once frames flow again,
+  never across a turn boundary. Disable with
+  `STVConfig(video_repeat_catchup_enabled=False)`. Traced as `repeat_catchup`
+  instants and the `repeat_catchup_drops_total` counter.
+- Lip-sync: swap-time alignment now handles a server turn head with extra
+  near-zero speech frames (e.g. padding minted while the server was starved of
+  TTS in the turn's first-fragment gap). Previously such a head both defeated
+  the aligner (the silent anchor aborted alignment) and needed a correction in
+  the direction the aligner could not do — the whole turn then played 40-120 ms
+  out of sync. The anchor signature now starts at the first audible frame, and
+  the signed onset difference either trims leading buffer audio (server dropped
+  it) or prepends silence so the audio waits for the video (server padded).
+  `TickResult.align_trim_frames` (and the `swap_align_trim` trace instant) can
+  now be negative — silence prepended.
+
 ## 0.8.0 - 2026-06-19
 
 ### Added

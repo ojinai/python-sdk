@@ -159,6 +159,7 @@ class OjinSTVClient:
         self._tr_emit_times: "deque[float]" = deque()
         self._tr_underruns = 0
         self._tr_idle_skips = 0
+        self._tr_catchup_drops = 0
         self._prev_tick_perf = 0.0
 
         # Off-loop JPEG decode pipeline.
@@ -727,6 +728,8 @@ class OjinSTVClient:
                 },
             )
         if result.align_trim_frames:
+            # Positive = leading buffer audio trimmed (server dropped it);
+            # negative = silence prepended (server emitted extra quiet head frames).
             tr.instant(
                 "lipsync",
                 "swap_align_trim",
@@ -736,6 +739,13 @@ class OjinSTVClient:
                         result.align_trim_frames * 1000.0 / self._config.fps, 1
                     ),
                 },
+            )
+        if result.catchup_dropped:
+            self._tr_catchup_drops += result.catchup_dropped
+            tr.instant(
+                "lipsync",
+                "repeat_catchup",
+                args={"dropped": result.catchup_dropped},
             )
         if result.overflow_dropped:
             tr.instant(
@@ -759,6 +769,7 @@ class OjinSTVClient:
         tr.counter("playback_fps", len(self._tr_emit_times))
         tr.counter("audio_underruns_total", self._tr_underruns)
         tr.counter("idle_backlog_skips_total", self._tr_idle_skips)
+        tr.counter("repeat_catchup_drops_total", self._tr_catchup_drops)
         if result.video_frame is not None and result.audio_chunk:
             frame_rms = rms_int16(result.video_frame.audio_bytes)
             if frame_rms is not None:

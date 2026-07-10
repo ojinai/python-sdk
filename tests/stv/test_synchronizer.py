@@ -289,3 +289,165 @@ def test_tick_interrupt_fade_then_silence() -> None:
     for _ in range(200):  # exhaust the fade window
         s.tick()
     assert s.tick().audio_chunk is None  # ramp complete → silence
+
+
+# ----------------------------------------------------------------------
+# Mid-speech video-repeat catch-up (repeat debt)
+# ----------------------------------------------------------------------
+
+
+def make_speaking_sync(chunks: int = 4) -> Synchronizer:
+    """Return a mid-turn synchronizer whose current buffer holds `chunks` chunks."""
+    s = make_sync(initial_buffer_frames=0)
+    buf = AudioBuffer(sample_rate=16000)
+    buf.bytes_.extend(b"\x01\x02" * (CHUNK // 2) * chunks)
+    s.current_buffer = buf
+    return s
+
+
+def test_tick_repeat_stall_accrues_debt_and_catches_up() -> None:
+    """A mid-speech stall (audio drains, no frame) is repaid by skipping a frame."""
+    s = make_speaking_sync()
+    s.video_frames.append(vf(1))
+    s.tick()  # normal paired tick
+    stalled = s.tick()  # no video queued: audio drains, video repeats → debt 1
+    assert stalled.video_frame is None and stalled.audio_chunk is not None
+    f1, f2, f3 = vf(1), vf(1), vf(1)
+    for f in (f1, f2, f3):
+        s.video_frames.append(f)
+    caught_up = s.tick()
+    assert caught_up.catchup_dropped == 1
+    assert caught_up.video_frame is f2  # f1 skipped: video jumps 80 ms this tick
+    assert len(s.video_frames) == 1
+    assert s.tick().catchup_dropped == 0  # debt repaid — back to one per tick
+
+
+def test_tick_repeat_catchup_never_skips_across_turn_boundary() -> None:
+    """Catch-up only skips plain speech: a new-turn head frame is never consumed."""
+    s = make_speaking_sync()
+    s.video_frames.append(vf(1))
+    s.tick()
+    s.tick()  # stall → debt 1
+    s.video_frames.append(vf(1))
+    s.video_frames.append(vf(3, audio=b"\x00\x40" * (CHUNK // 2)))
+    r = s.tick()
+    assert r.catchup_dropped == 0 and r.video_frame is not None
+    assert r.video_frame.frame_type == 1  # the new-turn frame stays queued
+
+
+def test_tick_repeat_debt_reset_at_turn_end() -> None:
+    """Owed video from one turn does not bleed into the next (idle pop resets)."""
+    s = make_speaking_sync(chunks=2)
+    s.video_frames.append(vf(1))
+    s.tick()
+    s.tick()  # stall while last chunk drains → debt 1
+    s.video_frames.append(vf(0))
+    s.tick()  # idle frame pops → turn over → debt reset
+    s.current_buffer = AudioBuffer(sample_rate=16000)
+    s.current_buffer.bytes_.extend(b"\x01\x02" * CHUNK)
+    s.video_frames.append(vf(1))
+    s.video_frames.append(vf(1))
+    r = s.tick()
+    assert r.catchup_dropped == 0 and len(s.video_frames) == 1
+
+
+def test_tick_idle_stall_accrues_no_debt() -> None:
+    """A stall with no speech draining (idle) owes nothing."""
+    s = make_sync(initial_buffer_frames=0)
+    s.tick()  # idle, no video, no audio
+    buf = AudioBuffer(sample_rate=16000)
+    buf.bytes_.extend(b"\x01\x02" * CHUNK)
+    s.current_buffer = buf
+    s.video_frames.append(vf(1))
+    s.video_frames.append(vf(1))
+    r = s.tick()
+    assert r.catchup_dropped == 0 and len(s.video_frames) == 1
+
+
+def test_tick_repeat_catchup_disabled_by_config() -> None:
+    """With the knob off, a stall shifts video permanently (legacy behavior)."""
+    s = make_sync(initial_buffer_frames=0, video_repeat_catchup_enabled=False)
+    buf = AudioBuffer(sample_rate=16000)
+    buf.bytes_.extend(b"\x01\x02" * CHUNK * 2)
+    s.current_buffer = buf
+    s.video_frames.append(vf(1))
+    s.tick()
+    s.tick()  # stall
+    s.video_frames.append(vf(1))
+    s.video_frames.append(vf(1))
+    r = s.tick()
+    assert r.catchup_dropped == 0 and len(s.video_frames) == 1
+
+
+def test_interrupt_resets_repeat_debt() -> None:
+    """A barge-in cancels the turn's owed video."""
+    s = make_speaking_sync()
+    s.video_frames.append(vf(1))
+    s.tick()
+    s.tick()  # stall → debt 1
+    assert s.interrupt() is True
+    s.current_buffer = AudioBuffer(sample_rate=16000)
+    s.current_buffer.bytes_.extend(b"\x01\x02" * CHUNK)
+    s.video_frames.append(vf(1))
+    s.video_frames.append(vf(1))
+    r = s.tick()
+    assert r.catchup_dropped == 0 and len(s.video_frames) == 1
+
+
+# ----------------------------------------------------------------------
+# Bidirectional swap alignment (silent-head anchor)
+# ----------------------------------------------------------------------
+
+FB = int(16000 * (1 / 25)) * 2  # 1280 bytes per 40 ms frame @ 16 kHz
+
+
+def test_align_prepends_silence_for_server_padded_head() -> None:
+    """Extra near-zero server head frames delay the audio instead of aborting.
+
+    The server can open a turn with speech-typed frames whose audio is ~zero
+    (padding minted while starved of TTS). The buffer has no such frames, so the
+    audio must WAIT: alignment prepends that much silence and reports a negative
+    shift. The old code skipped alignment entirely (silent anchor) and the whole
+    turn played 40 ms x N out of sync.
+    """
+    s = make_sync()
+    s.current_buffer = AudioBuffer(sample_rate=16000)
+    s.current_buffer.bytes_.extend((b"\x00\x40" * (FB // 2)) * 8)  # loud at head
+    before = len(s.current_buffer.bytes_)
+    zero = b"\x00\x00" * (FB // 2)
+    for _ in range(2):  # two more near-zero speech frames queued behind the trigger
+        s.video_frames.append(vf(1, audio=zero))
+    for _ in range(5):  # then the audible onset
+        s.video_frames.append(vf(1, audio=b"\x00\x40" * (FB // 2)))
+    shift = s.align_current_buffer_to_frame(vf(3, audio=zero))
+    assert shift == -3
+    assert len(s.current_buffer.bytes_) == before + 3 * FB
+    assert s.current_buffer.bytes_[: 3 * FB] == bytes(3 * FB)
+
+
+def test_align_silent_head_and_buffer_lead_nets_out() -> None:
+    """Server silent head and buffer quiet head cancel into a net signed shift."""
+    s = make_sync()
+    s.current_buffer = AudioBuffer(sample_rate=16000)
+    zero_frames = bytes(3 * FB)  # 3 near-zero frames the server never rendered...
+    loud = (b"\x00\x40" * (FB // 2)) * 8
+    s.current_buffer.bytes_.extend(zero_frames + loud)
+    before = len(s.current_buffer.bytes_)
+    for _ in range(5):
+        s.video_frames.append(vf(1, audio=b"\x00\x40" * (FB // 2)))
+    # ...while the server emits 1 near-zero head frame: net trim = 3 - 1 = 2.
+    shift = s.align_current_buffer_to_frame(vf(3, audio=b"\x00\x00" * (FB // 2)))
+    assert shift == 2
+    assert len(s.current_buffer.bytes_) == before - 2 * FB
+
+
+def test_align_no_shift_without_confident_match() -> None:
+    """An anchor that matches nowhere in the buffer shifts nothing."""
+    s = make_sync()
+    s.current_buffer = AudioBuffer(sample_rate=16000)
+    s.current_buffer.bytes_.extend((b"\x00\x05" * (FB // 2)) * 10)  # quiet only
+    before = len(s.current_buffer.bytes_)
+    for _ in range(5):
+        s.video_frames.append(vf(1, audio=b"\x00\x40" * (FB // 2)))
+    shift = s.align_current_buffer_to_frame(vf(3, audio=b"\x00\x40" * (FB // 2)))
+    assert shift == 0 and len(s.current_buffer.bytes_) == before
