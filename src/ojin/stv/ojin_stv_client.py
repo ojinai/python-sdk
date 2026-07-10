@@ -320,11 +320,18 @@ class OjinSTVClient:
             self._preinit_inputs.append(("turn",))
             self._tracer.instant("tts_input", "tts_started_buffered")
             return
-        # Flush the previous turn's resampler tail (soxr holds back ~30 ms of
-        # filter delay). Dropping it makes the 16 kHz server feed shorter than the
-        # played 24 kHz audio and drifts lip-sync; instead send it as the trailing
-        # audio of the turn that just ended, before the new turn's buffer opens.
-        tail = self._flush_resampler()
+        # Flush and DISCARD the previous turn's resampler tail (soxr holds back
+        # ~30 ms of filter delay). By start_turn time the previous turn ended
+        # seconds ago and its audio has already played; sending the tail now
+        # would land it at the HEAD of the new turn's server feed, where the
+        # server renders it as 1-2 near-zero speech frames the local buffer does
+        # not have — measured as a constant 40-80 ms video-late offset for the
+        # whole turn (staging session d65312d758f0: every natural-turn entry was
+        # offset by exactly the flushed tail's duration; barge-in turns, whose
+        # interrupt path already discards the tail, were clean). Dropping it
+        # only shortens the rendered tail of the PREVIOUS turn by ~1 frame —
+        # the server pads/fades a turn's end anyway. This mirrors interrupt().
+        self._flush_resampler()
         buf = self._synchronizer.open_turn()
         self._waiting_for_first_tts = True
         self._tracer.instant(
@@ -332,12 +339,9 @@ class OjinSTVClient:
         )
         if self._config.server_feed_batching_enabled:
             pending = self._batcher.drain()
-            payload = (pending or b"") + tail
-            if payload:
-                await self._send_audio_message(payload)
+            if pending:
+                await self._send_audio_message(pending)
             self._batcher.rearm_initial()
-        elif tail:
-            await self._send_audio_message(tail)
 
     def _flush_resampler(self) -> bytes:
         """Drain the streaming resampler's held tail at a turn boundary.

@@ -451,3 +451,26 @@ def test_align_no_shift_without_confident_match() -> None:
         s.video_frames.append(vf(1, audio=b"\x00\x40" * (FB // 2)))
     shift = s.align_current_buffer_to_frame(vf(3, audio=b"\x00\x40" * (FB // 2)))
     assert shift == 0 and len(s.current_buffer.bytes_) == before
+
+
+def test_tick_natural_end_swap_aligns_padded_head() -> None:
+    """Natural-end swaps run the aligner too — server head anomalies self-heal.
+
+    The server never marks a natural turn entry with frame_type 3, so anomalies
+    there (e.g. stale near-zero bytes rendered at the head) used to stick for
+    the whole turn. The swap triggered by a plain SPEECH frame must align.
+    """
+    s = make_sync(initial_buffer_frames=0)
+    s.current_buffer = AudioBuffer(sample_rate=16000)  # drained → replaceable
+    s.open_turn()
+    s.add_audio(bytes(b"\x00\x40" * (FB // 2)) * 8, 16000, 1)  # loud from byte 0
+    zero = b"\x00\x00" * (FB // 2)
+    for _ in range(2):  # two more near-zero speech frames behind the trigger
+        s.video_frames.append(vf(1, audio=zero))
+    for _ in range(5):
+        s.video_frames.append(vf(1, audio=b"\x00\x40" * (FB // 2)))
+    s.video_frames.appendleft(vf(1, audio=zero))  # the swap-triggering frame
+    r = s.tick()
+    assert r.swapped is True
+    assert r.align_trim_frames == -3  # audio delayed: 3 frames of silence prepended
+    assert r.audio_chunk == bytes(FB)  # first drained chunk is the prepended silence

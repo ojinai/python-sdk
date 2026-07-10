@@ -274,15 +274,17 @@ class Synchronizer:
         self.current_buffer = new_buffer
         self.swap_pending = False
 
-        # OJIN FIX (lipsync_0609): only the server-signalled new-turn boundary can
-        # drop leading speech, so it is the only path that needs alignment. A
-        # natural turn end has no fade and no drop — the correct trim is always 0,
-        # so aligning there can only inject error.
-        if (
-            self._config.align_audio_on_swap
-            and align_to_frame is not None
-            and align_to_frame.is_new_turn_start()
-        ):
+        # Align on every speech-triggered swap, natural turn ends included. The
+        # lipsync_0609 guard restricted this to the server-signalled new-turn
+        # boundary because the old matcher could only trim and a false trim on a
+        # natural end (where the correct shift is usually 0) injected error. Two
+        # things changed: the matcher is now confident-match-or-nothing with a
+        # head preference (steady state resolves to shift 0 and is untouched),
+        # and natural-turn entries were measured carrying real head anomalies
+        # (near-zero speech frames the buffer lacks) that ONLY this path can
+        # self-heal — the server never marks them, so waiting for frame_type 3
+        # means never correcting them.
+        if self._config.align_audio_on_swap and align_to_frame is not None:
             return self.align_current_buffer_to_frame(align_to_frame)
         return 0
 

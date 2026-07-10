@@ -7,6 +7,21 @@ All notable changes to `ojin-client` are documented here. The format follows
 ## 0.8.3 - 2026-07-10
 
 ### Fixed
+- Lip-sync: `start_turn` no longer sends the previous turn's resampler tail to
+  the server. The tail (last ~30-70 ms held by the soxr filter) belongs to
+  audio that played seconds ago; sending it at the next turn boundary landed it
+  at the head of the new turn's server feed, where the server rendered it as
+  1-2 near-zero speech frames the local buffer does not have — a constant
+  40-80 ms video-late offset for the whole turn. Measured on staging: every
+  natural-turn entry was offset by exactly the flushed tail's duration, while
+  barge-in turns (whose interrupt path already discards the tail) were clean.
+  The boundary still flushes the filter so the new turn starts from clean
+  state; the stale bytes are discarded, exactly like `interrupt` does.
+- Lip-sync: swap-time alignment now also runs on natural turn ends (plain
+  SPEECH trigger), not only on the server-marked new-turn boundary. The server
+  never marks natural entries, so head anomalies there could never self-heal.
+  Safe with the rewritten matcher: it only shifts on a confident envelope
+  match and prefers the head, so the steady state stays untouched.
 - Lip-sync: mid-speech video stalls are now repaid instead of shifting the video
   timeline permanently. When speech audio drained on a tick with no fresh video
   frame (a delivery stall → repeated frame), the video fell 40 ms behind the
