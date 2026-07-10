@@ -159,6 +159,7 @@ class OjinSTVClient:
         self._tr_emit_times: "deque[float]" = deque()
         self._tr_underruns = 0
         self._tr_idle_skips = 0
+        self._tr_catchup_drops = 0
         self._prev_tick_perf = 0.0
         # (cumulative ingress bytes, perf_counter) at the previous tick — the
         # delta between ticks drives the ingress-bandwidth counter lane.
@@ -322,11 +323,18 @@ class OjinSTVClient:
             self._preinit_inputs.append(("turn",))
             self._tracer.instant("tts_input", "tts_started_buffered")
             return
-        # Flush the previous turn's resampler tail (soxr holds back ~30 ms of
-        # filter delay). Dropping it makes the 16 kHz server feed shorter than the
-        # played 24 kHz audio and drifts lip-sync; instead send it as the trailing
-        # audio of the turn that just ended, before the new turn's buffer opens.
-        tail = self._flush_resampler()
+        # Flush and DISCARD the previous turn's resampler tail (soxr holds back
+        # ~30 ms of filter delay). By start_turn time the previous turn ended
+        # seconds ago and its audio has already played; sending the tail now
+        # would land it at the HEAD of the new turn's server feed, where the
+        # server renders it as 1-2 near-zero speech frames the local buffer does
+        # not have — measured as a constant 40-80 ms video-late offset for the
+        # whole turn (staging session d65312d758f0: every natural-turn entry was
+        # offset by exactly the flushed tail's duration; barge-in turns, whose
+        # interrupt path already discards the tail, were clean). Dropping it
+        # only shortens the rendered tail of the PREVIOUS turn by ~1 frame —
+        # the server pads/fades a turn's end anyway. This mirrors interrupt().
+        self._flush_resampler()
         buf = self._synchronizer.open_turn()
         self._waiting_for_first_tts = True
         self._tracer.instant(
@@ -334,12 +342,9 @@ class OjinSTVClient:
         )
         if self._config.server_feed_batching_enabled:
             pending = self._batcher.drain()
-            payload = (pending or b"") + tail
-            if payload:
-                await self._send_audio_message(payload)
+            if pending:
+                await self._send_audio_message(pending)
             self._batcher.rearm_initial()
-        elif tail:
-            await self._send_audio_message(tail)
 
     def _flush_resampler(self) -> bytes:
         """Drain the streaming resampler's held tail at a turn boundary.
@@ -739,6 +744,8 @@ class OjinSTVClient:
                 },
             )
         if result.align_trim_frames:
+            # Positive = leading buffer audio trimmed (server dropped it);
+            # negative = silence prepended (server emitted extra quiet head frames).
             tr.instant(
                 "lipsync",
                 "swap_align_trim",
@@ -748,6 +755,13 @@ class OjinSTVClient:
                         result.align_trim_frames * 1000.0 / self._config.fps, 1
                     ),
                 },
+            )
+        if result.catchup_dropped:
+            self._tr_catchup_drops += result.catchup_dropped
+            tr.instant(
+                "lipsync",
+                "repeat_catchup",
+                args={"dropped": result.catchup_dropped},
             )
         if result.overflow_dropped:
             tr.instant(
@@ -771,6 +785,7 @@ class OjinSTVClient:
         tr.counter("playback_fps", len(self._tr_emit_times))
         tr.counter("audio_underruns_total", self._tr_underruns)
         tr.counter("idle_backlog_skips_total", self._tr_idle_skips)
+        tr.counter("repeat_catchup_drops_total", self._tr_catchup_drops)
         if result.video_frame is not None and result.audio_chunk:
             frame_rms = rms_int16(result.video_frame.audio_bytes)
             if frame_rms is not None:
