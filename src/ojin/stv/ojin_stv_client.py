@@ -153,6 +153,15 @@ class OjinSTVClient:
         # before the cancel landed) can't stack a second cancel on the server.
         self._interruption_ongoing = False
 
+        # A turn whose start_turn() lands while a barge-in is still settling
+        # (_interruption_ongoing) is rejected wholesale: the server discards that
+        # turn's audio (it's still cancelling the prior one), so if the client kept
+        # buffering + playing it, every later turn would desync. This flag is set at
+        # start_turn and STAYS set for the whole turn — so audio that arrives after
+        # the interruption clears mid-turn is still dropped — and is reset only when
+        # the next turn opens outside an interruption. See is_audio_input_enabled.
+        self._turn_input_discarded = False
+
         # Per-tick trace bookkeeping (only touched when a real tracer is injected,
         # so a NullTracer session pays nothing). Mirrors OjinVideoService.
         self._tracing = not isinstance(self._tracer, NullTracer)
@@ -197,6 +206,18 @@ class OjinSTVClient:
     def session_data(self) -> Optional[dict]:
         """Server-provided session parameters, available after SESSION_READY."""
         return self._session_data
+
+    def is_audio_input_enabled(self) -> bool:
+        """Whether TTS input for the current turn is being accepted.
+
+        ``False`` from the moment a turn's :meth:`start_turn` lands during an
+        in-flight barge-in — the whole turn is rejected to stay in sync with the
+        server, which discards it — until the next turn opens outside an
+        interruption. Adapters read this to skip TTS bookkeeping (e.g. arming TTFB
+        metrics) for audio that will be dropped; the drop itself is enforced inside
+        :meth:`start_turn` / :meth:`send_tts_audio` so direct SDK users get it too.
+        """
+        return not self._turn_input_discarded
 
     def on(self, event: STVEvent) -> Callable:
         """Register an event handler via decorator (see :class:`STVEvent`)."""
@@ -319,6 +340,18 @@ class OjinSTVClient:
             self._preinit_inputs.append(("turn",))
             self._tracer.instant("tts_input", "tts_started_buffered")
             return
+        if self._interruption_ongoing:
+            # A new turn opened while a prior barge-in is still settling server-side.
+            # The server discards this turn's audio (it's still cancelling), so reject
+            # the whole turn client-side too: mark it discarded (sticky for the turn,
+            # so every following TTSAudioFrame is dropped even if the interruption
+            # clears mid-turn) and return without opening a buffer or flushing/sending
+            # the prior tail — interrupt() already reset the feed.
+            self._turn_input_discarded = True
+            self._tracer.instant("tts_input", "tts_started_discarded")
+            return
+        # Accept this turn: any prior turn's discard no longer applies.
+        self._turn_input_discarded = False
         # Flush the previous turn's resampler tail (soxr holds back ~30 ms of
         # filter delay). Dropping it makes the 16 kHz server feed shorter than the
         # played 24 kHz audio and drifts lip-sync; instead send it as the trailing
@@ -373,6 +406,14 @@ class OjinSTVClient:
                 )
             else:
                 logger.warning("send_tts_audio before session ready — dropping")
+            return
+
+        if self._turn_input_discarded:
+            # This turn was rejected at start_turn (it opened during a barge-in). Drop
+            # every one of its frames: the server never rendered this audio, so
+            # buffering it for playback would desync the avatar. Cleared when the next
+            # turn opens outside an interruption (see start_turn).
+            self._tracer.instant("tts_input", "tts_audio_discarded")
             return
 
         duration = len(pcm) / (sample_rate * num_channels * 2)
