@@ -4,6 +4,24 @@ All notable changes to `ojin-client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0 — see CONTRIBUTING.md).
 
+## 0.8.3 - 2026-07-12
+
+### Fixed
+- A turn whose `start_turn()` lands while a barge-in is still settling server-side
+  (`interrupt()` sent, not yet acknowledged) is now rejected wholesale by the
+  client. Previously the client opened a fresh buffer and fed both playback and the
+  server, but the server discards that audio (it is still cancelling the prior
+  turn) — so the client played audio the server never rendered, desyncing every
+  later turn. `start_turn()` now opens no buffer during an in-flight interruption
+  and marks the turn discarded; the decision is sticky for the whole turn, so
+  `send_tts_audio()` drops every one of its frames even if the interruption clears
+  part-way through (the audio still belongs to the turn that opened under it).
+
+### Added
+- `OjinSTVClient.is_audio_input_enabled()` — `False` while the current turn is
+  being discarded (see above), `True` otherwise. Adapters read it to skip TTS
+  bookkeeping (e.g. arming TTFB metrics) for audio that will be dropped.
+
 ## 0.8.0 - 2026-06-19
 
 ### Added

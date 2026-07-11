@@ -261,6 +261,85 @@ def test_interrupt_window_closes_on_idle_or_fadeout_frame() -> None:
     asyncio.run(run())
 
 
+def test_turn_opened_during_interruption_is_discarded() -> None:
+    """A turn whose start_turn lands during an in-flight barge-in drops all its audio.
+
+    The server discards this turn (still cancelling the prior one); if the client
+    buffered + sent it, playback would desync. So start_turn opens no buffer and
+    send_tts_audio feeds neither the playback buffer nor the server.
+    """
+
+    async def run() -> None:
+        c, fc, _out = make_client(server_feed_batching_enabled=False)
+        c._initialized = True  # a live turn only exists once the session is ready
+        c._synchronizer.current_buffer = _live_buffer()
+        await c.interrupt()
+        assert c._interruption_ongoing is True
+        fc.sent.clear()
+
+        # A new turn opens while the cancel is still unacknowledged → rejected.
+        pre_buffers = len(c._synchronizer.audio_buffers)
+        await c.start_turn()
+        assert c.is_audio_input_enabled() is False
+        assert len(c._synchronizer.audio_buffers) == pre_buffers  # no buffer opened
+        await c.send_tts_audio(b"\x01\x02" * 640, 16000, 1)
+        # Nothing buffered for playback, nothing fed to the server.
+        assert len(c._synchronizer.audio_buffers) == pre_buffers
+        assert not [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+
+    asyncio.run(run())
+
+
+def test_discarded_turn_stays_discarded_after_interruption_clears() -> None:
+    """The whole turn is dropped even if the interruption ends part-way through it.
+
+    The reject decision is made once, at start_turn; audio that arrives after the
+    server acknowledges the cancel (interruption cleared) is still dropped, because
+    that audio belongs to the turn that opened under the interruption.
+    """
+
+    async def run() -> None:
+        c, fc, _out = make_client(server_feed_batching_enabled=False)
+        c._initialized = True
+        c._synchronizer.current_buffer = _live_buffer()
+        await c.interrupt()
+        await c.start_turn()  # rejected: opened during the barge-in
+        assert c.is_audio_input_enabled() is False
+        fc.sent.clear()
+
+        # Server acknowledges the cancel mid-turn — interruption window closes.
+        c._on_interaction_response(_interaction_response(FrameType.IDLE))
+        assert c._interruption_ongoing is False
+        # But this audio still belongs to the rejected turn → dropped.
+        assert c.is_audio_input_enabled() is False
+        await c.send_tts_audio(b"\x01\x02" * 640, 16000, 1)
+        assert not [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+
+    asyncio.run(run())
+
+
+def test_next_turn_after_interruption_clears_is_accepted() -> None:
+    """Once the interruption clears, the next start_turn accepts input again."""
+
+    async def run() -> None:
+        c, fc, _out = make_client(server_feed_batching_enabled=False)
+        c._initialized = True
+        c._synchronizer.current_buffer = _live_buffer()
+        await c.interrupt()
+        await c.start_turn()  # rejected
+        c._on_interaction_response(_interaction_response(FrameType.IDLE))  # cancel ack
+        fc.sent.clear()
+
+        # A genuinely-new turn now opens outside any interruption → accepted.
+        await c.start_turn()
+        assert c.is_audio_input_enabled() is True
+        await c.send_tts_audio(b"\x01\x02" * 640, 16000, 1)
+        assert c._synchronizer.audio_buffers[-1].bytes_  # buffered for playback
+        assert [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]  # fed
+
+    asyncio.run(run())
+
+
 def test_emit_tick_fires_started_speaking_event() -> None:
     """When a buffer begins draining, the tick emits BOT_STARTED_SPEAKING."""
 
