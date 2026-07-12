@@ -164,6 +164,7 @@ class OjinSTVClient:
         self._buffer_preinit_tts_audio = buffer_preinit_tts_audio
         self._preinit_inputs: list[tuple] = []
         self._last_audio_shape = (OJIN_PERSONA_SAMPLE_RATE, 1)
+        self._last_video_frame: Optional[VideoFrame] = None
         self._last_played_rgb: Optional[bytes] = None
         self._last_played_size: Optional[tuple[int, int]] = None  # native (w, h)
         # Barge-in in flight: set when a cancel is sent, cleared when the server's
@@ -720,9 +721,29 @@ class OjinSTVClient:
             await self._events.emit(STVEvent.ERROR, message=text, code=code, fatal=True)
             await self.close()
 
+    def _validate_frame_type(self, frame_type: int) -> bool:
+        """Raise if the frame type is not a known Ojin FrameType."""
+        last_frame_type = (
+            self._last_video_frame.frame_type
+            if self._last_video_frame is not None
+            else None
+        )
+
+        if last_frame_type == 1 and frame_type == 3:
+            logger.warning(
+                "Received BOOMERANG frame after SPEECH_FRAME frame; "
+                "this is unexpected and may indicate a server-side issue."
+            )
+            return False
+
+        return True
+
     def _on_interaction_response(self, message: OjinInteractionResponseMessage) -> None:
         """Build a VideoFrame, hand it to the decode worker, record recv trace."""
         frame_type = int(message.frame_type)
+        if not self._validate_frame_type(frame_type):
+            return  # Skip processing this frame due to invalid frame type
+
         volume = int(rms_int16(message.audio_frame_bytes) or 0)
         video_frame = VideoFrame(
             frame_type=frame_type,
