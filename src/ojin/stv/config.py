@@ -52,7 +52,7 @@ class STVConfig:
     # payloads are split) and spaces consecutive sends ``server_feed_send_gap_ms``
     # apart — but ONLY while a backlog remains, so steady-state realtime streaming is
     # never delayed. Both are passed to OjinClient at construction.
-    server_feed_max_chunk_bytes: int = 1024 * 100
+    server_feed_max_chunk_bytes: int = 1024 * 50
     server_feed_send_gap_ms: int = 200
 
     # Diagnostics — off by default; a published SDK should be quiet. Each tier
