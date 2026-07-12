@@ -323,6 +323,90 @@ def test_trailing_audio_of_interrupted_turn_is_not_deferred() -> None:
     asyncio.run(run())
 
 
+def test_lead_cap_gates_sends_and_releases_as_playback_advances() -> None:
+    """Audio beyond the lead cap waits client-side and ships as playback catches up.
+
+    Guards the session-7 finding (2026-07-12): shipping a long answer's whole
+    audio up front built a server-side backlog that made barge-in cancels take
+    seconds to acknowledge. With the cap, only ~cap ms may be in flight ahead of
+    playback; the rest is released by the feeder as ticks consume audio.
+    """
+
+    async def run() -> None:
+        c, fc, _out = make_client(
+            server_feed_batching_enabled=False, server_feed_max_lead_ms=100
+        )
+        await c.start()
+        await asyncio.sleep(0.05)
+        fc.sent.clear()
+        await c.start_turn()
+
+        chunk = b"\x01\x02" * 1280  # 80 ms @ 16 kHz mono (identity resample)
+        for _ in range(3):
+            await c.send_tts_audio(chunk, 16000, 1)
+
+        # First send: lead 0 < 100 → out. Second: lead 80 < 100 → out (one payload
+        # may overshoot the cap). Third: lead 160 >= 100 → gated.
+        sent = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(sent) == 2
+        assert len(c._feed_pending) == 1
+
+        # Playback consumes 200 ms → the feeder releases the gated payload.
+        c._played_real_ms += 200.0
+        c._feed_wake.set()
+        await asyncio.sleep(0.05)
+        sent = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(sent) == 3
+        assert not c._feed_pending
+        await c.close()
+
+    asyncio.run(run())
+
+
+def test_interrupt_discards_lead_gated_audio_and_levels_the_feed() -> None:
+    """A barge-in drops gated payloads and resets the lead to the played position."""
+
+    async def run() -> None:
+        c, fc, _out = make_client(
+            server_feed_batching_enabled=False, server_feed_max_lead_ms=100
+        )
+        c._initialized = True
+        c._synchronizer.current_buffer = _live_buffer()
+        c._server_fed_ms = 500.0
+        c._played_real_ms = 120.0
+        c._feed_pending.append(b"\x01\x02" * 100)
+
+        await c.interrupt()
+
+        assert not c._feed_pending  # cancelled turn's gated audio discarded
+        assert c._server_lead_ms() == 0.0  # feed restarts level with playback
+        # Nothing but the cancel went to the server.
+        assert not [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+
+    asyncio.run(run())
+
+
+def test_close_flushes_lead_gated_pending() -> None:
+    """close() best-effort flushes gated payloads before tearing down."""
+
+    async def run() -> None:
+        c, fc, _out = make_client(
+            server_feed_batching_enabled=False, server_feed_max_lead_ms=100
+        )
+        await c.start()
+        await asyncio.sleep(0.05)
+        fc.sent.clear()
+        c._feed_pending.append(b"\x01\x02" * 100)
+        c._server_fed_ms = 1000.0  # over cap → would never send while live
+
+        await c.close()
+
+        sent = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(sent) == 1  # flushed on close despite the cap
+
+    asyncio.run(run())
+
+
 def test_emit_tick_fires_started_speaking_event() -> None:
     """When a buffer begins draining, the tick emits BOT_STARTED_SPEAKING."""
 

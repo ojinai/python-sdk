@@ -143,6 +143,9 @@ class OjinClient(IOjinClient):
         self.reconnect_delay = reconnect_delay
         self._max_input_chunk_bytes = max(1, max_input_chunk_bytes)
         self._send_chunk_gap_s = max(0.0, send_chunk_gap_s)
+        # Monotonic time of the last on-wire audio send; seeds far in the past so
+        # the first send after connect/idle never waits.
+        self._last_audio_send_t = float("-inf")
 
         self._ws: Optional[ClientConnection] = None
         self._available_response_messages_queue: asyncio.Queue[BaseModel] = (
@@ -478,11 +481,27 @@ class OjinClient(IOjinClient):
                 if len(audio_chunks) == 0:
                     audio_chunks.append(bytes())
 
-                for idx, chunk in enumerate(audio_chunks):
+                for chunk in audio_chunks:
                     if self._cancelled:
                         # A cancel landed mid-send: abandon the rest of this (now
                         # cancelled) turn's audio instead of finishing the burst.
                         break
+                    # Pace the feed BY TIME: enforce a minimum interval between
+                    # consecutive audio sends. Gating on queue depth misses the
+                    # burst case entirely — a producer that enqueues one message
+                    # per await (e.g. TTS buffered during a barge-in then replayed)
+                    # interleaves with this consumer so the queue never LOOKS
+                    # backlogged while the wire bursts many messages back-to-back
+                    # (seen in the 2026-07-12 session-7 trace). Time-based spacing
+                    # is race-free: bursts get spread out no matter how the queue
+                    # interleaves, while steady realtime (batched emits already
+                    # >= ~400 ms apart) never waits.
+                    if self._send_chunk_gap_s > 0:
+                        elapsed = time.monotonic() - self._last_audio_send_t
+                        if elapsed < self._send_chunk_gap_s:
+                            await asyncio.sleep(self._send_chunk_gap_s - elapsed)
+                        if self._cancelled:
+                            break  # a cancel landed during the pacing sleep
                     interaction_input = InteractionInput(
                         payload_type="audio",
                         payload=chunk,
@@ -492,19 +511,7 @@ class OjinClient(IOjinClient):
                     proxy_message = InteractionInputMessage(payload=interaction_input)
 
                     await self._ws.send(proxy_message.to_bytes())
-
-                    # Pace the feed: when more audio is ready to go right now — more
-                    # split chunks of this message, or a backlog of queued messages
-                    # (e.g. TTS buffered during a barge-in then replayed all at once)
-                    # — space consecutive sends so a burst doesn't flood the inference
-                    # server. Steady realtime carries one small message at a time and
-                    # the queue drains empty between arrivals, so no gap is added.
-                    more_to_send = (
-                        idx < len(audio_chunks) - 1
-                        or not self._pending_client_messages_queue.empty()
-                    )
-                    if more_to_send and self._send_chunk_gap_s > 0:
-                        await asyncio.sleep(self._send_chunk_gap_s)
+                    self._last_audio_send_t = time.monotonic()
 
             elif isinstance(message, OjinTextInputMessage):
                 text_message = message.to_proxy_message()

@@ -138,6 +138,21 @@ class OjinSTVClient:
         self._batch_added = asyncio.Event()
         self._batch_flush_task: Optional[asyncio.Task] = None
 
+        # Server-feed lead cap (see STVConfig.server_feed_max_lead_ms). The gate
+        # compares how much audio has been shipped to the server (_server_fed_ms)
+        # against how much real audio playback has consumed (_played_real_ms);
+        # payloads that would push the lead past the cap wait in _feed_pending and
+        # are released by _server_feed_loop as ticks advance playback. All
+        # server-bound payloads are 16 kHz mono int16, so ms = bytes / 32.
+        self._server_feed_max_lead_ms = float(
+            max(0, self._config.server_feed_max_lead_ms)
+        )
+        self._server_fed_ms = 0.0
+        self._played_real_ms = 0.0
+        self._feed_pending: "deque[bytes]" = deque()
+        self._feed_wake = asyncio.Event()
+        self._feed_task: Optional[asyncio.Task] = None
+
         self._initialized = False
         self._session_data: Optional[dict] = None
         self._waiting_for_first_tts = False
@@ -290,17 +305,28 @@ class OjinSTVClient:
         self._stop_decode_worker()
         if was_initialized:
             self._tracer.span("lifecycle", "session", self._tr_session_start)
-        # Stop the batch-flush task before the transport closes.
-        if self._batch_flush_task is not None:
-            self._batch_flush_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._batch_flush_task
-            self._batch_flush_task = None
-        if was_initialized and self._config.server_feed_batching_enabled:
-            pending = self._batcher.drain()
-            if pending is not None:
+        # Stop the batch-flush and lead-gate feeder tasks before the transport
+        # closes.
+        for task_attr in ("_batch_flush_task", "_feed_task"):
+            task = getattr(self, task_attr)
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+                setattr(self, task_attr, None)
+        if was_initialized:
+            # Flush what is still owed to the server, in order: lead-gated
+            # payloads first (older), then the batcher's sub-threshold tail.
+            # Best-effort straight sends — the session is ending, the lead cap
+            # no longer matters.
+            while self._feed_pending:
                 with contextlib.suppress(Exception):
-                    await self._send_audio_message(pending)
+                    await self._send_audio_now(self._feed_pending.popleft())
+            if self._config.server_feed_batching_enabled:
+                pending = self._batcher.drain()
+                if pending is not None:
+                    with contextlib.suppress(Exception):
+                        await self._send_audio_now(pending)
         try:
             await self._client.close()
         except Exception as exc:  # never let teardown raise
@@ -383,14 +409,66 @@ class OjinSTVClient:
         tail = flush()
         return tail if isinstance(tail, bytes) else b""
 
-    async def _send_audio_message(self, pcm: bytes) -> None:
-        """Send one server-bound audio payload and record the to_server trace.
+    def _server_lead_ms(self) -> float:
+        """How far the server feed is ahead of local playback, in ms (>= 0)."""
+        return max(0.0, self._server_fed_ms - self._played_real_ms)
 
-        Pacing (a gap between consecutive sends when a backlog builds) and chunking
-        live in ``OjinClient``; this just hands the payload off.
+    async def _send_audio_message(self, pcm: bytes) -> None:
+        """Ship one server-bound audio payload, subject to the lead cap.
+
+        Under the cap (or with it disabled) the payload goes straight out; over
+        the cap it waits in ``_feed_pending`` for :meth:`_server_feed_loop` to
+        release it as playback advances. A barge-in discards the pending queue
+        (see :meth:`interrupt`). Wire chunking + time pacing live in
+        ``OjinClient``; this layer only bounds how far AHEAD of playback the
+        server is fed.
         """
+        if not pcm:
+            return
+        if self._server_feed_max_lead_ms <= 0 or (
+            not self._feed_pending
+            and self._server_lead_ms() < self._server_feed_max_lead_ms
+        ):
+            await self._send_audio_now(pcm)
+            return
+        self._feed_pending.append(pcm)
+        self._feed_wake.set()
+        self._tracer.instant(
+            "to_server",
+            "audio_lead_gated",
+            args={"bytes": len(pcm), "lead_ms": round(self._server_lead_ms())},
+        )
+
+    async def _send_audio_now(self, pcm: bytes) -> None:
+        """Send one server-bound audio payload and record the to_server trace."""
         await self._client.send_message(OjinAudioInputMessage(audio_int16_bytes=pcm))
+        self._server_fed_ms += len(pcm) / _BYTES_PER_MS_16K
         self._tracer.instant("to_server", "audio_sent", args={"bytes": len(pcm)})
+
+    async def _server_feed_loop(self) -> None:
+        """Release lead-gated payloads as playback advances (lead cap only).
+
+        Wakes on new pending payloads and on playback ticks; sends the head of
+        ``_feed_pending`` whenever the lead is back under the cap. One payload may
+        overshoot the cap by its own duration — the cap bounds the backlog, it is
+        not a hard quantum.
+        """
+        while self._initialized:
+            if (
+                self._feed_pending
+                and self._server_lead_ms() < self._server_feed_max_lead_ms
+            ):
+                pcm = self._feed_pending.popleft()
+                try:
+                    await self._send_audio_now(pcm)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # one bad send must not kill the feeder
+                    logger.exception("server feed loop send error — continuing")
+                continue
+            self._feed_wake.clear()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._feed_wake.wait(), 0.1)
 
     async def send_tts_audio(
         self, pcm: bytes, sample_rate: int, num_channels: int
@@ -545,6 +623,12 @@ class OjinSTVClient:
             await self._client.send_message(OjinCancelInteractionMessage())
             if self._config.server_feed_batching_enabled:
                 self._batcher.reset()
+            # Discard lead-gated payloads (they belong to the cancelled turn) and
+            # reconcile the lead: the server flushes its input backlog on cancel,
+            # so the feed restarts level with playback.
+            self._feed_pending.clear()
+            self._server_fed_ms = self._played_real_ms
+            self._feed_wake.set()
             # Drop the cancelled turn's resampler tail so it can't bleed into the
             # next turn's feed; the next turn starts from a clean filter.
             self._flush_resampler()
@@ -593,6 +677,8 @@ class OjinSTVClient:
                 and self._batch_flush_task is None
             ):
                 self._batch_flush_task = asyncio.create_task(self._batch_flush_loop())
+            if self._server_feed_max_lead_ms > 0 and self._feed_task is None:
+                self._feed_task = asyncio.create_task(self._server_feed_loop())
             await self._events.emit(
                 STVEvent.SESSION_READY, session_data=self._session_data
             )
@@ -754,6 +840,17 @@ class OjinSTVClient:
         await self._emit_video(result, pts)
         await self._emit_audio(result, pts)
 
+        if result.audio_chunk:
+            # Advance the playback position the server-feed lead cap gates on.
+            # Faded (interrupted) audio counts too: fed/played are reconciled at
+            # interrupt() anyway, and max(0, ...) absorbs any residue.
+            sample_rate, num_channels = self._last_audio_shape
+            self._played_real_ms += len(result.audio_chunk) / (
+                sample_rate * num_channels * 2 / 1000.0
+            )
+            if self._feed_pending:
+                self._feed_wake.set()
+
         if result.started_speaking:
             self._tr_speaking_start = self._tracer.mark()
             await self._events.emit(STVEvent.BOT_STARTED_SPEAKING)
@@ -846,6 +943,8 @@ class OjinSTVClient:
         if cur is not None and cur.sample_rate:
             cur_ms = len(cur.bytes_) / (cur.sample_rate * cur.num_channels * 2) * 1000.0
         tr.counter("current_buffer_ms", round(cur_ms, 1))
+        tr.counter("server_feed_lead_ms", round(self._server_lead_ms(), 1))
+        tr.counter("server_feed_gated_pending", len(self._feed_pending))
         tr.counter("queued_buffers", len(self._synchronizer.audio_buffers))
         tr.counter("pending_video_frames", len(self._synchronizer.video_frames))
         tr.counter("playback_fps", len(self._tr_emit_times))

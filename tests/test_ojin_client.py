@@ -94,7 +94,10 @@ async def test_large_audio_split_into_max_chunks_and_paced(monkeypatch) -> None:
     await _drain_send_loop(client, expected_sends=3, real_sleep=real_sleep)
 
     assert len(client._ws.sent) == 3  # 12 bytes / 4-byte cap = 3 chunks
-    assert sleeps == [0.2, 0.2]  # gap after chunks 0 and 1, none after the last
+    # Time-based pacing: no wait before the first send, one ~gap-length sleep
+    # before each later chunk (wall clock barely advances between them in-test).
+    assert len(sleeps) == 2
+    assert all(0.15 <= s <= 0.2 for s in sleeps)
 
 
 async def test_single_message_sends_without_gap(monkeypatch) -> None:
@@ -143,7 +146,57 @@ async def test_backlog_of_messages_is_paced(monkeypatch) -> None:
     await _drain_send_loop(client, expected_sends=3, real_sleep=real_sleep)
 
     assert len(client._ws.sent) == 3
-    assert sleeps == [0.2, 0.2]  # gap after the 1st and 2nd (backlog), not the 3rd
+    # First message goes straight out; each later one waits out the remainder of
+    # the gap since the previous send.
+    assert len(sleeps) == 2
+    assert all(0.15 <= s <= 0.2 for s in sleeps)
+
+
+async def test_interleaved_producer_is_still_paced(monkeypatch) -> None:
+    """A producer that enqueues one message per await is still gap-paced.
+
+    Regression guard for the session-7 burst (2026-07-12): the deferred-TTS
+    replay enqueues messages one at a time, interleaving with this consumer so
+    the queue never holds more than one item. Queue-depth-based pacing saw "no
+    backlog" and sent everything back-to-back; time-based pacing spaces the
+    sends regardless of how the queue interleaves.
+    """
+    real_sleep = asyncio.sleep
+    sleeps: list = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    client = OjinClient(
+        ws_url="ws://t", api_key="k", config_id="c", send_chunk_gap_s=0.2
+    )
+    client._running = True
+    client._ws = _FakeWS()  # type: ignore[assignment]
+
+    task = asyncio.create_task(client._process_client_messages())
+    try:
+        for i in range(3):
+            await client._pending_client_messages_queue.put(
+                _audio_msg(b"\x01\x02" * 10)
+            )
+            # Wait for THIS message to hit the wire before enqueueing the next —
+            # the queue is empty at every gap decision, mimicking the replay race.
+            for _ in range(200):
+                if len(client._ws.sent) > i:
+                    break
+                await real_sleep(0)
+    finally:
+        client._running = False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert len(client._ws.sent) == 3
+    assert len(sleeps) == 2  # 2nd and 3rd sends each waited out the gap
+    assert all(0.15 <= s <= 0.2 for s in sleeps)
 
 
 async def test_non_json_text_surfaces_clean_error() -> None:

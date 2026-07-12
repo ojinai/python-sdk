@@ -54,6 +54,17 @@ class STVConfig:
     # never delayed. Both are passed to OjinClient at construction.
     server_feed_max_chunk_bytes: int = 1024 * 50
     server_feed_send_gap_ms: int = 200
+    # Server-feed lead cap: never ship audio more than this far ahead of local
+    # playback. The server renders at ~1x realtime, so sending a long answer's
+    # whole audio up front (measured: 272 s queued in ~25 s of wall clock,
+    # session-7 trace 2026-07-12) buys nothing — it only builds a server-side
+    # input backlog that must flush before a barge-in cancel is acknowledged
+    # (ack grew 1.2 s -> 2.0 s over that session, and the deferred next turn
+    # waits on it). With the cap, the backlog at cancel is bounded and constant
+    # regardless of answer length. Payloads beyond the cap wait client-side and
+    # are released as playback advances; a barge-in discards them outright.
+    # 0 disables the cap (legacy: ship as fast as pacing allows).
+    server_feed_max_lead_ms: int = 8000
 
     # Diagnostics — off by default; a published SDK should be quiet. Each tier
     # dumps every thread's stack to stderr when a playback tick stalls past its
