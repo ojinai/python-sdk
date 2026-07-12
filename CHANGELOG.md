@@ -4,7 +4,7 @@ All notable changes to `ojin-client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0 — see CONTRIBUTING.md).
 
-## 0.9.0.dev1 - 2026-07-12 (dev pre-release — for online testing, not yet merged)
+## 0.9.0 - 2026-07-12
 
 ### Changed
 - TTS audio for a turn that opens **while a barge-in is still settling server-side**
@@ -19,17 +19,30 @@ All notable changes to `ojin-client` are documented here. The format follows
 ### Added
 - Transport-level server-feed **send pacing** in `OjinClient`: a single audio send
   is capped at `max_input_chunk_bytes` (larger payloads are split) and consecutive
-  sends are spaced `send_chunk_gap_s` apart **only while a backlog remains**, so a
-  buffered burst (e.g. TTS replayed after a barge-in) can't flood the inference
-  server while steady-state realtime streaming is never delayed. Wired from new
-  `STVConfig` knobs `server_feed_max_chunk_bytes` (default 512000) and
-  `server_feed_send_gap_ms` (default 200). `OjinClient`'s own defaults keep the
-  previous behaviour (no gap) for direct users.
+  sends are spaced at least `send_chunk_gap_s` apart **by time** — a minimum
+  interval between on-wire sends — so any burst (split chunks, a queued backlog,
+  or a producer enqueueing one message per await, like the deferred-TTS replay)
+  is spread out, while steady-state realtime streaming (batched emits already
+  ~400 ms apart) never waits. A cancel landing during the pacing sleep aborts the
+  remaining chunks. Wired from new `STVConfig` knobs `server_feed_max_chunk_bytes`
+  (default 51200) and `server_feed_send_gap_ms` (default 200). `OjinClient`'s own
+  defaults keep the previous behaviour (no gap) for direct users.
+- **Server-feed lead cap** (`STVConfig.server_feed_max_lead_ms`, default 8000; 0
+  disables): the client never ships audio more than the cap ahead of local
+  playback. The server renders at ~1x realtime, so sending a long answer's whole
+  audio up front (272 s queued in ~25 s of wall clock, session-7 trace
+  2026-07-12) only built a server-side input backlog that a barge-in cancel had
+  to flush before acknowledging — ack grew 1.2 s → 2.0 s over a session, and the
+  deferred next turn waits on that ack, so post-barge-in freezes grew with
+  answer length. Payloads beyond the cap wait client-side and are released as
+  playback advances; a barge-in discards them; `close()` flushes best-effort.
+  New trace counters: `server_feed_lead_ms`, `server_feed_gated_pending`.
 
 ### Fixed
 - A `CancelInteractionMessage` now **drops any audio still queued to be sent** in
-  `OjinClient` (and the in-flight chunk loop bails between chunks), so pre-cancel
-  audio can't outlive the barge-in and desync the next turn.
+  `OjinClient` (and the in-flight chunk loop bails between chunks and during the
+  pacing sleep), so pre-cancel audio can't outlive the barge-in and desync the
+  next turn.
 
 ## 0.8.0 - 2026-06-19
 
