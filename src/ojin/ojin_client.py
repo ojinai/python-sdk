@@ -65,11 +65,12 @@ def _configure_tcp_nodelay(ws: ClientConnection) -> None:
 
 
 # ``struct tcp_info`` (linux/tcp.h) prefix: 8 x u8 then 24 x u32 (rto..total_retrans).
-# Stable across kernels; later u64 fields move by version so we don't read them. Lets us
-# see the *receive* side of the proxy->client TCP connection from inside the client
-# (e.g. WSL2): RTT, loss/retransmits, and the receive-window estimate the client offers.
+# Stable across kernels. Lets us see the *receive* side of the proxy->client TCP
+# connection from inside the client (e.g. WSL2): RTT, loss/retransmits, and the
+# receive-window estimate the client offers.
 _TCP_INFO_FMT = "<8B24I"
 _TCP_INFO_LEN = struct.calcsize(_TCP_INFO_FMT)  # 104 bytes
+_TCP_INFO_BUF = 256
 _TCP_INFO_FIELDS = {
     "tcp_retransmits": 2,  # u8: hard retransmit count
     "tcp_rtt_us": 23,  # smoothed RTT to the proxy (microseconds)
@@ -77,6 +78,17 @@ _TCP_INFO_FIELDS = {
     "tcp_snd_cwnd": 26,  # send congestion window (MSS units)
     "tcp_rcv_space": 30,  # receive-window estimate this end advertises (bytes)
     "tcp_retrans_total": 31,  # cumulative segment retransmissions
+}
+# Extended tcp_info fields (appended by newer kernels at fixed byte offsets);
+# each read is guarded by buffer length and simply absent on older kernels.
+# Receive-side picks: kernel-level ingress byte count (advances even while the
+# app is slow to read — splits "network delivered late" from "we read late"),
+# out-of-order packet count (direct download-path loss/reorder evidence), and
+# the path's floor RTT.
+_TCP_INFO_EXT_FIELDS = {
+    "tcp_bytes_received": (128, "<Q"),
+    "tcp_min_rtt_us": (148, "<I"),
+    "tcp_rcv_ooopack": (224, "<I"),
 }
 
 
@@ -86,11 +98,15 @@ def _read_tcp_info(sock: socket.socket) -> dict[str, int]:
     if tcp_info_opt is None:
         return {}
     try:
-        raw = sock.getsockopt(socket.IPPROTO_TCP, tcp_info_opt, _TCP_INFO_LEN)
+        raw = sock.getsockopt(socket.IPPROTO_TCP, tcp_info_opt, _TCP_INFO_BUF)
         if len(raw) < _TCP_INFO_LEN:
             return {}
         t = struct.unpack(_TCP_INFO_FMT, raw[:_TCP_INFO_LEN])
-        return {name: int(t[idx]) for name, idx in _TCP_INFO_FIELDS.items()}
+        fields = {name: int(t[idx]) for name, idx in _TCP_INFO_FIELDS.items()}
+        for name, (offset, fmt) in _TCP_INFO_EXT_FIELDS.items():
+            if len(raw) >= offset + struct.calcsize(fmt):
+                fields[name] = int(struct.unpack_from(fmt, raw, offset)[0])
+        return fields
     except Exception:
         return {}
 
@@ -150,6 +166,9 @@ class OjinClient(IOjinClient):
         )
         self._running = False
         self._receive_task: Optional[asyncio.Task] = None
+        # Cumulative application-level bytes taken off the websocket; the
+        # tracer derives an ingress-bandwidth lane from its slope.
+        self._ingress_bytes_total: int = 0
         self._inference_server_ready: bool = False
         self._cancelled: bool = False
         self._active_interaction_id: str | None = None
@@ -250,6 +269,7 @@ class OjinClient(IOjinClient):
 
         try:
             async for message in self._ws:
+                self._ingress_bytes_total += len(message)
                 await self._handle_server_message(message)
         except (ConnectionClosedOK, ConnectionClosedError) as e:
             if self._running:  # Only log if we didn't initiate the close
@@ -595,4 +615,7 @@ class OjinClient(IOjinClient):
                     depths.update(_read_tcp_info(sock))
         with contextlib.suppress(Exception):
             depths["server_msgs"] = self._available_response_messages_queue.qsize()
+        # Cumulative app-level ingress; paired with ``tcp_bytes_received`` it
+        # splits "network delivered late" from "we read the socket late".
+        depths["ingress_bytes_total"] = self._ingress_bytes_total
         return depths

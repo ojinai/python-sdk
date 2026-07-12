@@ -178,9 +178,12 @@ async def test_session_ready_json_still_parsed() -> None:
 
 
 def test_debug_queue_depths_disconnected_reports_only_parsed_queue() -> None:
-    """With no websocket, only the always-readable parsed-queue depth is reported."""
+    """With no websocket, only the always-readable client-owned gauges appear."""
     client = _client()
-    assert client.debug_queue_depths() == {"server_msgs": 0}
+    assert client.debug_queue_depths() == {
+        "server_msgs": 0,
+        "ingress_bytes_total": 0,
+    }
     client._available_response_messages_queue.put_nowait(
         OjinSessionReadyMessage(parameters={})
     )
@@ -242,5 +245,8 @@ def test_debug_queue_depths_never_raises_on_broken_internals() -> None:
 
     client = _client()
     client._ws = _BadWS()  # type: ignore[assignment]
-    # Must not raise; ws gauges are simply absent, server_msgs still present.
-    assert client.debug_queue_depths() == {"server_msgs": 0}
+    # Must not raise; ws gauges are simply absent, client-owned gauges present.
+    assert client.debug_queue_depths() == {
+        "server_msgs": 0,
+        "ingress_bytes_total": 0,
+    }
