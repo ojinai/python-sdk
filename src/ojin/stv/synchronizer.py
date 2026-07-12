@@ -34,29 +34,6 @@ _ALIGN_REL_TOL = 0.05  # match tolerance as a fraction of the anchor RMS
 # trusted. A 1-2 frame RMS signature cannot uniquely localize a position inside a
 # multi-second buffer, producing a false trim that desyncs the whole turn.
 _ALIGN_MIN_ANCHORS = 4
-# Loose sanity cap for a non-head match, as a fraction of anchor energy. The
-# strict `_ALIGN_REL_TOL` stays as the head short-circuit, but real cross-rate
-# envelopes (16 kHz server frames vs 24 kHz TTS buffer) measured err ratios up
-# to ~5x the strict tolerance at the TRUE offset, while wrong offsets measured
-# 87-374x — so confidence comes from the margin below, not the absolute error.
-_ALIGN_MAX_REL_TOL = 0.25
-# A non-head match is only trusted when it beats every other offset (head
-# included) by this factor. Measured margins at true offsets: 47-3000x.
-_ALIGN_MARGIN = 8.0
-# Deferred alignment: at a real turn entry the video queue is only 1-2 frames
-# deep (just-in-time delivery), so the swap tick rarely has _ALIGN_MIN_ANCHORS
-# audible frames to anchor on. Rather than skip alignment (which left ±1-frame
-# skews uncorrected for whole turns), gather anchors from the frames popped on
-# the following ticks and align late — a shift is a constant timeline offset,
-# so applying it k ticks in still aligns the remainder of the turn. Give up
-# after this many ticks (the anchor window plus slack).
-_ALIGN_DEFER_MAX_TICKS = 8
-
-# Video-repeat catch-up: cap on how many owed frames are remembered. A stall
-# longer than this (1 s at 25 fps) looks broken regardless and the next
-# new-turn swap re-anchors anyway, so bounding the debt bounds the
-# fast-motion catch-up window that follows a stall.
-_REPEAT_DEBT_MAX = 25
 
 _AUDIO_BUFFER_IDS = itertools.count(1)
 
@@ -108,10 +85,6 @@ class VideoFrame:
         """Whether this is an idle/silence frame (frame_type 0)."""
         return self.frame_type == FrameType.IDLE
 
-    def is_speech(self) -> bool:
-        """Whether this is a plain continuation-speech frame (frame_type 1)."""
-        return self.frame_type == FrameType.SPEECH
-
     def is_fade_out(self) -> bool:
         """Whether this is a post-cancel fade-out frame (frame_type 2)."""
         return self.frame_type == FrameType.FADE_OUT
@@ -119,25 +92,6 @@ class VideoFrame:
     def is_new_turn_start(self) -> bool:
         """Whether this is the first speech frame of a new turn (frame_type 3)."""
         return self.frame_type == FrameType.START_OF_SPEECH
-
-
-@dataclass
-class _PendingAlign:
-    """Deferred swap-alignment state while anchors are still arriving.
-
-    Created when a swap fires with too few audible frames queued to build a
-    trustworthy anchor signature. ``head_snapshot`` preserves the buffer head as
-    it was at the swap (the live buffer drains one chunk per tick, but the match
-    offset is defined against the original head); ``rms_seq`` accumulates the
-    per-frame bundled-audio RMS of the trigger and every speech frame popped
-    since.
-    """
-
-    buffer_id: int
-    head_snapshot: bytes
-    buf_frame_bytes: int
-    rms_seq: list[float]
-    ticks_waited: int = 0
 
 
 @dataclass
@@ -150,12 +104,8 @@ class TickResult:
     started_speaking: bool = False
     stopped_speaking: bool = False
     idle_skipped: int = 0
-    # Swap-time alignment shift in 40 ms frames: positive = leading audio trimmed
-    # (the server dropped it), negative = silence prepended (the server emitted
-    # extra leading quiet frames the buffer does not have).
     align_trim_frames: int = 0
     overflow_dropped: int = 0  # oldest video frames dropped by the overflow cap
-    catchup_dropped: int = 0  # speech frames skipped to repay video-repeat debt
     warming_up: bool = False  # initial warm-up tick — client emits nothing
 
 
@@ -182,12 +132,6 @@ class Synchronizer:
         self.video_frames: Deque[VideoFrame] = deque()
         self.was_speaking: bool = False
         self._warmup_remaining: int = config.initial_buffer_frames
-        # Frames of video owed after mid-speech repeats (audio drained while no
-        # frame was available). Repaid by skipping one extra speech frame per
-        # tick once frames flow again; reset at any turn boundary.
-        self._repeat_debt: int = 0
-        # Swap alignment waiting for enough audible frames to anchor on.
-        self._pending_align: Optional[_PendingAlign] = None
 
     # ------------------------------------------------------------------
     # Audio buffering (≈ TTSStarted / TTSAudio target selection)
@@ -257,8 +201,6 @@ class Synchronizer:
         self.current_buffer.interrupted = True
         self.swap_pending = False
         self.audio_buffers.clear()
-        self._repeat_debt = 0  # the cancelled turn's owed video is moot
-        self._pending_align = None  # so is its unfinished alignment
         return True
 
     # ------------------------------------------------------------------
@@ -293,8 +235,6 @@ class Synchronizer:
         with the server's first new-turn frame and returns the number of leading
         40 ms frames trimmed (0 otherwise).
         """
-        # Whatever alignment the outgoing buffer still owed is moot now.
-        self._pending_align = None
         if not self.audio_buffers:
             self.swap_pending = True
             return 0
@@ -315,247 +255,117 @@ class Synchronizer:
         self.current_buffer = new_buffer
         self.swap_pending = False
 
-        # Align on every speech-triggered swap, natural turn ends included. The
-        # lipsync_0609 guard restricted this to the server-signalled new-turn
-        # boundary because the old matcher could only trim and a false trim on a
-        # natural end (where the correct shift is usually 0) injected error. Two
-        # things changed: the matcher is now confident-match-or-nothing with a
-        # head preference (steady state resolves to shift 0 and is untouched),
-        # and natural-turn entries were measured carrying real head anomalies
-        # (near-zero speech frames the buffer lacks) that ONLY this path can
-        # self-heal — the server never marks them, so waiting for frame_type 3
-        # means never correcting them.
-        if self._config.align_audio_on_swap and align_to_frame is not None:
+        # OJIN FIX (lipsync_0609): only the server-signalled new-turn boundary can
+        # drop leading speech, so it is the only path that needs alignment. A
+        # natural turn end has no fade and no drop — the correct trim is always 0,
+        # so aligning there can only inject error.
+        if (
+            self._config.align_audio_on_swap
+            and align_to_frame is not None
+            and align_to_frame.is_new_turn_start()
+        ):
             return self.align_current_buffer_to_frame(align_to_frame)
         return 0
 
-    def _collect_anchor(
-        self, rms_seq: list[float]
-    ) -> tuple[Optional[list[float]], int, bool]:
-        """Split an ordered per-frame RMS sequence into (anchor, lead, starved).
+    def _anchor_rms(self, align_to_frame: VideoFrame) -> Optional[list[float]]:
+        """Build the RMS anchor signature for alignment, or None if unusable.
 
-        The anchor signature starts at the first audible frame: a turn can open
-        with speech-typed frames whose audio is near-zero (e.g. the server
-        padded the turn head while starved of TTS), and matching on those both
-        pollutes the signature and used to abort alignment entirely because the
-        anchor looked silent. ``lead`` counts those skipped near-silent head
-        frames so the caller can convert a matched buffer offset into a signed
-        shift.
-
-        ``starved`` is True when the sequence simply ran out before
-        ``_ALIGN_MIN_ANCHORS`` audible frames were seen (the lipsync_0609 guard
-        against a too-short signature) — more frames may still arrive, so the
-        caller can defer instead of giving up. Anchor is None in that case, and
-        when the silent head is implausibly long (> ``align_audio_max_frames``;
-        ``starved`` False — unusable).
+        Anchors are the swap-triggering frame plus the leading non-silence frames
+        already buffered. Returns ``None`` when there is nothing to anchor on
+        (empty/silent audio) or when fewer than ``_ALIGN_MIN_ANCHORS`` real anchors
+        exist — the lipsync_0609 guard against a false trim from a too-short
+        signature.
         """
-        lead_silent = 0
+        if not align_to_frame.audio_bytes:
+            return None
+        anchors_src = [align_to_frame] + [
+            f for f in list(self.video_frames) if not f.is_silence()
+        ]
         anchor_rms: list[float] = []
-        for r in rms_seq:
-            if not anchor_rms and r < _ALIGN_MIN_RMS:
-                lead_silent += 1
-                if lead_silent > self._config.align_audio_max_frames:
-                    return None, lead_silent, False
-                continue
-            anchor_rms.append(r)
-            if len(anchor_rms) >= _ALIGN_ANCHOR_FRAMES:
+        for f in anchors_src[:_ALIGN_ANCHOR_FRAMES]:
+            r = rms_int16(f.audio_bytes)
+            if r is None:
                 break
-        if len(anchor_rms) >= _ALIGN_MIN_ANCHORS:
-            return anchor_rms, lead_silent, False
-        return None, lead_silent, True
-
-    def _buf_frame_bytes(self, buf: AudioBuffer) -> int:
-        """Bytes per 40 ms frame at the buffer's sample shape."""
-        return int(buf.sample_rate * self._frame_duration) * buf.num_channels * 2
-
-    def _match_and_apply(
-        self,
-        anchor_rms: list[float],
-        lead_silent: int,
-        head: bytes,
-        buf_frame_bytes: int,
-    ) -> int:
-        """Match the anchor against ``head`` and apply the signed shift.
-
-        ``head`` is the buffer head as it was at the swap (the live buffer may
-        have drained since; a shift is a constant timeline offset, so applying
-        it to the current head still aligns the remainder of the turn). Returns
-        the applied shift in frames: positive = leading audio trimmed (the
-        server dropped it), negative = silence prepended so the audio waits for
-        the video (the server emitted extra near-silent head frames).
-        """
-        buf = self.current_buffer
-        if buf is None or buf_frame_bytes <= 0:
-            return 0
-        max_d = min(
-            self._config.align_audio_max_frames,
-            len(head) // buf_frame_bytes - len(anchor_rms),
-        )
-        if max_d < 0:
-            return 0
-        best_d = self._best_alignment_offset(head, anchor_rms, buf_frame_bytes, max_d)
-        if best_d is None:
-            return 0
-        shift = best_d - lead_silent
-        if shift > 0:
-            del buf.bytes_[: min(shift * buf_frame_bytes, len(buf.bytes_))]
-        elif shift < 0:
-            buf.bytes_[:0] = bytes(-shift * buf_frame_bytes)
-        return shift
-
-    def _feed_pending_align(self, frame: VideoFrame) -> int:
-        """Grow a deferred alignment with this tick's popped frame; maybe apply.
-
-        Returns the signed shift applied this tick (0 otherwise). The pending
-        state is dropped when the turn moves on (silence/fade popped, buffer
-        replaced), when the window fills without enough audible anchors, or
-        after ``_ALIGN_DEFER_MAX_TICKS``.
-        """
-        st = self._pending_align
-        if st is None:
-            return 0
-        cur = self.current_buffer
-        if (
-            cur is None
-            or cur.buffer_id != st.buffer_id
-            or frame.is_silence()
-            or frame.is_fade_out()
-        ):
-            self._pending_align = None
-            return 0
-        st.ticks_waited += 1
-        r = rms_int16(frame.audio_bytes)
-        if r is not None:
-            st.rms_seq.append(r)
-        anchor_rms, lead_silent, starved = self._collect_anchor(st.rms_seq)
-        if anchor_rms is not None:
-            self._pending_align = None
-            return self._match_and_apply(
-                anchor_rms, lead_silent, st.head_snapshot, st.buf_frame_bytes
-            )
-        if not starved or st.ticks_waited >= _ALIGN_DEFER_MAX_TICKS:
-            self._pending_align = None
-        return 0
+            anchor_rms.append(r)
+        if not anchor_rms or max(anchor_rms) < _ALIGN_MIN_RMS:
+            return None
+        if len(anchor_rms) < _ALIGN_MIN_ANCHORS:
+            return None
+        return anchor_rms
 
     def align_current_buffer_to_frame(self, align_to_frame: VideoFrame) -> int:
-        """Shift the buffer head so it lines up with the server's frame timeline.
+        """Trim leading 40 ms frames so the buffer head matches the server frame.
 
-        The server's turn head can disagree with the local buffer in either
-        direction: it can drop leading speech of a new turn (e.g. the post-fade
-        SPEECH-drop window) — the first video frame then corresponds to audio
-        further into the buffer than byte 0 — or it can emit extra leading
-        near-silent speech frames the buffer does not have (e.g. padding minted
-        while the server was starved of TTS in the turn's first-fragment gap).
-        We recover the audible onset on both sides by matching the bundled audio
-        of the first server frame(s) against successive 40 ms windows using an
-        RMS amplitude-envelope signature — robust to the server (16 kHz) vs
-        buffer (TTS rate) sample-rate differences since RMS is rate-independent —
-        then apply the signed difference (see ``_match_and_apply``).
-
-        At a real turn entry the video queue is typically only 1-2 frames deep
-        (just-in-time delivery), so the swap tick rarely has enough audible
-        frames for a trustworthy signature. In that case alignment is DEFERRED:
-        the buffer head is snapshotted and the anchor keeps growing from the
-        frames popped on the following ticks (``_feed_pending_align``), applying
-        the shift a few ticks late — still a whole-turn fix, since the skew is a
-        constant offset. Returns the shift applied NOW (0 when deferred/skipped).
+        The server can drop leading speech of a new turn (e.g. the post-fade
+        SPEECH-drop window), so the first video frame can correspond to audio
+        further into the buffer than byte 0. We recover that offset by matching the
+        bundled audio of the first server frame(s) against successive 40 ms windows
+        using an RMS amplitude-envelope signature — robust to the server (16 kHz)
+        vs buffer (TTS rate) sample-rate differences since RMS is rate-independent.
+        Conservative: trims only on a confident non-zero match, so the steady-state
+        (offset 0) case is untouched. Returns the number of frames trimmed.
         """
         buf = self.current_buffer
         if buf is None or align_to_frame.is_silence() or align_to_frame.is_fade_out():
             return 0
-        if not align_to_frame.audio_bytes:
+
+        anchor_rms = self._anchor_rms(align_to_frame)
+        if anchor_rms is None:
             return 0
-        buf_frame_bytes = self._buf_frame_bytes(buf)
+
+        buf_frame_bytes = (
+            int(buf.sample_rate * self._frame_duration) * buf.num_channels * 2
+        )
         if buf_frame_bytes <= 0:
             return 0
-
-        rms_seq: list[float] = []
-        for f in [align_to_frame] + [
-            f for f in list(self.video_frames) if not f.is_silence()
-        ]:
-            r = rms_int16(f.audio_bytes)
-            if r is None:
-                break
-            rms_seq.append(r)
-
-        anchor_rms, lead_silent, starved = self._collect_anchor(rms_seq)
-        # The match only ever looks at the first max_d + anchor (+ lead) frames.
-        snap_frames = (
-            self._config.align_audio_max_frames + _ALIGN_ANCHOR_FRAMES + lead_silent + 1
+        max_d = min(
+            self._config.align_audio_max_frames,
+            len(buf.bytes_) // buf_frame_bytes - len(anchor_rms),
         )
-        head = bytes(buf.bytes_[: snap_frames * buf_frame_bytes])
-        if anchor_rms is not None:
-            return self._match_and_apply(anchor_rms, lead_silent, head, buf_frame_bytes)
-        if starved and rms_seq:
-            # Not enough audible frames yet — snapshot the head and gather
-            # anchors from the next ticks' pops. Seed with the trigger only:
-            # the frames peeked above are still queued and will pop on the
-            # following ticks, re-entering the sequence in order (seeding both
-            # would double-count them).
-            self._pending_align = _PendingAlign(
-                buffer_id=buf.buffer_id,
-                head_snapshot=head,
-                buf_frame_bytes=buf_frame_bytes,
-                rms_seq=rms_seq[:1],
-            )
-        return 0
+        if max_d <= 0:
+            return 0
+
+        best_d = self._best_alignment_offset(buf, anchor_rms, buf_frame_bytes, max_d)
+        if best_d > 0:
+            del buf.bytes_[: best_d * buf_frame_bytes]
+        return best_d
 
     @staticmethod
     def _best_alignment_offset(
-        head: bytes, anchor_rms: list[float], buf_frame_bytes: int, max_d: int
-    ) -> Optional[int]:
-        """Return the leading-frame offset whose RMS window matches the anchors.
+        buf: AudioBuffer, anchor_rms: list[float], buf_frame_bytes: int, max_d: int
+    ) -> int:
+        """Return the leading-frame offset whose RMS window best matches anchors.
 
-        ``None`` when no offset is a confident match — the caller must not shift
-        anything. ``0`` is a *confident* match at the head (distinct from the
-        old sentinel meaning "give up"): with a silent-head lead the caller
-        turns it into a negative shift.
-
-        Confidence rules, calibrated against real staging envelopes (session
-        4e35f6826fa5: true offsets scored err ratios 0.03-4.5x the strict
-        tolerance while wrong offsets scored 87-374x, with best-vs-second-best
-        margins of 47-3000x):
-        - The head is preferred whenever it is within the strict tolerance
-          (``_ALIGN_REL_TOL``), so the steady-state case never wanders.
-        - A non-head match must pass a loose sanity cap (``_ALIGN_MAX_REL_TOL``
-          of anchor energy) AND beat every other offset, head included, by
-          ``_ALIGN_MARGIN`` — the discriminative signal is the margin, not the
-          absolute error, which cross-sample-rate envelopes can't keep tight.
+        0 when no offset beats the head (d=0) within tolerance — i.e. the server
+        dropped nothing. The tolerance scales with anchor energy so it works at any
+        volume; only a confident, better-than-head match trims.
         """
 
         def window_err(d: int) -> Optional[float]:
             err = 0.0
             for j, a in enumerate(anchor_rms):
                 start = (d + j) * buf_frame_bytes
-                r = rms_int16(bytes(head[start : start + buf_frame_bytes]))
+                r = rms_int16(bytes(buf.bytes_[start : start + buf_frame_bytes]))
                 if r is None:
                     return None
                 err += (r - a) * (r - a)
             return err / len(anchor_rms)
 
-        mean_rms = sum(anchor_rms) / len(anchor_rms)
-        tol = (_ALIGN_REL_TOL * mean_rms) ** 2
         base_err = window_err(0)
         if base_err is None:
-            return None
-        if base_err <= tol:
             return 0
         best_d, best_err = 0, base_err
-        second_err = float("inf")
         for d in range(1, max_d + 1):
             e = window_err(d)
             if e is None:
                 break
             if e < best_err:
-                best_d, best_err, second_err = d, e, best_err
-            elif e < second_err:
-                second_err = e
-        tol_cap = (_ALIGN_MAX_REL_TOL * mean_rms) ** 2
-        # Strictly-less: a periodic envelope matching two offsets equally well
-        # (both errors 0) is ambiguous and must not shift.
-        if best_d > 0 and best_err <= tol_cap and best_err * _ALIGN_MARGIN < second_err:
+                best_d, best_err = d, e
+
+        tol = (_ALIGN_REL_TOL * (sum(anchor_rms) / len(anchor_rms))) ** 2
+        if best_d > 0 and best_err <= tol and best_err < base_err:
             return best_d
-        return None
+        return 0
 
     # ------------------------------------------------------------------
     # Idle backlog drain
@@ -638,22 +448,6 @@ class Synchronizer:
         video_frame: Optional[VideoFrame] = None
         if self.video_frames:
             video_frame = self.video_frames.popleft()
-            # Repay video-repeat debt: while mid-speech repeats left the video
-            # timeline behind the audio, skip one extra plain-speech frame per
-            # tick (video runs 2x for that tick) until the streams line up again.
-            # Never skips across a turn boundary — both the shown and the skipped
-            # frame must be plain continuation speech.
-            if (
-                self._repeat_debt > 0
-                and self._config.video_repeat_catchup_enabled
-                and self._pending_align is None  # a skip would corrupt the anchor
-                and video_frame.is_speech()
-                and self.video_frames
-                and self.video_frames[0].is_speech()
-            ):
-                video_frame = self.video_frames.popleft()
-                self._repeat_debt -= 1
-                result.catchup_dropped = 1
             # Two swap triggers: (1) the server's new-turn boundary (frame_type=3),
             # and (2) a natural turn end / deferred-swap recovery — a SPEECH frame
             # popped while the current buffer is replaceable and a buffer is queued.
@@ -668,36 +462,10 @@ class Synchronizer:
             if new_turn or natural_end:
                 result.align_trim_frames = self.swap_to_next_buffer(video_frame)
                 result.swapped = True
-            else:
-                # A swap that couldn't align yet (anchor-starved) keeps gathering
-                # anchors from the popped frames; the shift lands a few ticks in.
-                deferred_shift = self._feed_pending_align(video_frame)
-                if deferred_shift:
-                    result.align_trim_frames = deferred_shift
         result.video_frame = video_frame
-
-        # A turn boundary re-anchors the streams: owed video from the previous
-        # turn must not bleed into the next one.
-        if result.swapped or (
-            video_frame is not None
-            and (video_frame.is_silence() or video_frame.is_fade_out())
-        ):
-            self._repeat_debt = 0
 
         result.idle_skipped = self.drain_idle_backlog(video_frame)
         result.audio_chunk = self._drain_audio_chunk()
-
-        # Accrue video-repeat debt: real (non-faded) speech audio advanced this
-        # tick but no video frame was available — the shown frame repeated, so
-        # the video timeline is now one frame behind the audio.
-        if (
-            self._config.video_repeat_catchup_enabled
-            and video_frame is None
-            and result.audio_chunk is not None
-            and self.current_buffer is not None
-            and not self.current_buffer.interrupted
-        ):
-            self._repeat_debt = min(self._repeat_debt + 1, _REPEAT_DEBT_MAX)
 
         speaking = self.is_currently_speaking()
         if speaking and not self.was_speaking:
