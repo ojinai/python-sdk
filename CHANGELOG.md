@@ -4,6 +4,33 @@ All notable changes to `ojin-client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0 — see CONTRIBUTING.md).
 
+## 0.9.0.dev1 - 2026-07-12 (dev pre-release — for online testing, not yet merged)
+
+### Changed
+- TTS audio for a turn that opens **while a barge-in is still settling server-side**
+  is now **buffered and replayed** once the interruption clears, instead of being
+  fed immediately. The server discards audio sent while it is still cancelling the
+  prior turn, so feeding a new turn during that window left the client playing audio
+  the server never rendered — desyncing every later turn. `OjinSTVClient` now defers
+  the new turn's `start_turn` + audio (in arrival order) from the moment a barge-in
+  turn opens until the server's idle/fade frame closes the window, then replays it.
+  The interrupted turn's own trailing audio is still dropped (never replayed).
+
+### Added
+- Transport-level server-feed **send pacing** in `OjinClient`: a single audio send
+  is capped at `max_input_chunk_bytes` (larger payloads are split) and consecutive
+  sends are spaced `send_chunk_gap_s` apart **only while a backlog remains**, so a
+  buffered burst (e.g. TTS replayed after a barge-in) can't flood the inference
+  server while steady-state realtime streaming is never delayed. Wired from new
+  `STVConfig` knobs `server_feed_max_chunk_bytes` (default 512000) and
+  `server_feed_send_gap_ms` (default 200). `OjinClient`'s own defaults keep the
+  previous behaviour (no gap) for direct users.
+
+### Fixed
+- A `CancelInteractionMessage` now **drops any audio still queued to be sent** in
+  `OjinClient` (and the in-flight chunk loop bails between chunks), so pre-cancel
+  audio can't outlive the barge-in and desync the next turn.
+
 ## 0.8.0 - 2026-06-19
 
 ### Added

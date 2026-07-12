@@ -261,6 +261,68 @@ def test_interrupt_window_closes_on_idle_or_fadeout_frame() -> None:
     asyncio.run(run())
 
 
+def test_turn_opened_during_interruption_is_deferred_then_replayed() -> None:
+    """A turn opened mid-barge-in is buffered, not fed, then replayed on window close.
+
+    The server discards audio sent while it is still cancelling, so feeding the new
+    turn now would desync playback. Deferred input is replayed in order once the
+    idle/fade frame clears the window.
+    """
+
+    async def run() -> None:
+        c, fc, _out = make_client(server_feed_batching_enabled=False)
+        c._initialized = True  # a live turn only exists once the session is ready
+        c._synchronizer.current_buffer = _live_buffer()
+        await c.interrupt()
+        assert c._interruption_ongoing is True
+        fc.sent.clear()
+
+        # New turn + its audio open while the cancel is still unacknowledged.
+        await c.start_turn()
+        assert c._deferring_input is True
+        await c.send_tts_audio(b"\x01\x02" * 640, 16000, 1)
+        await c.send_tts_audio(b"\x03\x04" * 640, 16000, 1)
+        # Nothing opened for playback, nothing fed to the server — all buffered.
+        assert len(c._interrupt_deferred) == 3  # turn + 2 audio ops
+        assert not [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+
+        # Server's idle frame closes the window → deferred input replays (in order).
+        await c._handle_message(_interaction_response(FrameType.IDLE))
+        assert c._interruption_ongoing is False
+        assert c._deferring_input is False
+        assert c._interrupt_deferred == []
+        sent_audio = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(sent_audio) == 2  # both audio ops fed, in order
+        assert c._synchronizer.audio_buffers[-1].bytes_  # turn buffered for playback
+
+    asyncio.run(run())
+
+
+def test_trailing_audio_of_interrupted_turn_is_not_deferred() -> None:
+    """Audio for the cancelled turn (no new start_turn) is dropped, not buffered.
+
+    Deferral begins only at a NEW turn's start_turn during the window; the
+    interrupted turn's own straggler audio must still be dropped (it has no buffer),
+    never replayed after the barge-in.
+    """
+
+    async def run() -> None:
+        c, fc, _out = make_client(server_feed_batching_enabled=False)
+        c._initialized = True
+        c._synchronizer.current_buffer = _live_buffer()
+        await c.interrupt()
+        fc.sent.clear()
+
+        assert c._deferring_input is False  # no new turn opened
+        await c.send_tts_audio(b"\x01\x02" * 640, 16000, 1)
+
+        assert c._interrupt_deferred == []  # not buffered
+        # Dropped (no buffer for the cancelled turn), not fed to the server.
+        assert not [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+
+    asyncio.run(run())
+
+
 def test_emit_tick_fires_started_speaking_event() -> None:
     """When a buffer begins draining, the tick emits BOT_STARTED_SPEAKING."""
 

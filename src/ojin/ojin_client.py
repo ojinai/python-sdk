@@ -110,6 +110,8 @@ class OjinClient(IOjinClient):
         reconnect_attempts: int = 3,
         reconnect_delay: float = 1.0,
         mode: str | None = None,
+        max_input_chunk_bytes: int = 1024 * 500,
+        send_chunk_gap_s: float = 0.0,
     ):
         """Initialize the OJIN STV WebSocket client.
 
@@ -122,6 +124,15 @@ class OjinClient(IOjinClient):
             mode: Optional mode string for the connection (e.g., "dev" for
                 development mode). When set to "dev", adds mode parameter to
                 the WebSocket URL query string. Defaults to None.
+            max_input_chunk_bytes: Cap on a single audio send; larger
+                ``OjinAudioInputMessage`` payloads are split into this many bytes
+                per WebSocket frame.
+            send_chunk_gap_s: Minimum gap between consecutive audio sends while a
+                backlog remains (split chunks of one message, or a queue of pending
+                messages). Keeps a buffered burst from flooding the server; steady
+                realtime (one message at a time, queue drains empty) is never
+                delayed. Defaults to 0 (no pacing); ``OjinSTVClient`` passes its
+                configured value.
 
         """
         super().__init__()
@@ -130,6 +141,8 @@ class OjinClient(IOjinClient):
         self.config_id = config_id
         self.reconnect_attempts = reconnect_attempts
         self.reconnect_delay = reconnect_delay
+        self._max_input_chunk_bytes = max(1, max_input_chunk_bytes)
+        self._send_chunk_gap_s = max(0.0, send_chunk_gap_s)
 
         self._ws: Optional[ClientConnection] = None
         self._available_response_messages_queue: asyncio.Queue[BaseModel] = (
@@ -384,6 +397,13 @@ class OjinClient(IOjinClient):
             with contextlib.suppress(ValueError):
                 self._available_response_messages_queue.task_done()
 
+    def _drain_client_messages(self) -> None:
+        """Drop queued outbound client messages (e.g. on cancel) without blocking."""
+        while not self._pending_client_messages_queue.empty():
+            self._pending_client_messages_queue.get_nowait()
+            with contextlib.suppress(ValueError):
+                self._pending_client_messages_queue.task_done()
+
     async def send_message(self, message: BaseModel) -> None:
         """Send a message to the OJIN STV service.
 
@@ -402,6 +422,11 @@ class OjinClient(IOjinClient):
 
         if isinstance(message, OjinCancelInteractionMessage):
             self._cancelled = True
+            # Drop any audio still queued to be sent for the turn being cancelled:
+            # the server discards post-cancel input, so forwarding it would only
+            # desync the next turn. (The in-flight send loop also bails on
+            # ``_cancelled`` between chunks — see _process_client_messages.)
+            self._drain_client_messages()
             cancel_input = CancelInteractionMessage(payload=message.to_proxy_message())
 
             await self._ws.send(cancel_input.model_dump_json())
@@ -443,7 +468,7 @@ class OjinClient(IOjinClient):
 
             message: OjinMessage = await self._pending_client_messages_queue.get()
             if isinstance(message, OjinAudioInputMessage):
-                max_chunk_size = 1024 * 500
+                max_chunk_size = self._max_input_chunk_bytes
                 audio_chunks = [
                     message.audio_int16_bytes[i : i + max_chunk_size]
                     for i in range(0, len(message.audio_int16_bytes), max_chunk_size)
@@ -453,7 +478,11 @@ class OjinClient(IOjinClient):
                 if len(audio_chunks) == 0:
                     audio_chunks.append(bytes())
 
-                for _, chunk in enumerate(audio_chunks):
+                for idx, chunk in enumerate(audio_chunks):
+                    if self._cancelled:
+                        # A cancel landed mid-send: abandon the rest of this (now
+                        # cancelled) turn's audio instead of finishing the burst.
+                        break
                     interaction_input = InteractionInput(
                         payload_type="audio",
                         payload=chunk,
@@ -463,6 +492,19 @@ class OjinClient(IOjinClient):
                     proxy_message = InteractionInputMessage(payload=interaction_input)
 
                     await self._ws.send(proxy_message.to_bytes())
+
+                    # Pace the feed: when more audio is ready to go right now — more
+                    # split chunks of this message, or a backlog of queued messages
+                    # (e.g. TTS buffered during a barge-in then replayed all at once)
+                    # — space consecutive sends so a burst doesn't flood the inference
+                    # server. Steady realtime carries one small message at a time and
+                    # the queue drains empty between arrivals, so no gap is added.
+                    more_to_send = (
+                        idx < len(audio_chunks) - 1
+                        or not self._pending_client_messages_queue.empty()
+                    )
+                    if more_to_send and self._send_chunk_gap_s > 0:
+                        await asyncio.sleep(self._send_chunk_gap_s)
 
             elif isinstance(message, OjinTextInputMessage):
                 text_message = message.to_proxy_message()

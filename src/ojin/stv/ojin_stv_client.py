@@ -115,6 +115,10 @@ class OjinSTVClient:
             api_key=api_key,
             config_id=config_id,
             mode=os.getenv("OJIN_MODE", ""),
+            # Transport-level send pacing: cap a single send and gap a backlog so a
+            # buffered burst (e.g. TTS replayed after a barge-in) can't flood.
+            max_input_chunk_bytes=max(1, int(self._config.server_feed_max_chunk_bytes)),
+            send_chunk_gap_s=self._config.server_feed_send_gap_ms / 1000.0,
         )
         self._resampler: Resampler = resampler or default_resampler()
         self._decoder: VideoDecoder = decoder or OpenCVDecoder()
@@ -152,6 +156,17 @@ class OjinSTVClient:
         # are dropped so a re-fire (e.g. VAD flap, or a new turn that swapped in
         # before the cancel landed) can't stack a second cancel on the server.
         self._interruption_ongoing = False
+
+        # Deferred input during a barge-in. A NEW turn that opens (start_turn) while a
+        # cancel is still settling server-side must not be fed yet — the server would
+        # discard it, desyncing playback. Instead we buffer that turn's start + audio
+        # here (in order) and replay it once the server's idle/fade frame clears the
+        # window (see _flush_interrupt_deferred). Deferral begins at the new turn's
+        # start_turn (NOT at interrupt: the interrupted turn's own trailing audio must
+        # still be dropped, not replayed). Entries mirror _preinit_inputs:
+        # ("turn",) or ("audio", pcm, sample_rate, num_channels).
+        self._interrupt_deferred: list[tuple] = []
+        self._deferring_input = False
 
         # Per-tick trace bookkeeping (only touched when a real tracer is injected,
         # so a NullTracer session pays nothing). Mirrors OjinVideoService.
@@ -319,6 +334,24 @@ class OjinSTVClient:
             self._preinit_inputs.append(("turn",))
             self._tracer.instant("tts_input", "tts_started_buffered")
             return
+        if self._deferring_input or self._interruption_ongoing:
+            # A new turn opened while a barge-in is still settling server-side. Buffer
+            # its start (and everything that follows) instead of feeding it now — the
+            # server would discard audio sent mid-cancel, desyncing playback. Replayed
+            # in order once the window clears (see _flush_interrupt_deferred).
+            self._deferring_input = True
+            self._interrupt_deferred.append(("turn",))
+            self._tracer.instant("tts_input", "tts_started_deferred")
+            return
+        await self._start_turn_core()
+
+    async def _start_turn_core(self) -> None:
+        """Open the next turn's buffer and flush the prior turn's tail (no guards).
+
+        The body of :meth:`start_turn` once buffering/deferral guards have passed;
+        also the seam :meth:`_flush_interrupt_deferred` replays through, so it must
+        never re-check those guards.
+        """
         # Flush the previous turn's resampler tail (soxr holds back ~30 ms of
         # filter delay). Dropping it makes the 16 kHz server feed shorter than the
         # played 24 kHz audio and drifts lip-sync; instead send it as the trailing
@@ -351,7 +384,11 @@ class OjinSTVClient:
         return tail if isinstance(tail, bytes) else b""
 
     async def _send_audio_message(self, pcm: bytes) -> None:
-        """Send one server-bound audio payload and record the to_server trace."""
+        """Send one server-bound audio payload and record the to_server trace.
+
+        Pacing (a gap between consecutive sends when a backlog builds) and chunking
+        live in ``OjinClient``; this just hands the payload off.
+        """
         await self._client.send_message(OjinAudioInputMessage(audio_int16_bytes=pcm))
         self._tracer.instant("to_server", "audio_sent", args={"bytes": len(pcm)})
 
@@ -375,6 +412,25 @@ class OjinSTVClient:
                 logger.warning("send_tts_audio before session ready — dropping")
             return
 
+        if self._deferring_input:
+            # A turn opened during a barge-in (see start_turn); hold its audio until
+            # the window clears so it replays in order with its turn boundary.
+            self._interrupt_deferred.append(("audio", pcm, sample_rate, num_channels))
+            self._tracer.instant(
+                "tts_input", "tts_audio_deferred", args={"bytes": len(pcm)}
+            )
+            return
+
+        await self._send_tts_audio_core(pcm, sample_rate, num_channels)
+
+    async def _send_tts_audio_core(
+        self, pcm: bytes, sample_rate: int, num_channels: int
+    ) -> None:
+        """Buffer + resample + feed one TTS audio payload (no deferral guards).
+
+        The body of :meth:`send_tts_audio` once the not-ready / deferral guards have
+        passed; also the seam :meth:`_flush_interrupt_deferred` replays through.
+        """
         duration = len(pcm) / (sample_rate * num_channels * 2)
         if abs(duration - _HALF_SECOND) < _HALF_SECOND_TOL and pcm == b"\x00" * len(
             pcm
@@ -441,6 +497,30 @@ class OjinSTVClient:
             else:  # ("audio", pcm, sample_rate, num_channels)
                 await self.send_tts_audio(op[1], op[2], op[3])
 
+    async def _flush_interrupt_deferred(self) -> None:
+        """Replay input deferred during a barge-in, in arrival order, then resume.
+
+        Called from the receive loop when the server's idle/fade frame clears the
+        interruption window. Replays through the guard-free ``*_core`` seams so it
+        never re-defers. Drains in a loop and only clears ``_deferring_input`` once
+        the buffer is empty: any live ``send_tts_audio`` that lands mid-replay still
+        appends (the flag is set) and is picked up in the next pass, so ordering is
+        preserved and no frame slips ahead of the replayed backlog.
+        """
+        if self._interrupt_deferred:
+            logger.info(
+                "Replaying %d input op(s) deferred during barge-in",
+                len(self._interrupt_deferred),
+            )
+        while self._interrupt_deferred:
+            pending, self._interrupt_deferred = self._interrupt_deferred, []
+            for op in pending:
+                if op[0] == "turn":
+                    await self._start_turn_core()
+                else:  # ("audio", pcm, sample_rate, num_channels)
+                    await self._send_tts_audio_core(op[1], op[2], op[3])
+        self._deferring_input = False
+
     async def interrupt(self) -> bool:
         """Barge-in: fade the current turn and cancel it server-side if playing.
 
@@ -460,6 +540,8 @@ class OjinSTVClient:
             return False
         if self._synchronizer.interrupt():
             self._interruption_ongoing = True
+            # OjinClient drops any audio still queued toward the server when it sees
+            # this cancel, so no pre-cancel audio outlives the barge-in.
             await self._client.send_message(OjinCancelInteractionMessage())
             if self._config.server_feed_batching_enabled:
                 self._batcher.reset()
@@ -523,7 +605,17 @@ class OjinSTVClient:
             await self._flush_preinit_inputs()
 
         elif isinstance(message, OjinInteractionResponseMessage):
+            was_interrupting = self._interruption_ongoing
             self._on_interaction_response(message)
+            # The idle/fade frame that just closed the barge-in window is the server's
+            # signal that it is ready for new input again — replay any turn that was
+            # deferred while the cancel was settling (see start_turn / send_tts_audio).
+            if (
+                was_interrupting
+                and not self._interruption_ongoing
+                and self._deferring_input
+            ):
+                await self._flush_interrupt_deferred()
 
         elif isinstance(message, ErrorResponseMessage):
             code = str(message.payload.code)

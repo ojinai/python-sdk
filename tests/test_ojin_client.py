@@ -1,15 +1,149 @@
 """Unit tests for OjinClient server-message handling robustness."""
 
+import asyncio
+import contextlib
 import json
 
 from ojin.entities.interaction_messages import ErrorResponseMessage
 from ojin.ojin_client import OjinClient
-from ojin.ojin_client_messages import OjinSessionReadyMessage
+from ojin.ojin_client_messages import (
+    OjinAudioInputMessage,
+    OjinCancelInteractionMessage,
+    OjinSessionReadyMessage,
+)
 
 
 def _client() -> OjinClient:
     """Return an OjinClient that is constructed but never connected (queue only)."""
     return OjinClient(ws_url="ws://test/realtime", api_key="k", config_id="c")
+
+
+class _FakeWS:
+    """Records everything sent over the socket; no real I/O."""
+
+    def __init__(self) -> None:
+        self.sent: list = []
+
+    async def send(self, data) -> None:
+        self.sent.append(data)
+
+
+async def _drain_send_loop(client, expected_sends, real_sleep, max_iters=1000):
+    """Run _process_client_messages until it has sent ``expected_sends`` frames.
+
+    ``real_sleep`` is the un-patched ``asyncio.sleep`` (so the driver can yield even
+    when the module's sleep is monkeypatched to a no-op recorder).
+    """
+    task = asyncio.create_task(client._process_client_messages())
+    for _ in range(max_iters):
+        if (
+            len(client._ws.sent) >= expected_sends
+            and client._pending_client_messages_queue.empty()
+        ):
+            break
+        await real_sleep(0)
+    client._running = False
+    task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await task
+
+
+def _audio_msg(pcm: bytes) -> OjinAudioInputMessage:
+    return OjinAudioInputMessage(audio_int16_bytes=pcm)
+
+
+async def test_cancel_drops_pending_client_messages() -> None:
+    """A cancel clears audio still queued to send, so it can't outlive the barge-in."""
+    client = _client()
+    client._running = True
+    client._inference_server_ready = True
+    client._ws = _FakeWS()  # type: ignore[assignment]
+
+    await client.send_message(_audio_msg(b"\x01\x02" * 100))
+    await client.send_message(_audio_msg(b"\x03\x04" * 100))
+    assert client._pending_client_messages_queue.qsize() == 2
+
+    await client.send_message(OjinCancelInteractionMessage())
+
+    assert client._pending_client_messages_queue.qsize() == 0  # drained on cancel
+    assert len(client._ws.sent) == 1  # only the cancel frame reached the wire
+
+
+async def test_large_audio_split_into_max_chunks_and_paced(monkeypatch) -> None:
+    """A payload larger than the cap is split, and split chunks are gapped."""
+    real_sleep = asyncio.sleep
+    sleeps: list = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    client = OjinClient(
+        ws_url="ws://t",
+        api_key="k",
+        config_id="c",
+        max_input_chunk_bytes=4,
+        send_chunk_gap_s=0.2,
+    )
+    client._running = True
+    client._ws = _FakeWS()  # type: ignore[assignment]
+    await client._pending_client_messages_queue.put(_audio_msg(b"\x01\x02\x03\x04" * 3))
+
+    await _drain_send_loop(client, expected_sends=3, real_sleep=real_sleep)
+
+    assert len(client._ws.sent) == 3  # 12 bytes / 4-byte cap = 3 chunks
+    assert sleeps == [0.2, 0.2]  # gap after chunks 0 and 1, none after the last
+
+
+async def test_single_message_sends_without_gap(monkeypatch) -> None:
+    """One message with no backlog is sent at once — pacing never delays realtime."""
+    real_sleep = asyncio.sleep
+    sleeps: list = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    client = OjinClient(
+        ws_url="ws://t", api_key="k", config_id="c", send_chunk_gap_s=0.2
+    )
+    client._running = True
+    client._ws = _FakeWS()  # type: ignore[assignment]
+    await client._pending_client_messages_queue.put(_audio_msg(b"\x01\x02" * 10))
+
+    await _drain_send_loop(client, expected_sends=1, real_sleep=real_sleep)
+
+    assert len(client._ws.sent) == 1
+    assert sleeps == []  # queue drained empty → no gap inserted
+
+
+async def test_backlog_of_messages_is_paced(monkeypatch) -> None:
+    """A queued burst of messages is spaced by the gap, one per message boundary."""
+    real_sleep = asyncio.sleep
+    sleeps: list = []
+
+    async def fake_sleep(delay):
+        sleeps.append(delay)
+        await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", fake_sleep)
+
+    client = OjinClient(
+        ws_url="ws://t", api_key="k", config_id="c", send_chunk_gap_s=0.2
+    )
+    client._running = True
+    client._ws = _FakeWS()  # type: ignore[assignment]
+    for _ in range(3):
+        await client._pending_client_messages_queue.put(_audio_msg(b"\x01\x02" * 10))
+
+    await _drain_send_loop(client, expected_sends=3, real_sleep=real_sleep)
+
+    assert len(client._ws.sent) == 3
+    assert sleeps == [0.2, 0.2]  # gap after the 1st and 2nd (backlog), not the 3rd
 
 
 async def test_non_json_text_surfaces_clean_error() -> None:

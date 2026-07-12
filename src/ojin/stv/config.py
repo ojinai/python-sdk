@@ -45,6 +45,15 @@ class STVConfig:
     server_feed_initial_chunk_ms: int = 1000
     server_feed_min_chunk_ms: int = 400
     server_feed_flush_idle_ms: int = 200
+    # Server-feed send pacing (enforced by the transport, OjinClient). A backlog can
+    # build when input is buffered (e.g. TTS deferred during a barge-in, then
+    # replayed) or a large payload lands at once. To avoid flooding the inference
+    # server, OjinClient caps a single send at ``server_feed_max_chunk_bytes`` (larger
+    # payloads are split) and spaces consecutive sends ``server_feed_send_gap_ms``
+    # apart — but ONLY while a backlog remains, so steady-state realtime streaming is
+    # never delayed. Both are passed to OjinClient at construction.
+    server_feed_max_chunk_bytes: int = 1024 * 500
+    server_feed_send_gap_ms: int = 200
 
     # Diagnostics — off by default; a published SDK should be quiet. Each tier
     # dumps every thread's stack to stderr when a playback tick stalls past its
