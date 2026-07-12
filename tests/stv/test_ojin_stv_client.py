@@ -530,17 +530,13 @@ def test_start_turn_flushes_previous_tail_and_rearms_initial() -> None:
     asyncio.run(run())
 
 
-def test_start_turn_discards_resampler_tail() -> None:
-    """A new turn resets the resampler but never sends the stale tail.
+def test_start_turn_flushes_resampler_tail_to_server() -> None:
+    """A new turn drains the previous turn's *resampler* tail to the server.
 
-    The streaming resampler holds back a filter-delay tail from audio fed
-    seconds ago. Sending it at the next ``start_turn`` lands it at the HEAD of
-    the new turn's server feed, where the server renders it as near-zero speech
-    frames the local buffer does not have — a constant video-late offset for
-    the whole turn (measured on staging: every natural-turn entry was offset by
-    exactly the tail's duration). The boundary must flush the filter state so
-    the new turn starts clean, but the stale bytes are discarded — mirroring
-    the interrupt path.
+    The streaming resampler holds back a filter-delay tail; if it were dropped at
+    the turn boundary the 16 kHz server feed would be a hair shorter than the
+    played 24 kHz audio, drifting lip-sync. A fake resampler makes the tail
+    observable in the sent messages.
     """
     tail_marker = b"\xab\xcd" * 8
 
@@ -579,13 +575,12 @@ def test_start_turn_discards_resampler_tail() -> None:
         await c.start_turn()
         await c.send_tts_audio(b"\x03\x04" * 480, 24000, 1)  # 20 ms @ 24 kHz
         fc.sent.clear()
-        await c.start_turn()  # turn boundary → reset the filter, drop the tail
+        await c.start_turn()  # turn boundary → flush prior turn's resampler tail
         sent = [
             m.audio_int16_bytes for m in fc.sent if isinstance(m, OjinAudioInputMessage)
         ]
-        assert rs.flushes >= 1  # the filter state was still reset at the boundary
-        assert tail_marker not in sent, f"stale tail leaked into the new turn: {sent}"
-        assert not sent  # nothing else should be sent by an empty-batch boundary
+        assert rs.flushes >= 1
+        assert tail_marker in sent, f"resampler tail not sent at boundary: {sent}"
         await c.close()
 
     asyncio.run(run())
