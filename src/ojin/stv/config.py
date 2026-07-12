@@ -32,6 +32,13 @@ class STVConfig:
     align_audio_on_swap: bool = True
     align_audio_max_frames: int = 50
 
+    # Mid-speech video-repeat catch-up. When speech audio drains on a tick with
+    # no fresh video frame (a delivery stall), the shown frame repeats and the
+    # video timeline falls 40 ms behind the audio — permanently, since only one
+    # frame is popped per tick. When enabled, the owed frames are repaid by
+    # skipping one extra plain-speech frame per tick once frames flow again.
+    video_repeat_catchup_enabled: bool = True
+
     # Barge-in
     interrupt_audio_fade_s: float = 0.75
 
