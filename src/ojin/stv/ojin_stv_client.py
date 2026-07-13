@@ -755,6 +755,7 @@ class OjinSTVClient:
             is_final=message.is_final_response,
             volume=volume,
         )
+        self._last_video_frame = video_frame
         self._decode_in.put(video_frame)
 
         payload_bytes = len(message.video_frame_bytes) + len(message.audio_frame_bytes)
