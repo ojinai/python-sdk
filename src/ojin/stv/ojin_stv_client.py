@@ -78,7 +78,7 @@ _BYTES_PER_MS_16K = OJIN_PERSONA_SAMPLE_RATE * 2 / 1000.0  # 32 B/ms mono int16
 class OjinSTVClient:
     """Drives one Ojin STV session: feed TTS audio in, get synced A/V out."""
 
-    def __init__(  # noqa: PLR0913 — injectable deps; all keyword-only with defaults
+    def __init__(  # noqa: PLR0913, PLR0915 — injectable deps + flat field init
         self,
         *,
         api_key: str = "",
@@ -729,7 +729,10 @@ class OjinSTVClient:
             else None
         )
 
-        if last_frame_type == 1 and frame_type == 3:
+        if (
+            last_frame_type == FrameType.SPEECH
+            and frame_type == FrameType.START_OF_SPEECH
+        ):
             logger.warning(
                 "Received BOOMERANG frame after SPEECH_FRAME frame; "
                 "this is unexpected and may indicate a server-side issue."
