@@ -2,7 +2,7 @@
 
 [![PyPI version](https://img.shields.io/pypi/v/ojin-client.svg)](https://pypi.org/project/ojin-client/)
 [![Python versions](https://img.shields.io/pypi/pyversions/ojin-client.svg)](https://pypi.org/project/ojin-client/)
-[![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
+[![License: BSD 2-Clause](https://img.shields.io/badge/license-BSD%202--Clause-blue.svg)](LICENSE)
 [![Docs](https://img.shields.io/badge/docs-docs.ojin.ai-111.svg)](https://docs.ojin.ai)
 
 > Real-time talking faces for **human agents that resonate**. Stream audio in, get a lip-synced avatar back — on a real-time clock, straight from Python.
@@ -396,4 +396,4 @@ async def main(pcm_16k_mono: bytes) -> None:
 
 ## License
 
-Apache License 2.0 — see [LICENSE](LICENSE).
+BSD 2-Clause License — see [LICENSE](LICENSE).

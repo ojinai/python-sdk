@@ -5,9 +5,9 @@ description = "Ojin platform services"
 readme = "README.md"
 requires-python = ">=3.10"
 authors = [{name = "Journee"}]
-license = {text = "Apache-2.0"}
+license = {text = "BSD-2-Clause"}
 classifiers = [
-    "License :: OSI Approved :: Apache Software License"
+    "License :: OSI Approved :: BSD License"
 ]
 dependencies = [    
     "websockets>=15.0.1,<16",
