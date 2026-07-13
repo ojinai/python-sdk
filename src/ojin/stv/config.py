@@ -32,6 +32,13 @@ class STVConfig:
     align_audio_on_swap: bool = True
     align_audio_max_frames: int = 50
 
+    # Mid-speech video-repeat catch-up. When speech audio drains on a tick with
+    # no fresh video frame (a delivery stall), the shown frame repeats and the
+    # video timeline falls 40 ms behind the audio — permanently, since only one
+    # frame is popped per tick. When enabled, the owed frames are repaid by
+    # skipping one extra plain-speech frame per tick once frames flow again.
+    video_repeat_catchup_enabled: bool = True
+
     # Barge-in
     interrupt_audio_fade_s: float = 0.75
 
@@ -45,6 +52,26 @@ class STVConfig:
     server_feed_initial_chunk_ms: int = 1000
     server_feed_min_chunk_ms: int = 400
     server_feed_flush_idle_ms: int = 200
+    # Server-feed send pacing (enforced by the transport, OjinClient). A backlog can
+    # build when input is buffered (e.g. TTS deferred during a barge-in, then
+    # replayed) or a large payload lands at once. To avoid flooding the inference
+    # server, OjinClient caps a single send at ``server_feed_max_chunk_bytes`` (larger
+    # payloads are split) and spaces consecutive sends ``server_feed_send_gap_ms``
+    # apart — but ONLY while a backlog remains, so steady-state realtime streaming is
+    # never delayed. Both are passed to OjinClient at construction.
+    server_feed_max_chunk_bytes: int = 1024 * 50
+    server_feed_send_gap_ms: int = 200
+    # Server-feed lead cap: never ship audio more than this far ahead of local
+    # playback. The server renders at ~1x realtime, so sending a long answer's
+    # whole audio up front (measured: 272 s queued in ~25 s of wall clock,
+    # session-7 trace 2026-07-12) buys nothing — it only builds a server-side
+    # input backlog that must flush before a barge-in cancel is acknowledged
+    # (ack grew 1.2 s -> 2.0 s over that session, and the deferred next turn
+    # waits on it). With the cap, the backlog at cancel is bounded and constant
+    # regardless of answer length. Payloads beyond the cap wait client-side and
+    # are released as playback advances; a barge-in discards them outright.
+    # 0 disables the cap (legacy: ship as fast as pacing allows).
+    server_feed_max_lead_ms: int = 8000
 
     # Diagnostics — off by default; a published SDK should be quiet. Each tier
     # dumps every thread's stack to stderr when a playback tick stalls past its

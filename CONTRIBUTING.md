@@ -167,4 +167,4 @@ Open an [issue](https://github.com/ojinai/python-sdk/issues) with:
 
 ## License
 
-By contributing, you agree that your contributions are licensed under the [Apache License 2.0](LICENSE), the same license as the project.
+By contributing, you agree that your contributions are licensed under the [BSD 2-Clause License](LICENSE), the same license as the project.

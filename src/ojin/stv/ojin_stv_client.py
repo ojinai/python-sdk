@@ -78,7 +78,7 @@ _BYTES_PER_MS_16K = OJIN_PERSONA_SAMPLE_RATE * 2 / 1000.0  # 32 B/ms mono int16
 class OjinSTVClient:
     """Drives one Ojin STV session: feed TTS audio in, get synced A/V out."""
 
-    def __init__(  # noqa: PLR0913 — injectable deps; all keyword-only with defaults
+    def __init__(  # noqa: PLR0913, PLR0915 — injectable deps + flat field init
         self,
         *,
         api_key: str = "",
@@ -115,6 +115,10 @@ class OjinSTVClient:
             api_key=api_key,
             config_id=config_id,
             mode=os.getenv("OJIN_MODE", ""),
+            # Transport-level send pacing: cap a single send and gap a backlog so a
+            # buffered burst (e.g. TTS replayed after a barge-in) can't flood.
+            max_input_chunk_bytes=max(1, int(self._config.server_feed_max_chunk_bytes)),
+            send_chunk_gap_s=self._config.server_feed_send_gap_ms / 1000.0,
         )
         self._resampler: Resampler = resampler or default_resampler()
         self._decoder: VideoDecoder = decoder or OpenCVDecoder()
@@ -134,6 +138,21 @@ class OjinSTVClient:
         self._batch_added = asyncio.Event()
         self._batch_flush_task: Optional[asyncio.Task] = None
 
+        # Server-feed lead cap (see STVConfig.server_feed_max_lead_ms). The gate
+        # compares how much audio has been shipped to the server (_server_fed_ms)
+        # against how much real audio playback has consumed (_played_real_ms);
+        # payloads that would push the lead past the cap wait in _feed_pending and
+        # are released by _server_feed_loop as ticks advance playback. All
+        # server-bound payloads are 16 kHz mono int16, so ms = bytes / 32.
+        self._server_feed_max_lead_ms = float(
+            max(0, self._config.server_feed_max_lead_ms)
+        )
+        self._server_fed_ms = 0.0
+        self._played_real_ms = 0.0
+        self._feed_pending: "deque[bytes]" = deque()
+        self._feed_wake = asyncio.Event()
+        self._feed_task: Optional[asyncio.Task] = None
+
         self._initialized = False
         self._session_data: Optional[dict] = None
         self._waiting_for_first_tts = False
@@ -145,6 +164,7 @@ class OjinSTVClient:
         self._buffer_preinit_tts_audio = buffer_preinit_tts_audio
         self._preinit_inputs: list[tuple] = []
         self._last_audio_shape = (OJIN_PERSONA_SAMPLE_RATE, 1)
+        self._last_video_frame: Optional[VideoFrame] = None
         self._last_played_rgb: Optional[bytes] = None
         self._last_played_size: Optional[tuple[int, int]] = None  # native (w, h)
         # Barge-in in flight: set when a cancel is sent, cleared when the server's
@@ -153,13 +173,28 @@ class OjinSTVClient:
         # before the cancel landed) can't stack a second cancel on the server.
         self._interruption_ongoing = False
 
+        # Deferred input during a barge-in. A NEW turn that opens (start_turn) while a
+        # cancel is still settling server-side must not be fed yet — the server would
+        # discard it, desyncing playback. Instead we buffer that turn's start + audio
+        # here (in order) and replay it once the server's idle/fade frame clears the
+        # window (see _flush_interrupt_deferred). Deferral begins at the new turn's
+        # start_turn (NOT at interrupt: the interrupted turn's own trailing audio must
+        # still be dropped, not replayed). Entries mirror _preinit_inputs:
+        # ("turn",) or ("audio", pcm, sample_rate, num_channels).
+        self._interrupt_deferred: list[tuple] = []
+        self._deferring_input = False
+
         # Per-tick trace bookkeeping (only touched when a real tracer is injected,
         # so a NullTracer session pays nothing). Mirrors OjinVideoService.
         self._tracing = not isinstance(self._tracer, NullTracer)
         self._tr_emit_times: "deque[float]" = deque()
         self._tr_underruns = 0
         self._tr_idle_skips = 0
+        self._tr_catchup_drops = 0
         self._prev_tick_perf = 0.0
+        # (cumulative ingress bytes, perf_counter) at the previous tick — the
+        # delta between ticks drives the ingress-bandwidth counter lane.
+        self._tr_prev_ingress: "tuple[int, float] | None" = None
 
         # Off-loop JPEG decode pipeline.
         self._decode_in: "queue.Queue[Optional[VideoFrame]]" = queue.Queue()
@@ -275,17 +310,28 @@ class OjinSTVClient:
         self._stop_decode_worker()
         if was_initialized:
             self._tracer.span("lifecycle", "session", self._tr_session_start)
-        # Stop the batch-flush task before the transport closes.
-        if self._batch_flush_task is not None:
-            self._batch_flush_task.cancel()
-            with contextlib.suppress(asyncio.CancelledError, Exception):
-                await self._batch_flush_task
-            self._batch_flush_task = None
-        if was_initialized and self._config.server_feed_batching_enabled:
-            pending = self._batcher.drain()
-            if pending is not None:
+        # Stop the batch-flush and lead-gate feeder tasks before the transport
+        # closes.
+        for task_attr in ("_batch_flush_task", "_feed_task"):
+            task = getattr(self, task_attr)
+            if task is not None:
+                task.cancel()
+                with contextlib.suppress(asyncio.CancelledError, Exception):
+                    await task
+                setattr(self, task_attr, None)
+        if was_initialized:
+            # Flush what is still owed to the server, in order: lead-gated
+            # payloads first (older), then the batcher's sub-threshold tail.
+            # Best-effort straight sends — the session is ending, the lead cap
+            # no longer matters.
+            while self._feed_pending:
                 with contextlib.suppress(Exception):
-                    await self._send_audio_message(pending)
+                    await self._send_audio_now(self._feed_pending.popleft())
+            if self._config.server_feed_batching_enabled:
+                pending = self._batcher.drain()
+                if pending is not None:
+                    with contextlib.suppress(Exception):
+                        await self._send_audio_now(pending)
         try:
             await self._client.close()
         except Exception as exc:  # never let teardown raise
@@ -319,11 +365,36 @@ class OjinSTVClient:
             self._preinit_inputs.append(("turn",))
             self._tracer.instant("tts_input", "tts_started_buffered")
             return
-        # Flush the previous turn's resampler tail (soxr holds back ~30 ms of
-        # filter delay). Dropping it makes the 16 kHz server feed shorter than the
-        # played 24 kHz audio and drifts lip-sync; instead send it as the trailing
-        # audio of the turn that just ended, before the new turn's buffer opens.
-        tail = self._flush_resampler()
+        if self._deferring_input or self._interruption_ongoing:
+            # A new turn opened while a barge-in is still settling server-side. Buffer
+            # its start (and everything that follows) instead of feeding it now — the
+            # server would discard audio sent mid-cancel, desyncing playback. Replayed
+            # in order once the window clears (see _flush_interrupt_deferred).
+            self._deferring_input = True
+            self._interrupt_deferred.append(("turn",))
+            self._tracer.instant("tts_input", "tts_started_deferred")
+            return
+        await self._start_turn_core()
+
+    async def _start_turn_core(self) -> None:
+        """Open the next turn's buffer and flush the prior turn's tail (no guards).
+
+        The body of :meth:`start_turn` once buffering/deferral guards have passed;
+        also the seam :meth:`_flush_interrupt_deferred` replays through, so it must
+        never re-check those guards.
+        """
+        # Flush and DISCARD the previous turn's resampler tail (soxr holds back
+        # ~30 ms of filter delay). By start_turn time the previous turn ended
+        # seconds ago and its audio has already played; sending the tail now
+        # would land it at the HEAD of the new turn's server feed, where the
+        # server renders it as 1-2 near-zero speech frames the local buffer does
+        # not have — measured as a constant 40-80 ms video-late offset for the
+        # whole turn (staging session d65312d758f0: every natural-turn entry was
+        # offset by exactly the flushed tail's duration; barge-in turns, whose
+        # interrupt path already discards the tail, were clean). Dropping it
+        # only shortens the rendered tail of the PREVIOUS turn by ~1 frame —
+        # the server pads/fades a turn's end anyway. This mirrors interrupt().
+        self._flush_resampler()
         buf = self._synchronizer.open_turn()
         self._waiting_for_first_tts = True
         self._tracer.instant(
@@ -331,12 +402,9 @@ class OjinSTVClient:
         )
         if self._config.server_feed_batching_enabled:
             pending = self._batcher.drain()
-            payload = (pending or b"") + tail
-            if payload:
-                await self._send_audio_message(payload)
+            if pending:
+                await self._send_audio_message(pending)
             self._batcher.rearm_initial()
-        elif tail:
-            await self._send_audio_message(tail)
 
     def _flush_resampler(self) -> bytes:
         """Drain the streaming resampler's held tail at a turn boundary.
@@ -350,10 +418,66 @@ class OjinSTVClient:
         tail = flush()
         return tail if isinstance(tail, bytes) else b""
 
+    def _server_lead_ms(self) -> float:
+        """How far the server feed is ahead of local playback, in ms (>= 0)."""
+        return max(0.0, self._server_fed_ms - self._played_real_ms)
+
     async def _send_audio_message(self, pcm: bytes) -> None:
+        """Ship one server-bound audio payload, subject to the lead cap.
+
+        Under the cap (or with it disabled) the payload goes straight out; over
+        the cap it waits in ``_feed_pending`` for :meth:`_server_feed_loop` to
+        release it as playback advances. A barge-in discards the pending queue
+        (see :meth:`interrupt`). Wire chunking + time pacing live in
+        ``OjinClient``; this layer only bounds how far AHEAD of playback the
+        server is fed.
+        """
+        if not pcm:
+            return
+        if self._server_feed_max_lead_ms <= 0 or (
+            not self._feed_pending
+            and self._server_lead_ms() < self._server_feed_max_lead_ms
+        ):
+            await self._send_audio_now(pcm)
+            return
+        self._feed_pending.append(pcm)
+        self._feed_wake.set()
+        self._tracer.instant(
+            "to_server",
+            "audio_lead_gated",
+            args={"bytes": len(pcm), "lead_ms": round(self._server_lead_ms())},
+        )
+
+    async def _send_audio_now(self, pcm: bytes) -> None:
         """Send one server-bound audio payload and record the to_server trace."""
         await self._client.send_message(OjinAudioInputMessage(audio_int16_bytes=pcm))
+        self._server_fed_ms += len(pcm) / _BYTES_PER_MS_16K
         self._tracer.instant("to_server", "audio_sent", args={"bytes": len(pcm)})
+
+    async def _server_feed_loop(self) -> None:
+        """Release lead-gated payloads as playback advances (lead cap only).
+
+        Wakes on new pending payloads and on playback ticks; sends the head of
+        ``_feed_pending`` whenever the lead is back under the cap. One payload may
+        overshoot the cap by its own duration — the cap bounds the backlog, it is
+        not a hard quantum.
+        """
+        while self._initialized:
+            if (
+                self._feed_pending
+                and self._server_lead_ms() < self._server_feed_max_lead_ms
+            ):
+                pcm = self._feed_pending.popleft()
+                try:
+                    await self._send_audio_now(pcm)
+                except asyncio.CancelledError:
+                    raise
+                except Exception:  # one bad send must not kill the feeder
+                    logger.exception("server feed loop send error — continuing")
+                continue
+            self._feed_wake.clear()
+            with contextlib.suppress(asyncio.TimeoutError):
+                await asyncio.wait_for(self._feed_wake.wait(), 0.1)
 
     async def send_tts_audio(
         self, pcm: bytes, sample_rate: int, num_channels: int
@@ -375,6 +499,25 @@ class OjinSTVClient:
                 logger.warning("send_tts_audio before session ready — dropping")
             return
 
+        if self._deferring_input:
+            # A turn opened during a barge-in (see start_turn); hold its audio until
+            # the window clears so it replays in order with its turn boundary.
+            self._interrupt_deferred.append(("audio", pcm, sample_rate, num_channels))
+            self._tracer.instant(
+                "tts_input", "tts_audio_deferred", args={"bytes": len(pcm)}
+            )
+            return
+
+        await self._send_tts_audio_core(pcm, sample_rate, num_channels)
+
+    async def _send_tts_audio_core(
+        self, pcm: bytes, sample_rate: int, num_channels: int
+    ) -> None:
+        """Buffer + resample + feed one TTS audio payload (no deferral guards).
+
+        The body of :meth:`send_tts_audio` once the not-ready / deferral guards have
+        passed; also the seam :meth:`_flush_interrupt_deferred` replays through.
+        """
         duration = len(pcm) / (sample_rate * num_channels * 2)
         if abs(duration - _HALF_SECOND) < _HALF_SECOND_TOL and pcm == b"\x00" * len(
             pcm
@@ -441,6 +584,30 @@ class OjinSTVClient:
             else:  # ("audio", pcm, sample_rate, num_channels)
                 await self.send_tts_audio(op[1], op[2], op[3])
 
+    async def _flush_interrupt_deferred(self) -> None:
+        """Replay input deferred during a barge-in, in arrival order, then resume.
+
+        Called from the receive loop when the server's idle/fade frame clears the
+        interruption window. Replays through the guard-free ``*_core`` seams so it
+        never re-defers. Drains in a loop and only clears ``_deferring_input`` once
+        the buffer is empty: any live ``send_tts_audio`` that lands mid-replay still
+        appends (the flag is set) and is picked up in the next pass, so ordering is
+        preserved and no frame slips ahead of the replayed backlog.
+        """
+        if self._interrupt_deferred:
+            logger.info(
+                "Replaying %d input op(s) deferred during barge-in",
+                len(self._interrupt_deferred),
+            )
+        while self._interrupt_deferred:
+            pending, self._interrupt_deferred = self._interrupt_deferred, []
+            for op in pending:
+                if op[0] == "turn":
+                    await self._start_turn_core()
+                else:  # ("audio", pcm, sample_rate, num_channels)
+                    await self._send_tts_audio_core(op[1], op[2], op[3])
+        self._deferring_input = False
+
     async def interrupt(self) -> bool:
         """Barge-in: fade the current turn and cancel it server-side if playing.
 
@@ -460,9 +627,17 @@ class OjinSTVClient:
             return False
         if self._synchronizer.interrupt():
             self._interruption_ongoing = True
+            # OjinClient drops any audio still queued toward the server when it sees
+            # this cancel, so no pre-cancel audio outlives the barge-in.
             await self._client.send_message(OjinCancelInteractionMessage())
             if self._config.server_feed_batching_enabled:
                 self._batcher.reset()
+            # Discard lead-gated payloads (they belong to the cancelled turn) and
+            # reconcile the lead: the server flushes its input backlog on cancel,
+            # so the feed restarts level with playback.
+            self._feed_pending.clear()
+            self._server_fed_ms = self._played_real_ms
+            self._feed_wake.set()
             # Drop the cancelled turn's resampler tail so it can't bleed into the
             # next turn's feed; the next turn starts from a clean filter.
             self._flush_resampler()
@@ -511,6 +686,8 @@ class OjinSTVClient:
                 and self._batch_flush_task is None
             ):
                 self._batch_flush_task = asyncio.create_task(self._batch_flush_loop())
+            if self._server_feed_max_lead_ms > 0 and self._feed_task is None:
+                self._feed_task = asyncio.create_task(self._server_feed_loop())
             await self._events.emit(
                 STVEvent.SESSION_READY, session_data=self._session_data
             )
@@ -523,7 +700,17 @@ class OjinSTVClient:
             await self._flush_preinit_inputs()
 
         elif isinstance(message, OjinInteractionResponseMessage):
+            was_interrupting = self._interruption_ongoing
             self._on_interaction_response(message)
+            # The idle/fade frame that just closed the barge-in window is the server's
+            # signal that it is ready for new input again — replay any turn that was
+            # deferred while the cancel was settling (see start_turn / send_tts_audio).
+            if (
+                was_interrupting
+                and not self._interruption_ongoing
+                and self._deferring_input
+            ):
+                await self._flush_interrupt_deferred()
 
         elif isinstance(message, ErrorResponseMessage):
             code = str(message.payload.code)
@@ -534,9 +721,32 @@ class OjinSTVClient:
             await self._events.emit(STVEvent.ERROR, message=text, code=code, fatal=True)
             await self.close()
 
+    def _validate_frame_type(self, frame_type: int) -> bool:
+        """Raise if the frame type is not a known Ojin FrameType."""
+        last_frame_type = (
+            self._last_video_frame.frame_type
+            if self._last_video_frame is not None
+            else None
+        )
+
+        if (
+            last_frame_type == FrameType.SPEECH
+            and frame_type == FrameType.START_OF_SPEECH
+        ):
+            logger.warning(
+                "Received BOOMERANG frame after SPEECH_FRAME frame; "
+                "this is unexpected and may indicate a server-side issue."
+            )
+            return False
+
+        return True
+
     def _on_interaction_response(self, message: OjinInteractionResponseMessage) -> None:
         """Build a VideoFrame, hand it to the decode worker, record recv trace."""
         frame_type = int(message.frame_type)
+        if not self._validate_frame_type(frame_type):
+            return  # Skip processing this frame due to invalid frame type
+
         volume = int(rms_int16(message.audio_frame_bytes) or 0)
         video_frame = VideoFrame(
             frame_type=frame_type,
@@ -547,13 +757,22 @@ class OjinSTVClient:
         )
         self._decode_in.put(video_frame)
 
+        payload_bytes = len(message.video_frame_bytes) + len(message.audio_frame_bytes)
         self._tracer.instant(
             recv_lane_for_frame_type(frame_type),
             "frame_recv",
             cat=str(frame_type),
-            args={"frame_type": frame_type, "volume": volume},
+            args={"frame_type": frame_type, "volume": volume, "bytes": payload_bytes},
         )
         self._tracer.counter("recv_frame_type", frame_type)
+        # Per-frame transit delay: local wall clock minus the server's send
+        # hand-off stamp from the wire header. The bot↔server clock offset
+        # shifts the whole lane by a constant — read the SHAPE, not the
+        # absolute value: a flat lane is healthy pacing; a ramp is frames
+        # aging in transit (network/proxy holding them); a step is a stall.
+        if message.timestamp > 0:
+            transit_ms = time.time() * 1000.0 - float(message.timestamp)
+            self._tracer.counter("frame_transit_ms", round(transit_ms, 1))
         # End the barge-in window on the first idle/fade-out frame after a cancel —
         # the server's acknowledgement that the interruption took effect. Re-enables
         # interrupt() for the next turn.
@@ -662,6 +881,17 @@ class OjinSTVClient:
         await self._emit_video(result, pts)
         await self._emit_audio(result, pts)
 
+        if result.audio_chunk:
+            # Advance the playback position the server-feed lead cap gates on.
+            # Faded (interrupted) audio counts too: fed/played are reconciled at
+            # interrupt() anyway, and max(0, ...) absorbs any residue.
+            sample_rate, num_channels = self._last_audio_shape
+            self._played_real_ms += len(result.audio_chunk) / (
+                sample_rate * num_channels * 2 / 1000.0
+            )
+            if self._feed_pending:
+                self._feed_wake.set()
+
         if result.started_speaking:
             self._tr_speaking_start = self._tracer.mark()
             await self._events.emit(STVEvent.BOT_STARTED_SPEAKING)
@@ -727,6 +957,8 @@ class OjinSTVClient:
                 },
             )
         if result.align_trim_frames:
+            # Positive = leading buffer audio trimmed (server dropped it);
+            # negative = silence prepended (server emitted extra quiet head frames).
             tr.instant(
                 "lipsync",
                 "swap_align_trim",
@@ -736,6 +968,13 @@ class OjinSTVClient:
                         result.align_trim_frames * 1000.0 / self._config.fps, 1
                     ),
                 },
+            )
+        if result.catchup_dropped:
+            self._tr_catchup_drops += result.catchup_dropped
+            tr.instant(
+                "lipsync",
+                "repeat_catchup",
+                args={"dropped": result.catchup_dropped},
             )
         if result.overflow_dropped:
             tr.instant(
@@ -754,11 +993,14 @@ class OjinSTVClient:
         if cur is not None and cur.sample_rate:
             cur_ms = len(cur.bytes_) / (cur.sample_rate * cur.num_channels * 2) * 1000.0
         tr.counter("current_buffer_ms", round(cur_ms, 1))
+        tr.counter("server_feed_lead_ms", round(self._server_lead_ms(), 1))
+        tr.counter("server_feed_gated_pending", len(self._feed_pending))
         tr.counter("queued_buffers", len(self._synchronizer.audio_buffers))
         tr.counter("pending_video_frames", len(self._synchronizer.video_frames))
         tr.counter("playback_fps", len(self._tr_emit_times))
         tr.counter("audio_underruns_total", self._tr_underruns)
         tr.counter("idle_backlog_skips_total", self._tr_idle_skips)
+        tr.counter("repeat_catchup_drops_total", self._tr_catchup_drops)
         if result.video_frame is not None and result.audio_chunk:
             frame_rms = rms_int16(result.video_frame.audio_bytes)
             if frame_rms is not None:
@@ -812,9 +1054,24 @@ class OjinSTVClient:
             "tcp_retransmits",
             "tcp_snd_cwnd",
             "tcp_rcv_space",
+            "tcp_bytes_received",
+            "tcp_min_rtt_us",
+            "tcp_rcv_ooopack",
         ):
             if name in depths:
                 tr.counter(name, depths[name])
+        # Ingress bandwidth: cumulative app-level bytes off the websocket plus
+        # a per-tick rate lane. Compared with ``tcp_bytes_received`` (kernel
+        # cumulative) this splits "network delivered late" from "read late".
+        if "ingress_bytes_total" in depths:
+            total = int(depths["ingress_bytes_total"])
+            now = time.perf_counter()
+            tr.counter("recv_ingress_bytes_total", total)
+            prev = self._tr_prev_ingress
+            if prev is not None and now > prev[1]:
+                rate_mbps = (total - prev[0]) * 8.0 / (now - prev[1]) / 1e6
+                tr.counter("recv_ingress_mbps", round(max(0.0, rate_mbps), 3))
+            self._tr_prev_ingress = (total, now)
         tr.counter("recv_decode_in", self._decode_in.qsize())
         tr.counter("recv_decode_out", self._decode_out.qsize())
 

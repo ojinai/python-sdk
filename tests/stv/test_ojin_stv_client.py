@@ -261,6 +261,152 @@ def test_interrupt_window_closes_on_idle_or_fadeout_frame() -> None:
     asyncio.run(run())
 
 
+def test_turn_opened_during_interruption_is_deferred_then_replayed() -> None:
+    """A turn opened mid-barge-in is buffered, not fed, then replayed on window close.
+
+    The server discards audio sent while it is still cancelling, so feeding the new
+    turn now would desync playback. Deferred input is replayed in order once the
+    idle/fade frame clears the window.
+    """
+
+    async def run() -> None:
+        c, fc, _out = make_client(server_feed_batching_enabled=False)
+        c._initialized = True  # a live turn only exists once the session is ready
+        c._synchronizer.current_buffer = _live_buffer()
+        await c.interrupt()
+        assert c._interruption_ongoing is True
+        fc.sent.clear()
+
+        # New turn + its audio open while the cancel is still unacknowledged.
+        await c.start_turn()
+        assert c._deferring_input is True
+        await c.send_tts_audio(b"\x01\x02" * 640, 16000, 1)
+        await c.send_tts_audio(b"\x03\x04" * 640, 16000, 1)
+        # Nothing opened for playback, nothing fed to the server — all buffered.
+        assert len(c._interrupt_deferred) == 3  # turn + 2 audio ops
+        assert not [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+
+        # Server's idle frame closes the window → deferred input replays (in order).
+        await c._handle_message(_interaction_response(FrameType.IDLE))
+        assert c._interruption_ongoing is False
+        assert c._deferring_input is False
+        assert c._interrupt_deferred == []
+        sent_audio = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(sent_audio) == 2  # both audio ops fed, in order
+        assert c._synchronizer.audio_buffers[-1].bytes_  # turn buffered for playback
+
+    asyncio.run(run())
+
+
+def test_trailing_audio_of_interrupted_turn_is_not_deferred() -> None:
+    """Audio for the cancelled turn (no new start_turn) is dropped, not buffered.
+
+    Deferral begins only at a NEW turn's start_turn during the window; the
+    interrupted turn's own straggler audio must still be dropped (it has no buffer),
+    never replayed after the barge-in.
+    """
+
+    async def run() -> None:
+        c, fc, _out = make_client(server_feed_batching_enabled=False)
+        c._initialized = True
+        c._synchronizer.current_buffer = _live_buffer()
+        await c.interrupt()
+        fc.sent.clear()
+
+        assert c._deferring_input is False  # no new turn opened
+        await c.send_tts_audio(b"\x01\x02" * 640, 16000, 1)
+
+        assert c._interrupt_deferred == []  # not buffered
+        # Dropped (no buffer for the cancelled turn), not fed to the server.
+        assert not [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+
+    asyncio.run(run())
+
+
+def test_lead_cap_gates_sends_and_releases_as_playback_advances() -> None:
+    """Audio beyond the lead cap waits client-side and ships as playback catches up.
+
+    Guards the session-7 finding (2026-07-12): shipping a long answer's whole
+    audio up front built a server-side backlog that made barge-in cancels take
+    seconds to acknowledge. With the cap, only ~cap ms may be in flight ahead of
+    playback; the rest is released by the feeder as ticks consume audio.
+    """
+
+    async def run() -> None:
+        c, fc, _out = make_client(
+            server_feed_batching_enabled=False, server_feed_max_lead_ms=100
+        )
+        await c.start()
+        await asyncio.sleep(0.05)
+        fc.sent.clear()
+        await c.start_turn()
+
+        chunk = b"\x01\x02" * 1280  # 80 ms @ 16 kHz mono (identity resample)
+        for _ in range(3):
+            await c.send_tts_audio(chunk, 16000, 1)
+
+        # First send: lead 0 < 100 → out. Second: lead 80 < 100 → out (one payload
+        # may overshoot the cap). Third: lead 160 >= 100 → gated.
+        sent = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(sent) == 2
+        assert len(c._feed_pending) == 1
+
+        # Playback consumes 200 ms → the feeder releases the gated payload.
+        c._played_real_ms += 200.0
+        c._feed_wake.set()
+        await asyncio.sleep(0.05)
+        sent = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(sent) == 3
+        assert not c._feed_pending
+        await c.close()
+
+    asyncio.run(run())
+
+
+def test_interrupt_discards_lead_gated_audio_and_levels_the_feed() -> None:
+    """A barge-in drops gated payloads and resets the lead to the played position."""
+
+    async def run() -> None:
+        c, fc, _out = make_client(
+            server_feed_batching_enabled=False, server_feed_max_lead_ms=100
+        )
+        c._initialized = True
+        c._synchronizer.current_buffer = _live_buffer()
+        c._server_fed_ms = 500.0
+        c._played_real_ms = 120.0
+        c._feed_pending.append(b"\x01\x02" * 100)
+
+        await c.interrupt()
+
+        assert not c._feed_pending  # cancelled turn's gated audio discarded
+        assert c._server_lead_ms() == 0.0  # feed restarts level with playback
+        # Nothing but the cancel went to the server.
+        assert not [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+
+    asyncio.run(run())
+
+
+def test_close_flushes_lead_gated_pending() -> None:
+    """close() best-effort flushes gated payloads before tearing down."""
+
+    async def run() -> None:
+        c, fc, _out = make_client(
+            server_feed_batching_enabled=False, server_feed_max_lead_ms=100
+        )
+        await c.start()
+        await asyncio.sleep(0.05)
+        fc.sent.clear()
+        c._feed_pending.append(b"\x01\x02" * 100)
+        c._server_fed_ms = 1000.0  # over cap → would never send while live
+
+        await c.close()
+
+        sent = [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+        assert len(sent) == 1  # flushed on close despite the cap
+
+    asyncio.run(run())
+
+
 def test_emit_tick_fires_started_speaking_event() -> None:
     """When a buffer begins draining, the tick emits BOT_STARTED_SPEAKING."""
 
@@ -530,13 +676,17 @@ def test_start_turn_flushes_previous_tail_and_rearms_initial() -> None:
     asyncio.run(run())
 
 
-def test_start_turn_flushes_resampler_tail_to_server() -> None:
-    """A new turn drains the previous turn's *resampler* tail to the server.
+def test_start_turn_discards_resampler_tail() -> None:
+    """A new turn resets the resampler but never sends the stale tail.
 
-    The streaming resampler holds back a filter-delay tail; if it were dropped at
-    the turn boundary the 16 kHz server feed would be a hair shorter than the
-    played 24 kHz audio, drifting lip-sync. A fake resampler makes the tail
-    observable in the sent messages.
+    The streaming resampler holds back a filter-delay tail from audio fed
+    seconds ago. Sending it at the next ``start_turn`` lands it at the HEAD of
+    the new turn's server feed, where the server renders it as near-zero speech
+    frames the local buffer does not have — a constant video-late offset for
+    the whole turn (measured on staging: every natural-turn entry was offset by
+    exactly the tail's duration). The boundary must flush the filter state so
+    the new turn starts clean, but the stale bytes are discarded — mirroring
+    the interrupt path.
     """
     tail_marker = b"\xab\xcd" * 8
 
@@ -575,12 +725,13 @@ def test_start_turn_flushes_resampler_tail_to_server() -> None:
         await c.start_turn()
         await c.send_tts_audio(b"\x03\x04" * 480, 24000, 1)  # 20 ms @ 24 kHz
         fc.sent.clear()
-        await c.start_turn()  # turn boundary → flush prior turn's resampler tail
+        await c.start_turn()  # turn boundary → reset the filter, drop the tail
         sent = [
             m.audio_int16_bytes for m in fc.sent if isinstance(m, OjinAudioInputMessage)
         ]
-        assert rs.flushes >= 1
-        assert tail_marker in sent, f"resampler tail not sent at boundary: {sent}"
+        assert rs.flushes >= 1  # the filter state was still reset at the boundary
+        assert tail_marker not in sent, f"stale tail leaked into the new turn: {sent}"
+        assert not sent  # nothing else should be sent by an empty-batch boundary
         await c.close()
 
     asyncio.run(run())

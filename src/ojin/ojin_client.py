@@ -65,11 +65,12 @@ def _configure_tcp_nodelay(ws: ClientConnection) -> None:
 
 
 # ``struct tcp_info`` (linux/tcp.h) prefix: 8 x u8 then 24 x u32 (rto..total_retrans).
-# Stable across kernels; later u64 fields move by version so we don't read them. Lets us
-# see the *receive* side of the proxy->client TCP connection from inside the client
-# (e.g. WSL2): RTT, loss/retransmits, and the receive-window estimate the client offers.
+# Stable across kernels. Lets us see the *receive* side of the proxy->client TCP
+# connection from inside the client (e.g. WSL2): RTT, loss/retransmits, and the
+# receive-window estimate the client offers.
 _TCP_INFO_FMT = "<8B24I"
 _TCP_INFO_LEN = struct.calcsize(_TCP_INFO_FMT)  # 104 bytes
+_TCP_INFO_BUF = 256
 _TCP_INFO_FIELDS = {
     "tcp_retransmits": 2,  # u8: hard retransmit count
     "tcp_rtt_us": 23,  # smoothed RTT to the proxy (microseconds)
@@ -77,6 +78,17 @@ _TCP_INFO_FIELDS = {
     "tcp_snd_cwnd": 26,  # send congestion window (MSS units)
     "tcp_rcv_space": 30,  # receive-window estimate this end advertises (bytes)
     "tcp_retrans_total": 31,  # cumulative segment retransmissions
+}
+# Extended tcp_info fields (appended by newer kernels at fixed byte offsets);
+# each read is guarded by buffer length and simply absent on older kernels.
+# Receive-side picks: kernel-level ingress byte count (advances even while the
+# app is slow to read — splits "network delivered late" from "we read late"),
+# out-of-order packet count (direct download-path loss/reorder evidence), and
+# the path's floor RTT.
+_TCP_INFO_EXT_FIELDS = {
+    "tcp_bytes_received": (128, "<Q"),
+    "tcp_min_rtt_us": (148, "<I"),
+    "tcp_rcv_ooopack": (224, "<I"),
 }
 
 
@@ -86,11 +98,15 @@ def _read_tcp_info(sock: socket.socket) -> dict[str, int]:
     if tcp_info_opt is None:
         return {}
     try:
-        raw = sock.getsockopt(socket.IPPROTO_TCP, tcp_info_opt, _TCP_INFO_LEN)
+        raw = sock.getsockopt(socket.IPPROTO_TCP, tcp_info_opt, _TCP_INFO_BUF)
         if len(raw) < _TCP_INFO_LEN:
             return {}
         t = struct.unpack(_TCP_INFO_FMT, raw[:_TCP_INFO_LEN])
-        return {name: int(t[idx]) for name, idx in _TCP_INFO_FIELDS.items()}
+        fields = {name: int(t[idx]) for name, idx in _TCP_INFO_FIELDS.items()}
+        for name, (offset, fmt) in _TCP_INFO_EXT_FIELDS.items():
+            if len(raw) >= offset + struct.calcsize(fmt):
+                fields[name] = int(struct.unpack_from(fmt, raw, offset)[0])
+        return fields
     except Exception:
         return {}
 
@@ -110,6 +126,8 @@ class OjinClient(IOjinClient):
         reconnect_attempts: int = 3,
         reconnect_delay: float = 1.0,
         mode: str | None = None,
+        max_input_chunk_bytes: int = 1024 * 500,
+        send_chunk_gap_s: float = 0.0,
     ):
         """Initialize the OJIN STV WebSocket client.
 
@@ -122,6 +140,15 @@ class OjinClient(IOjinClient):
             mode: Optional mode string for the connection (e.g., "dev" for
                 development mode). When set to "dev", adds mode parameter to
                 the WebSocket URL query string. Defaults to None.
+            max_input_chunk_bytes: Cap on a single audio send; larger
+                ``OjinAudioInputMessage`` payloads are split into this many bytes
+                per WebSocket frame.
+            send_chunk_gap_s: Minimum gap between consecutive audio sends while a
+                backlog remains (split chunks of one message, or a queue of pending
+                messages). Keeps a buffered burst from flooding the server; steady
+                realtime (one message at a time, queue drains empty) is never
+                delayed. Defaults to 0 (no pacing); ``OjinSTVClient`` passes its
+                configured value.
 
         """
         super().__init__()
@@ -130,6 +157,11 @@ class OjinClient(IOjinClient):
         self.config_id = config_id
         self.reconnect_attempts = reconnect_attempts
         self.reconnect_delay = reconnect_delay
+        self._max_input_chunk_bytes = max(1, max_input_chunk_bytes)
+        self._send_chunk_gap_s = max(0.0, send_chunk_gap_s)
+        # Monotonic time of the last on-wire audio send; seeds far in the past so
+        # the first send after connect/idle never waits.
+        self._last_audio_send_t = float("-inf")
 
         self._ws: Optional[ClientConnection] = None
         self._available_response_messages_queue: asyncio.Queue[BaseModel] = (
@@ -137,6 +169,9 @@ class OjinClient(IOjinClient):
         )
         self._running = False
         self._receive_task: Optional[asyncio.Task] = None
+        # Cumulative application-level bytes taken off the websocket; the
+        # tracer derives an ingress-bandwidth lane from its slope.
+        self._ingress_bytes_total: int = 0
         self._inference_server_ready: bool = False
         self._cancelled: bool = False
         self._active_interaction_id: str | None = None
@@ -237,6 +272,7 @@ class OjinClient(IOjinClient):
 
         try:
             async for message in self._ws:
+                self._ingress_bytes_total += len(message)
                 await self._handle_server_message(message)
         except (ConnectionClosedOK, ConnectionClosedError) as e:
             if self._running:  # Only log if we didn't initiate the close
@@ -384,6 +420,13 @@ class OjinClient(IOjinClient):
             with contextlib.suppress(ValueError):
                 self._available_response_messages_queue.task_done()
 
+    def _drain_client_messages(self) -> None:
+        """Drop queued outbound client messages (e.g. on cancel) without blocking."""
+        while not self._pending_client_messages_queue.empty():
+            self._pending_client_messages_queue.get_nowait()
+            with contextlib.suppress(ValueError):
+                self._pending_client_messages_queue.task_done()
+
     async def send_message(self, message: BaseModel) -> None:
         """Send a message to the OJIN STV service.
 
@@ -402,6 +445,11 @@ class OjinClient(IOjinClient):
 
         if isinstance(message, OjinCancelInteractionMessage):
             self._cancelled = True
+            # Drop any audio still queued to be sent for the turn being cancelled:
+            # the server discards post-cancel input, so forwarding it would only
+            # desync the next turn. (The in-flight send loop also bails on
+            # ``_cancelled`` between chunks — see _process_client_messages.)
+            self._drain_client_messages()
             cancel_input = CancelInteractionMessage(payload=message.to_proxy_message())
 
             await self._ws.send(cancel_input.model_dump_json())
@@ -443,7 +491,7 @@ class OjinClient(IOjinClient):
 
             message: OjinMessage = await self._pending_client_messages_queue.get()
             if isinstance(message, OjinAudioInputMessage):
-                max_chunk_size = 1024 * 500
+                max_chunk_size = self._max_input_chunk_bytes
                 audio_chunks = [
                     message.audio_int16_bytes[i : i + max_chunk_size]
                     for i in range(0, len(message.audio_int16_bytes), max_chunk_size)
@@ -453,7 +501,27 @@ class OjinClient(IOjinClient):
                 if len(audio_chunks) == 0:
                     audio_chunks.append(bytes())
 
-                for _, chunk in enumerate(audio_chunks):
+                for chunk in audio_chunks:
+                    if self._cancelled:
+                        # A cancel landed mid-send: abandon the rest of this (now
+                        # cancelled) turn's audio instead of finishing the burst.
+                        break
+                    # Pace the feed BY TIME: enforce a minimum interval between
+                    # consecutive audio sends. Gating on queue depth misses the
+                    # burst case entirely — a producer that enqueues one message
+                    # per await (e.g. TTS buffered during a barge-in then replayed)
+                    # interleaves with this consumer so the queue never LOOKS
+                    # backlogged while the wire bursts many messages back-to-back
+                    # (seen in the 2026-07-12 session-7 trace). Time-based spacing
+                    # is race-free: bursts get spread out no matter how the queue
+                    # interleaves, while steady realtime (batched emits already
+                    # >= ~400 ms apart) never waits.
+                    if self._send_chunk_gap_s > 0:
+                        elapsed = time.monotonic() - self._last_audio_send_t
+                        if elapsed < self._send_chunk_gap_s:
+                            await asyncio.sleep(self._send_chunk_gap_s - elapsed)
+                        if self._cancelled:
+                            break  # a cancel landed during the pacing sleep
                     interaction_input = InteractionInput(
                         payload_type="audio",
                         payload=chunk,
@@ -463,6 +531,7 @@ class OjinClient(IOjinClient):
                     proxy_message = InteractionInputMessage(payload=interaction_input)
 
                     await self._ws.send(proxy_message.to_bytes())
+                    self._last_audio_send_t = time.monotonic()
 
             elif isinstance(message, OjinTextInputMessage):
                 text_message = message.to_proxy_message()
@@ -553,4 +622,7 @@ class OjinClient(IOjinClient):
                     depths.update(_read_tcp_info(sock))
         with contextlib.suppress(Exception):
             depths["server_msgs"] = self._available_response_messages_queue.qsize()
+        # Cumulative app-level ingress; paired with ``tcp_bytes_received`` it
+        # splits "network delivered late" from "we read the socket late".
+        depths["ingress_bytes_total"] = self._ingress_bytes_total
         return depths
