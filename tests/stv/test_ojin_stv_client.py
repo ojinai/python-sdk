@@ -407,6 +407,58 @@ def test_close_flushes_lead_gated_pending() -> None:
     asyncio.run(run())
 
 
+def test_emit_tick_drains_lead_on_silence_ticks() -> None:
+    """A silent tick still advances the server-feed drain so the gate can't latch.
+
+    Regression: gating the drain on real-audio-present let the lead freeze once the
+    cap engaged — the gate withholds audio, the server starves, no speech frames
+    come back, local playback underruns, the drain stops, and the gate never
+    reopens (a self-sustaining deadlock). Every tick advances one frame of drain
+    and, with a payload gated, wakes the feeder to re-check the lead.
+    """
+
+    async def run() -> None:
+        c, _fc, _out = make_client(server_feed_max_lead_ms=100)
+        c._feed_pending.append(b"\x00\x00")  # a payload stuck behind a stale lead
+        c._feed_wake.clear()
+        before = c._played_real_ms
+
+        await c._emit_tick()  # empty synchronizer -> silence tick (audio_chunk None)
+
+        assert c._played_real_ms == before + 1000.0 / c._config.fps
+        assert c._feed_wake.is_set()  # feeder re-checks the now-lower lead
+
+    asyncio.run(run())
+
+
+def test_start_turn_relevels_lead_and_releases_gated_backlog() -> None:
+    """A new turn clears a stale gated backlog and re-levels the lead to playback.
+
+    Regression: if the previous turn left the lead stuck above the cap (its drain
+    and the server's real consumption diverged), every later turn's audio was gated
+    behind it and the session went silent. start_turn reconciles fed == played and
+    drops the stale backlog, mirroring interrupt().
+    """
+
+    async def run() -> None:
+        c, fc, _out = make_client(
+            server_feed_batching_enabled=False, server_feed_max_lead_ms=100
+        )
+        c._initialized = True
+        c._server_fed_ms = 5000.0  # stuck far ahead of playback
+        c._played_real_ms = 100.0
+        c._feed_pending.append(b"\x01\x02" * 100)  # prior turn's stranded payload
+
+        await c.start_turn()
+
+        assert not c._feed_pending  # stale backlog dropped at the turn boundary
+        assert c._server_lead_ms() == 0.0  # feed re-leveled to playback
+        # Only the turn opened — no stale audio (and no cancel) went to the server.
+        assert not [m for m in fc.sent if isinstance(m, OjinAudioInputMessage)]
+
+    asyncio.run(run())
+
+
 def test_emit_tick_fires_started_speaking_event() -> None:
     """When a buffer begins draining, the tick emits BOT_STARTED_SPEAKING."""
 

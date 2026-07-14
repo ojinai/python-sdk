@@ -4,6 +4,25 @@ All notable changes to `ojin-client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0 — see CONTRIBUTING.md).
 
+## 0.9.2 - 2026-07-14
+
+### Fixed
+- **Server-feed lead-cap deadlock.** The lead cap (`server_feed_max_lead_ms`)
+  advanced its "played" side only on ticks that emitted real audio, so once the
+  cap engaged the gate became self-latching: it withheld audio → the server
+  starved → no speech frames came back → local playback underran → the drain
+  froze → the lead stayed pinned above the cap for the rest of the session. The
+  whole session went silent while video kept pacing at 25 fps; every TTS reply
+  after the first long turn was gated and only flushed at `close()` (staging
+  session `c0e60aab`, trace `5cb4201b`). Two changes: (1) `_emit_tick` now
+  advances the drain by one frame on **every** tick — silence included — since
+  the server consumes fed audio on its own ~1x-realtime timeline regardless of
+  what local playback rendered, so the lead always decays and the feeder
+  self-heals within `(lead − cap)` of wall-clock; (2) `start_turn` now re-levels
+  the lead (`fed = played`) and drops any stale gated backlog at the turn
+  boundary, mirroring `interrupt()`, so one overshooting turn can't strand the
+  turns after it.
+
 ## 0.9.0 - 2026-07-12
 
 ### Changed

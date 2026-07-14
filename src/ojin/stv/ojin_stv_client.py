@@ -400,6 +400,16 @@ class OjinSTVClient:
         self._tracer.instant(
             "tts_input", "tts_started", args={"buffer_id": buf.buffer_id}
         )
+        # Re-level the server-feed lead at the turn boundary: by now the previous
+        # turn has played out (or the server has starved through it), so a stale
+        # lead / gated backlog from it must not gate this turn's audio. Mirrors the
+        # reconciliation interrupt() does. Belt-and-suspenders with the per-tick
+        # drain in _emit_tick — a single overshooting turn cannot strand the
+        # session even if the drain and the server's real consumption ever diverge.
+        if self._server_feed_max_lead_ms > 0:
+            self._feed_pending.clear()
+            self._server_fed_ms = self._played_real_ms
+            self._feed_wake.set()
         if self._config.server_feed_batching_enabled:
             pending = self._batcher.drain()
             if pending:
@@ -882,16 +892,18 @@ class OjinSTVClient:
         await self._emit_video(result, pts)
         await self._emit_audio(result, pts)
 
-        if result.audio_chunk:
-            # Advance the playback position the server-feed lead cap gates on.
-            # Faded (interrupted) audio counts too: fed/played are reconciled at
-            # interrupt() anyway, and max(0, ...) absorbs any residue.
-            sample_rate, num_channels = self._last_audio_shape
-            self._played_real_ms += len(result.audio_chunk) / (
-                sample_rate * num_channels * 2 / 1000.0
-            )
-            if self._feed_pending:
-                self._feed_wake.set()
+        # Advance the playback position the server-feed lead cap gates on by one
+        # frame EVERY tick — real audio or silence. The server consumes fed audio
+        # on its own 25 fps timeline whether or not local playback had speech to
+        # render, so gating this drain on real-audio-present freezes the lead once
+        # the cap engages: the gate withholds audio → server starves → no speech
+        # frames come back → local playback underruns → the drain stops → the gate
+        # never reopens (a self-sustaining deadlock). max(0, ...) in
+        # _server_lead_ms absorbs any over-count while the server is idle;
+        # interrupt() reconciles fed/played on barge-in.
+        self._played_real_ms += 1000.0 / self._config.fps
+        if self._feed_pending:
+            self._feed_wake.set()
 
         if result.started_speaking:
             self._tr_speaking_start = self._tracer.mark()
