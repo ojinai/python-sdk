@@ -43,6 +43,7 @@ from ojin.ojin_client_messages import (
     OjinInteractionResponseMessage,
     OjinSessionReadyMessage,
 )
+from ojin.stv._outbound_feed import OutboundFeedMixin
 from ojin.stv.audio_utils import rms_int16
 from ojin.stv.config import STVConfig
 from ojin.stv.diagnostics import LoopDiagnostics
@@ -50,7 +51,6 @@ from ojin.stv.events import EventEmitter, STVEvent
 from ojin.stv.frames import STVAudioFrame, STVVideoFrame
 from ojin.stv.output import QueueOutput, STVOutput
 from ojin.stv.resampler import Resampler, default_resampler
-from ojin.stv.send_batcher import SendBatcher
 from ojin.stv.synchronizer import (
     BYTES_PER_FRAME,
     OJIN_PERSONA_SAMPLE_RATE,
@@ -72,13 +72,12 @@ _DEFAULT_WS_URL = "wss://models.ojin.ai/realtime"
 _HALF_SECOND = 0.5
 _HALF_SECOND_TOL = 0.01
 _ONE_SEC_US = 1_000_000  # rolling window for the playback_fps counter
-_BYTES_PER_MS_16K = OJIN_PERSONA_SAMPLE_RATE * 2 / 1000.0  # 32 B/ms mono int16
 
 
-class OjinSTVClient:
+class OjinSTVClient(OutboundFeedMixin):
     """Drives one Ojin STV session: feed TTS audio in, get synced A/V out."""
 
-    def __init__(  # noqa: PLR0913, PLR0915 — injectable deps + flat field init
+    def __init__(  # noqa: PLR0913 — injectable deps + flat field init
         self,
         *,
         api_key: str = "",
@@ -126,63 +125,16 @@ class OjinSTVClient:
         self._output: STVOutput = output or QueueOutput()
         self._events = EventEmitter()
         self._synchronizer = Synchronizer(self._config)
-        self._batcher = SendBatcher(
-            initial_chunk_bytes=int(
-                self._config.server_feed_initial_chunk_ms * _BYTES_PER_MS_16K
-            ),
-            min_chunk_bytes=int(
-                self._config.server_feed_min_chunk_ms * _BYTES_PER_MS_16K
-            ),
-            flush_idle_s=self._config.server_feed_flush_idle_ms / 1000.0,
-        )
-        self._batch_added = asyncio.Event()
-        self._batch_flush_task: Optional[asyncio.Task] = None
-
-        # Server-feed lead cap (see STVConfig.server_feed_max_lead_ms). The gate
-        # compares how much audio has been shipped to the server (_server_fed_ms)
-        # against how much real audio playback has consumed (_played_real_ms);
-        # payloads that would push the lead past the cap wait in _feed_pending and
-        # are released by _server_feed_loop as ticks advance playback. All
-        # server-bound payloads are 16 kHz mono int16, so ms = bytes / 32.
-        self._server_feed_max_lead_ms = float(
-            max(0, self._config.server_feed_max_lead_ms)
-        )
-        self._server_fed_ms = 0.0
-        self._played_real_ms = 0.0
-        self._feed_pending: "deque[bytes]" = deque()
-        self._feed_wake = asyncio.Event()
-        self._feed_task: Optional[asyncio.Task] = None
-
         self._initialized = False
+        self._init_outbound_feed(buffer_preinit_tts_audio)
+
         self._session_data: Optional[dict] = None
         self._waiting_for_first_tts = False
 
-        # Pre-initialization input buffer: when enabled, start_turn / send_tts_audio
-        # calls that arrive before SESSION_READY are recorded here (in order) and
-        # replayed once the session is ready, instead of being dropped. Entries are
-        # ("turn",) or ("audio", pcm, sample_rate, num_channels).
-        self._buffer_preinit_tts_audio = buffer_preinit_tts_audio
-        self._preinit_inputs: list[tuple] = []
         self._last_audio_shape = (OJIN_PERSONA_SAMPLE_RATE, 1)
         self._last_video_frame: Optional[VideoFrame] = None
         self._last_played_rgb: Optional[bytes] = None
         self._last_played_size: Optional[tuple[int, int]] = None  # native (w, h)
-        # Barge-in in flight: set when a cancel is sent, cleared when the server's
-        # first idle/fade-out frame acknowledges it. While set, further interrupts
-        # are dropped so a re-fire (e.g. VAD flap, or a new turn that swapped in
-        # before the cancel landed) can't stack a second cancel on the server.
-        self._interruption_ongoing = False
-
-        # Deferred input during a barge-in. A NEW turn that opens (start_turn) while a
-        # cancel is still settling server-side must not be fed yet — the server would
-        # discard it, desyncing playback. Instead we buffer that turn's start + audio
-        # here (in order) and replay it once the server's idle/fade frame clears the
-        # window (see _flush_interrupt_deferred). Deferral begins at the new turn's
-        # start_turn (NOT at interrupt: the interrupted turn's own trailing audio must
-        # still be dropped, not replayed). Entries mirror _preinit_inputs:
-        # ("turn",) or ("audio", pcm, sample_rate, num_channels).
-        self._interrupt_deferred: list[tuple] = []
-        self._deferring_input = False
 
         # Per-tick trace bookkeeping (only touched when a real tracer is injected,
         # so a NullTracer session pays nothing). Mirrors OjinVideoService.
@@ -312,26 +264,9 @@ class OjinSTVClient:
             self._tracer.span("lifecycle", "session", self._tr_session_start)
         # Stop the batch-flush and lead-gate feeder tasks before the transport
         # closes.
-        for task_attr in ("_batch_flush_task", "_feed_task"):
-            task = getattr(self, task_attr)
-            if task is not None:
-                task.cancel()
-                with contextlib.suppress(asyncio.CancelledError, Exception):
-                    await task
-                setattr(self, task_attr, None)
+        await self._stop_feed_tasks()
         if was_initialized:
-            # Flush what is still owed to the server, in order: lead-gated
-            # payloads first (older), then the batcher's sub-threshold tail.
-            # Best-effort straight sends — the session is ending, the lead cap
-            # no longer matters.
-            while self._feed_pending:
-                with contextlib.suppress(Exception):
-                    await self._send_audio_now(self._feed_pending.popleft())
-            if self._config.server_feed_batching_enabled:
-                pending = self._batcher.drain()
-                if pending is not None:
-                    with contextlib.suppress(Exception):
-                        await self._send_audio_now(pending)
+            await self._flush_outbound_tail()
         try:
             await self._client.close()
         except Exception as exc:  # never let teardown raise
@@ -354,27 +289,6 @@ class OjinSTVClient:
     # ------------------------------------------------------------------
     # Input — turn + audio + interrupt
     # ------------------------------------------------------------------
-
-    async def start_turn(self) -> None:
-        """Open a new audio buffer for the next utterance (≈ TTSStartedFrame)."""
-        if not self._initialized and self._buffer_preinit_tts_audio:
-            # Defer until the session is ready so this turn boundary is replayed in
-            # order with its audio (see _flush_preinit_inputs). Opening a buffer now
-            # would strand it: add_audio always targets the tail buffer, so audio
-            # replayed later would collapse into the most recent pre-init turn.
-            self._preinit_inputs.append(("turn",))
-            self._tracer.instant("tts_input", "tts_started_buffered")
-            return
-        if self._deferring_input or self._interruption_ongoing:
-            # A new turn opened while a barge-in is still settling server-side. Buffer
-            # its start (and everything that follows) instead of feeding it now — the
-            # server would discard audio sent mid-cancel, desyncing playback. Replayed
-            # in order once the window clears (see _flush_interrupt_deferred).
-            self._deferring_input = True
-            self._interrupt_deferred.append(("turn",))
-            self._tracer.instant("tts_input", "tts_started_deferred")
-            return
-        await self._start_turn_core()
 
     async def _start_turn_core(self) -> None:
         """Open the next turn's buffer and flush the prior turn's tail (no guards).
@@ -400,115 +314,7 @@ class OjinSTVClient:
         self._tracer.instant(
             "tts_input", "tts_started", args={"buffer_id": buf.buffer_id}
         )
-        if self._config.server_feed_batching_enabled:
-            pending = self._batcher.drain()
-            if pending:
-                await self._send_audio_message(pending)
-            self._batcher.rearm_initial()
-
-    def _flush_resampler(self) -> bytes:
-        """Drain the streaming resampler's held tail at a turn boundary.
-
-        Guarded so an injected resampler without ``flush`` degrades gracefully to
-        the old drop-the-tail behaviour rather than raising.
-        """
-        flush = getattr(self._resampler, "flush", None)
-        if not callable(flush):
-            return b""
-        tail = flush()
-        return tail if isinstance(tail, bytes) else b""
-
-    def _server_lead_ms(self) -> float:
-        """How far the server feed is ahead of local playback, in ms (>= 0)."""
-        return max(0.0, self._server_fed_ms - self._played_real_ms)
-
-    async def _send_audio_message(self, pcm: bytes) -> None:
-        """Ship one server-bound audio payload, subject to the lead cap.
-
-        Under the cap (or with it disabled) the payload goes straight out; over
-        the cap it waits in ``_feed_pending`` for :meth:`_server_feed_loop` to
-        release it as playback advances. A barge-in discards the pending queue
-        (see :meth:`interrupt`). Wire chunking + time pacing live in
-        ``OjinClient``; this layer only bounds how far AHEAD of playback the
-        server is fed.
-        """
-        if not pcm:
-            return
-        if self._server_feed_max_lead_ms <= 0 or (
-            not self._feed_pending
-            and self._server_lead_ms() < self._server_feed_max_lead_ms
-        ):
-            await self._send_audio_now(pcm)
-            return
-        self._feed_pending.append(pcm)
-        self._feed_wake.set()
-        self._tracer.instant(
-            "to_server",
-            "audio_lead_gated",
-            args={"bytes": len(pcm), "lead_ms": round(self._server_lead_ms())},
-        )
-
-    async def _send_audio_now(self, pcm: bytes) -> None:
-        """Send one server-bound audio payload and record the to_server trace."""
-        await self._client.send_message(OjinAudioInputMessage(audio_int16_bytes=pcm))
-        self._server_fed_ms += len(pcm) / _BYTES_PER_MS_16K
-        self._tracer.instant("to_server", "audio_sent", args={"bytes": len(pcm)})
-
-    async def _server_feed_loop(self) -> None:
-        """Release lead-gated payloads as playback advances (lead cap only).
-
-        Wakes on new pending payloads and on playback ticks; sends the head of
-        ``_feed_pending`` whenever the lead is back under the cap. One payload may
-        overshoot the cap by its own duration — the cap bounds the backlog, it is
-        not a hard quantum.
-        """
-        while self._initialized:
-            if (
-                self._feed_pending
-                and self._server_lead_ms() < self._server_feed_max_lead_ms
-            ):
-                pcm = self._feed_pending.popleft()
-                try:
-                    await self._send_audio_now(pcm)
-                except asyncio.CancelledError:
-                    raise
-                except Exception:  # one bad send must not kill the feeder
-                    logger.exception("server feed loop send error — continuing")
-                continue
-            self._feed_wake.clear()
-            with contextlib.suppress(asyncio.TimeoutError):
-                await asyncio.wait_for(self._feed_wake.wait(), 0.1)
-
-    async def send_tts_audio(
-        self, pcm: bytes, sample_rate: int, num_channels: int
-    ) -> None:
-        """Buffer original TTS audio for playback and send a resampled copy.
-
-        Discards the 0.5 s all-zero trailing-silence sentinel some TTS engines emit.
-        Buffers the **original** bytes (played verbatim) and sends a 16 kHz copy to
-        the server for lip-sync inference.
-        """
-        if not self._initialized:
-            if self._buffer_preinit_tts_audio:
-                # Queue verbatim; replayed in order once the session is ready.
-                self._preinit_inputs.append(("audio", pcm, sample_rate, num_channels))
-                self._tracer.instant(
-                    "tts_input", "tts_audio_buffered", args={"bytes": len(pcm)}
-                )
-            else:
-                logger.warning("send_tts_audio before session ready — dropping")
-            return
-
-        if self._deferring_input:
-            # A turn opened during a barge-in (see start_turn); hold its audio until
-            # the window clears so it replays in order with its turn boundary.
-            self._interrupt_deferred.append(("audio", pcm, sample_rate, num_channels))
-            self._tracer.instant(
-                "tts_input", "tts_audio_deferred", args={"bytes": len(pcm)}
-            )
-            return
-
-        await self._send_tts_audio_core(pcm, sample_rate, num_channels)
+        await self._drain_batch_at_turn_boundary()
 
     async def _send_tts_audio_core(
         self, pcm: bytes, sample_rate: int, num_channels: int
@@ -553,60 +359,12 @@ class OjinSTVClient:
             if input_rms is not None:
                 self._tracer.counter("input_audio_rms", round(input_rms, 1))
 
-        if self._config.server_feed_batching_enabled:
-            to_send = self._batcher.add(resampled)
-            self._batch_added.set()  # any arrival resets the idle-flush timer
-            if to_send is not None:
-                await self._send_audio_message(to_send)
-        else:
-            await self._send_audio_message(resampled)
+        await self._feed_resampled_audio(resampled)
 
     async def say(self, pcm: bytes, sample_rate: int, num_channels: int) -> None:
         """Open a turn and send one audio payload (one-shot helper)."""
         await self.start_turn()
         await self.send_tts_audio(pcm, sample_rate, num_channels)
-
-    async def _flush_preinit_inputs(self) -> None:
-        """Replay input buffered before the session was ready, in arrival order.
-
-        Called once from the ``SESSION_READY`` handler after the audio seed, with
-        ``_initialized`` already ``True`` — so the replayed ``start_turn`` /
-        ``send_tts_audio`` calls take their normal path (the guards that buffered
-        them no longer trip) and won't re-enqueue.
-        """
-        pending, self._preinit_inputs = self._preinit_inputs, []
-        if not pending:
-            return
-        logger.info("Replaying %d buffered pre-init input op(s)", len(pending))
-        for op in pending:
-            if op[0] == "turn":
-                await self.start_turn()
-            else:  # ("audio", pcm, sample_rate, num_channels)
-                await self.send_tts_audio(op[1], op[2], op[3])
-
-    async def _flush_interrupt_deferred(self) -> None:
-        """Replay input deferred during a barge-in, in arrival order, then resume.
-
-        Called from the receive loop when the server's idle/fade frame clears the
-        interruption window. Replays through the guard-free ``*_core`` seams so it
-        never re-defers. Drains in a loop and only clears ``_deferring_input`` once
-        the buffer is empty: any live ``send_tts_audio`` that lands mid-replay still
-        appends (the flag is set) and is picked up in the next pass, so ordering is
-        preserved and no frame slips ahead of the replayed backlog.
-        """
-        if self._interrupt_deferred:
-            logger.info(
-                "Replaying %d input op(s) deferred during barge-in",
-                len(self._interrupt_deferred),
-            )
-        while self._interrupt_deferred:
-            pending, self._interrupt_deferred = self._interrupt_deferred, []
-            for op in pending:
-                if op[0] == "turn":
-                    await self._start_turn_core()
-                else:  # ("audio", pcm, sample_rate, num_channels)
-                    await self._send_tts_audio_core(op[1], op[2], op[3])
-        self._deferring_input = False
 
     async def interrupt(self) -> bool:
         """Barge-in: fade the current turn and cancel it server-side if playing.
@@ -681,13 +439,7 @@ class OjinSTVClient:
             self._tracer.span("lifecycle", "connect", self._tr_connect_start)
             if self._playback_task is None:
                 self._playback_task = asyncio.create_task(self._video_playback_loop())
-            if (
-                self._config.server_feed_batching_enabled
-                and self._batch_flush_task is None
-            ):
-                self._batch_flush_task = asyncio.create_task(self._batch_flush_loop())
-            if self._server_feed_max_lead_ms > 0 and self._feed_task is None:
-                self._feed_task = asyncio.create_task(self._server_feed_loop())
+            self._start_feed_tasks()
             await self._events.emit(
                 STVEvent.SESSION_READY, session_data=self._session_data
             )
@@ -820,40 +572,6 @@ class OjinSTVClient:
             self._diagnostics.note_tick()
             await self._emit_tick()
 
-    async def _batch_flush_tick(self, idle: float) -> None:
-        """Run one debounce tick: wait for audio or fire a tail flush on timeout.
-
-        Extracted from the loop so the ``try``/``except`` does not sit directly
-        inside ``while`` (avoids PERF203).  Raises ``asyncio.CancelledError``
-        so the caller loop can exit cleanly; all other exceptions are swallowed
-        and logged so one bad send never kills the loop.
-        """
-        try:
-            await asyncio.wait_for(self._batch_added.wait(), timeout=idle)
-            self._batch_added.clear()  # new audio arrived → restart the timer
-        except asyncio.TimeoutError:
-            if self._batcher.flush_due():
-                pending = self._batcher.drain()
-                if pending is not None:
-                    await self._send_audio_message(pending)
-        except asyncio.CancelledError:
-            raise
-        except Exception:  # never let one bad send kill the loop
-            logger.exception("batch flush loop error — continuing")
-
-    async def _batch_flush_loop(self) -> None:
-        """Flush a sub-threshold audio tail after the idle gap, off the playback clock.
-
-        Debounces on ``_batch_added``: each new chunk restarts the timer, so a
-        flush only fires once TTS has been quiet for ``server_feed_flush_idle_ms``
-        (turn end / short turn). Runs as its own task so a blocking websocket send
-        never jitters the 25 fps playback loop. Re-arm of the initial threshold is
-        NOT done here — that is tied to ``start_turn``.
-        """
-        idle = self._config.server_feed_flush_idle_ms / 1000.0
-        while self._initialized:
-            await self._batch_flush_tick(idle)
-
     async def _emit_tick(self) -> None:
         """Run one tick: drain decode output, step the synchronizer, emit frames.
 
@@ -883,15 +601,12 @@ class OjinSTVClient:
         await self._emit_audio(result, pts)
 
         if result.audio_chunk:
-            # Advance the playback position the server-feed lead cap gates on.
             # Faded (interrupted) audio counts too: fed/played are reconciled at
             # interrupt() anyway, and max(0, ...) absorbs any residue.
             sample_rate, num_channels = self._last_audio_shape
-            self._played_real_ms += len(result.audio_chunk) / (
-                sample_rate * num_channels * 2 / 1000.0
+            self._advance_played_real_ms(
+                len(result.audio_chunk) / (sample_rate * num_channels * 2 / 1000.0)
             )
-            if self._feed_pending:
-                self._feed_wake.set()
 
         if result.started_speaking:
             self._tr_speaking_start = self._tracer.mark()
