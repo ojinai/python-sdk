@@ -10,6 +10,7 @@ from ojin.stv.config import STVConfig, WebRTCSettings
 from ojin.stv.events import STVEvent
 from ojin.stv.frames import FrameType, STVAudioFrame, STVVideoFrame
 from ojin.stv.ojin_stv_client import OjinSTVClient
+from ojin.stv.ojin_stv_webrtc_client import OjinSTVWebRTCClient
 from ojin.stv.output import QueueOutput, STVOutput
 from ojin.stv.resampler import (
     NumpyLinearResampler,
@@ -35,6 +36,7 @@ __all__ = [
     "NullTracer",
     "NumpyLinearResampler",
     "OjinSTVClient",
+    "OjinSTVWebRTCClient",
     "OjinSessionTrace",
     "OpenCVDecoder",
     "PassthroughDecoder",
