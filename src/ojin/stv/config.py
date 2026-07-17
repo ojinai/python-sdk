@@ -10,6 +10,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+_MIN_AUDIO_SAMPLE_RATE = 8000
+_MAX_AUDIO_SAMPLE_RATE = 48000
+_FRAMES_PER_SECOND = 25
+
 
 @dataclass
 class WebRTCSettings:
@@ -25,6 +29,22 @@ class WebRTCSettings:
     provider: str = "daily"
     audio_sample_rate: int = 16000
     webrtc_join_timeout_s: float = 10.0
+
+    def __post_init__(self) -> None:
+        """Reject a feed rate that would misframe the 40 ms slice or divide by zero.
+
+        The server is the authority on rate acceptance, but this is a public
+        dataclass — fail here rather than deep in the outbound loop.
+        """
+        if (
+            not _MIN_AUDIO_SAMPLE_RATE <= self.audio_sample_rate <= _MAX_AUDIO_SAMPLE_RATE
+            or self.audio_sample_rate % _FRAMES_PER_SECOND
+        ):
+            raise ValueError(
+                f"audio_sample_rate must be within "
+                f"[{_MIN_AUDIO_SAMPLE_RATE}, {_MAX_AUDIO_SAMPLE_RATE}] and divisible "
+                f"by {_FRAMES_PER_SECOND}, got {self.audio_sample_rate}"
+            )
 
 
 @dataclass
