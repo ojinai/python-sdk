@@ -6,7 +6,7 @@ post-interruption re-sync. It is pipecat-free and built on the swappable
 ``IOjinClient`` transport (WebSocket today, WebRTC later).
 """
 
-from ojin.stv.config import STVConfig
+from ojin.stv.config import STVConfig, WebRTCSettings
 from ojin.stv.events import STVEvent
 from ojin.stv.frames import FrameType, STVAudioFrame, STVVideoFrame
 from ojin.stv.ojin_stv_client import OjinSTVClient
@@ -51,6 +51,7 @@ __all__ = [
     "TickSample",
     "Tracer",
     "VideoDecoder",
+    "WebRTCSettings",
     "cross_correlation_lag",
     "default_resampler",
     "luma_motion_rms",

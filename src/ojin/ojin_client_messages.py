@@ -134,6 +134,21 @@ class OjinInteractionResponseMessage(OjinMessage):
         )
 
 
+class OjinWebRTCStatusMessage(OjinMessage):
+    """Server ``webrtcStatus`` payload reporting direct-WebRTC negotiation state.
+
+    Fields are deliberately lenient plain strings/dicts: an unknown or future
+    ``status`` value must parse cleanly and be handled (or ignored) downstream,
+    never raise here.
+    """
+
+    status: str = ""
+    provider: str = ""
+    participant_id: Optional[str] = None
+    error: Optional[Dict[str, Any]] = None
+    timestamp: int = 0
+
+
 class OjinCancelInteractionMessage(OjinMessage):
     """Message to cancel an interaction."""
 

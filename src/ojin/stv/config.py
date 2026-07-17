@@ -8,7 +8,23 @@ client constructor, not here.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+
+
+@dataclass
+class WebRTCSettings:
+    """Room credentials + knobs for the direct-WebRTC negotiation.
+
+    ``token`` is excluded from ``repr`` and must never be logged.
+    ``webrtc_join_timeout_s`` is client-local and is never serialized into the
+    ``sessionUpdate`` payload.
+    """
+
+    room_url: str
+    token: str = field(repr=False)
+    provider: str = "daily"
+    audio_sample_rate: int = 16000
+    webrtc_join_timeout_s: float = 10.0
 
 
 @dataclass

@@ -4,13 +4,38 @@ import asyncio
 import contextlib
 import json
 
+import pytest
+
 from ojin.entities.interaction_messages import ErrorResponseMessage
+from ojin.entities.session_messages import SessionUpdateMessage, SessionUpdatePayload
 from ojin.ojin_client import OjinClient
 from ojin.ojin_client_messages import (
     OjinAudioInputMessage,
     OjinCancelInteractionMessage,
     OjinSessionReadyMessage,
+    OjinWebRTCStatusMessage,
 )
+
+# Canonical webrtcStatus wire literals (parent design §1.3) — the same shapes
+# the server serializes; parser drift from them must fail here.
+WEBRTC_STATUS_CONNECTED = {
+    "type": "webrtcStatus",
+    "payload": {
+        "status": "connected",
+        "provider": "daily",
+        "participant_id": "prt-1234",
+        "timestamp": 1789000000000,
+    },
+}
+WEBRTC_STATUS_FAILED = {
+    "type": "webrtcStatus",
+    "payload": {
+        "status": "failed",
+        "provider": "daily",
+        "error": {"code": "NETWORK", "message": "join failed"},
+        "timestamp": 1789000000000,
+    },
+}
 
 
 def _client() -> OjinClient:
@@ -303,3 +328,143 @@ def test_debug_queue_depths_never_raises_on_broken_internals() -> None:
         "server_msgs": 0,
         "ingress_bytes_total": 0,
     }
+
+
+# ----------------------------------------------------------------------
+# Direct-WebRTC additions: sessionUpdate outbound + webrtcStatus inbound
+# ----------------------------------------------------------------------
+
+
+def _webrtc_session_update() -> SessionUpdateMessage:
+    """Build a webrtc-only sessionUpdate matching the pinned wire shape."""
+    return SessionUpdateMessage(
+        payload=SessionUpdatePayload(
+            parameters={
+                "webrtc": {
+                    "version": 1,
+                    "provider": "daily",
+                    "room_url": "https://ojin.daily.co/room-1",
+                    "token": "tok-secret",
+                    "audio_sample_rate": 16000,
+                }
+            },
+            timestamp=1789000000000,
+        )
+    )
+
+
+async def test_session_update_sent_verbatim_post_ready() -> None:
+    """A SessionUpdateMessage is serialized and sent directly on the socket."""
+    client = _client()
+    client._running = True
+    client._inference_server_ready = True
+    client._ws = _FakeWS()  # type: ignore[assignment]
+
+    message = _webrtc_session_update()
+    await client.send_message(message)
+
+    assert len(client._ws.sent) == 1
+    assert json.loads(client._ws.sent[0]) == {
+        "type": "sessionUpdate",
+        "payload": {
+            "parameters": {
+                "webrtc": {
+                    "version": 1,
+                    "provider": "daily",
+                    "room_url": "https://ojin.daily.co/room-1",
+                    "token": "tok-secret",
+                    "audio_sample_rate": 16000,
+                }
+            },
+            "timestamp": 1789000000000,
+        },
+    }
+    # It bypasses the paced client-message queue like the cancel branch does.
+    assert client._pending_client_messages_queue.qsize() == 0
+
+
+async def test_session_update_gated_before_ready() -> None:
+    """The sessionUpdate branch honors the existing readiness gates."""
+    client = _client()
+    client._running = True
+    client._inference_server_ready = False
+    client._ws = _FakeWS()  # type: ignore[assignment]
+
+    with pytest.raises(ConnectionError):
+        await client.send_message(_webrtc_session_update())
+    assert client._ws.sent == []
+
+
+async def test_webrtc_status_routed_to_callback_never_queued() -> None:
+    """A webrtcStatus goes to the registered callback, not the response queue."""
+    client = _client()
+    received: list[OjinWebRTCStatusMessage] = []
+
+    async def on_status(status: OjinWebRTCStatusMessage) -> None:
+        received.append(status)
+
+    client.set_webrtc_status_callback(on_status)
+    await client._handle_server_message(json.dumps(WEBRTC_STATUS_CONNECTED))
+
+    assert len(received) == 1
+    status = received[0]
+    assert status.status == "connected"
+    assert status.provider == "daily"
+    assert status.participant_id == "prt-1234"
+    assert status.error is None
+    assert client._available_response_messages_queue.empty()
+
+    # The receive path survives and later messages are still delivered.
+    payload = {"type": "sessionReady", "payload": {"parameters": {"persona": "x"}}}
+    await client._handle_server_message(json.dumps(payload))
+    msg = client._available_response_messages_queue.get_nowait()
+    assert isinstance(msg, OjinSessionReadyMessage)
+
+
+async def test_webrtc_status_throwing_callback_is_contained(caplog) -> None:
+    """A throwing status callback is caught and logged; the loop survives."""
+
+    def on_status(status: OjinWebRTCStatusMessage) -> None:
+        raise ValueError("handler boom")
+
+    client = _client()
+    client.set_webrtc_status_callback(on_status)
+    await client._handle_server_message(json.dumps(WEBRTC_STATUS_FAILED))  # no raise
+
+    assert client._available_response_messages_queue.empty()
+    assert any("webrtcStatus" in record.message for record in caplog.records)
+
+    payload = {"type": "sessionReady", "payload": {"parameters": {"persona": "x"}}}
+    await client._handle_server_message(json.dumps(payload))
+    assert isinstance(
+        client._available_response_messages_queue.get_nowait(), OjinSessionReadyMessage
+    )
+
+
+async def test_webrtc_status_without_callback_is_dropped_quietly() -> None:
+    """With no callback registered, a status is parsed and dropped, no raise."""
+    client = _client()
+    await client._handle_server_message(json.dumps(WEBRTC_STATUS_CONNECTED))
+    assert client._available_response_messages_queue.empty()
+
+
+async def test_webrtc_status_survives_cancel_drain() -> None:
+    """A cancel's response-queue drain cannot lose an already-delivered status."""
+    client = _client()
+    client._running = True
+    client._inference_server_ready = True
+    client._ws = _FakeWS()  # type: ignore[assignment]
+    received: list[OjinWebRTCStatusMessage] = []
+
+    def on_status(status: OjinWebRTCStatusMessage) -> None:
+        received.append(status)
+
+    client.set_webrtc_status_callback(on_status)
+    await client._handle_server_message(json.dumps(WEBRTC_STATUS_FAILED))
+    # A barge-in fires before any consumer runs: cancel drains the queue.
+    await client.send_message(OjinCancelInteractionMessage())
+
+    assert len(received) == 1
+    assert received[0].status == "failed"
+    assert received[0].error == {"code": "NETWORK", "message": "join failed"}
+    assert client._available_response_messages_queue.empty()

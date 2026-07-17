@@ -45,6 +45,7 @@ LANES: Dict[str, int] = {
     "lipsync": 17,
     "response": 18,
     "latency": 19,
+    "webrtc": 20,
 }
 
 _MIN_SPAN_US = 1.0

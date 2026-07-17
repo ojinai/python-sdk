@@ -3,12 +3,13 @@
 import array
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import socket
 import struct
 import time
-from typing import Dict, Optional, Type, TypeVar
+from typing import Callable, Dict, Optional, Type, TypeVar
 
 try:  # FIONREAD socket probe is Unix-only; absent on Windows.
     import fcntl
@@ -35,6 +36,7 @@ from ojin.entities.interaction_messages import (
     InteractionInputMessage,
     InteractionResponseMessage,
 )
+from ojin.entities.session_messages import SessionUpdateMessage
 from ojin.ojin_client_messages import (
     IOjinClient,
     OjinAudioInputMessage,
@@ -45,6 +47,7 @@ from ojin.ojin_client_messages import (
     OjinSessionReadyMessage,
     OjinSessionReadyPing,
     OjinTextInputMessage,
+    OjinWebRTCStatusMessage,
 )
 
 T = TypeVar("T", bound=OjinMessage)
@@ -181,6 +184,20 @@ class OjinClient(IOjinClient):
         )
         self._mode: str | None = mode
         self._pending_first_input: bool = False
+        self._webrtc_status_callback: Optional[
+            Callable[[OjinWebRTCStatusMessage], object]
+        ] = None
+
+    def set_webrtc_status_callback(
+        self, callback: Callable[[OjinWebRTCStatusMessage], object]
+    ) -> None:
+        """Register the handler invoked inline for each ``webrtcStatus`` message.
+
+        The callback (sync or async) is called from the receive loop; statuses
+        are never enqueued on the drainable response queue, so a cancel-time
+        drain can never drop one.
+        """
+        self._webrtc_status_callback = callback
 
     async def connect(self) -> None:
         """Establish WebSocket connection and authenticate with the service."""
@@ -373,6 +390,10 @@ class OjinClient(IOjinClient):
                 return
             msg_type = data.get("type")
 
+            if msg_type == "webrtcStatus":
+                await self._dispatch_webrtc_status(data)
+                return
+
             # Map message types to their corresponding classes
             message_types: Dict[str, Type[BaseModel]] = {
                 "sessionReady": OjinSessionReadyMessage,
@@ -408,6 +429,25 @@ class OjinClient(IOjinClient):
         except Exception as e:
             logger.exception("Error handling message: %s", e)
             raise RuntimeError(e) from e
+
+    async def _dispatch_webrtc_status(self, data: dict) -> None:
+        """Parse a ``webrtcStatus`` message and deliver it to the callback.
+
+        Parse and dispatch share one try/except: neither a malformed payload
+        nor a throwing callback may escape into the receive loop's fatal
+        error path.
+        """
+        try:
+            status = OjinWebRTCStatusMessage(**(data.get("payload") or {}))
+            callback = self._webrtc_status_callback
+            if callback is None:
+                logger.warning("webrtcStatus received with no callback registered")
+                return
+            result = callback(status)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.exception("Error handling webrtcStatus message — dropped")
 
     async def start_interaction(self) -> None:
         """Drain any pending response messages before starting a new interaction."""
@@ -458,6 +498,10 @@ class OjinClient(IOjinClient):
 
             self._cancelled = False
 
+            return
+
+        if isinstance(message, SessionUpdateMessage):
+            await self._ws.send(message.model_dump_json())
             return
 
         if isinstance(
