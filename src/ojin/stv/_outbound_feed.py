@@ -28,9 +28,11 @@ from ojin.stv.tracing import Tracer
 
 logger = logging.getLogger(__name__)
 
-# All server-bound payloads are 16 kHz mono int16, so ms = bytes / 32.
+# Legacy server-bound payloads are 16 kHz mono int16, so ms = bytes / 32. The
+# direct-WebRTC client feeds at its declared native rate instead, so the byte↔ms
+# conversion is an instance value (`_bytes_per_ms`) derived from the feed rate;
+# 16 kHz stays the default so the legacy client is byte-identical.
 FEED_SAMPLE_RATE = 16_000
-_BYTES_PER_MS = FEED_SAMPLE_RATE * 2 / 1000.0
 
 
 class OutboundFeedMixin:
@@ -43,13 +45,28 @@ class OutboundFeedMixin:
     _tracer: Tracer
     _initialized: bool
 
-    def _init_outbound_feed(self, buffer_preinit_tts_audio: bool) -> None:
-        """Initialize the batcher, lead-cap, preinit and deferral state."""
+    def _init_outbound_feed(
+        self,
+        buffer_preinit_tts_audio: bool,
+        feed_sample_rate: int = FEED_SAMPLE_RATE,
+    ) -> None:
+        """Initialize the batcher, lead-cap, preinit and deferral state.
+
+        ``feed_sample_rate`` is the mono int16 rate of the server-bound audio;
+        it fixes the byte↔ms conversion (``bytes = ms * rate * 2 / 1000``). The
+        legacy client leaves it at 16 kHz (32 B/ms); the direct-WebRTC client
+        passes its declared native rate (e.g. 24 kHz → 48 B/ms).
+        """
+        # ms = bytes / _bytes_per_ms, for the batcher thresholds and the lead
+        # clock. Derived from the feed rate so both clients share one formula.
+        self._bytes_per_ms = feed_sample_rate * 2 / 1000.0
         self._batcher = SendBatcher(
             initial_chunk_bytes=int(
-                self._config.server_feed_initial_chunk_ms * _BYTES_PER_MS
+                self._config.server_feed_initial_chunk_ms * self._bytes_per_ms
             ),
-            min_chunk_bytes=int(self._config.server_feed_min_chunk_ms * _BYTES_PER_MS),
+            min_chunk_bytes=int(
+                self._config.server_feed_min_chunk_ms * self._bytes_per_ms
+            ),
             flush_idle_s=self._config.server_feed_flush_idle_ms / 1000.0,
         )
         self._batch_added = asyncio.Event()
@@ -274,7 +291,7 @@ class OutboundFeedMixin:
     async def _send_audio_now(self, pcm: bytes) -> None:
         """Send one server-bound audio payload and record the to_server trace."""
         await self._client.send_message(OjinAudioInputMessage(audio_int16_bytes=pcm))
-        self._server_fed_ms += len(pcm) / _BYTES_PER_MS
+        self._server_fed_ms += len(pcm) / self._bytes_per_ms
         self._tracer.instant("to_server", "audio_sent", args={"bytes": len(pcm)})
 
     async def _server_feed_loop(self) -> None:

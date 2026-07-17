@@ -117,7 +117,12 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         self._tracer: Tracer = tracer or NullTracer()
         self._events = EventEmitter()
         self._initialized = False
-        self._init_outbound_feed(buffer_preinit_tts_audio)
+        # Feed the server at the declared native rate: the batcher thresholds
+        # and lead clock follow it, and send_tts_audio resamples to it below.
+        self._init_outbound_feed(
+            buffer_preinit_tts_audio,
+            feed_sample_rate=webrtc_settings.audio_sample_rate,
+        )
 
         self._session_data: Optional[dict] = None
         self._state = _NegotiationState.IDLE

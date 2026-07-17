@@ -12,8 +12,9 @@ from ojin.ojin_client_messages import (
 )
 from ojin.stv.config import STVConfig, WebRTCSettings
 from ojin.stv.events import STVEvent
+from ojin.stv.ojin_stv_client import OjinSTVClient
 from ojin.stv.ojin_stv_webrtc_client import OjinSTVWebRTCClient
-from tests.stv.fakes import FakeOjinClient, RecordingTracer
+from tests.stv.fakes import FakeOjinClient, ListOutput, RecordingTracer
 from tests.stv.test_webrtc_negotiation import (
     CAPABILITY_PARAMETERS,
     STATUS_CONNECTED,
@@ -33,14 +34,16 @@ STATUS_FAILED_REJOIN = {
 }
 
 
-def make_client(clock=None, **config_overrides):
+def make_client(clock=None, audio_sample_rate=16000, **config_overrides):
     """Build a webrtc client on fakes (no receive loop; handlers driven direct)."""
     fake_client = FakeOjinClient(session_parameters=CAPABILITY_PARAMETERS)
     tracer = RecordingTracer()
     kwargs = {"clock": clock} if clock is not None else {}
     client = OjinSTVWebRTCClient(
         webrtc_settings=WebRTCSettings(
-            room_url="https://ojin.daily.co/room-abc", token="tok-secret-123"
+            room_url="https://ojin.daily.co/room-abc",
+            token="tok-secret-123",
+            audio_sample_rate=audio_sample_rate,
         ),
         client=fake_client,
         tracer=tracer,
@@ -273,6 +276,41 @@ async def test_interrupt_cancels_resets_and_acks_on_idle() -> None:
     await client.close()
 
 
+async def test_new_turn_during_ack_window_is_deferred_then_replayed() -> None:
+    """A turn opened while a cancel is settling is held, then shipped on the ack.
+
+    The server discards audio sent mid-cancel, so the new turn must not be fed
+    until the first idle/fade-out metadata frame closes the window; then the
+    deferred turn and its audio replay in order.
+    """
+    client, fake_client, _tracer = make_client(server_feed_batching_enabled=False)
+    await _connect(client, fake_client)
+    await client.start_turn()
+    chunk_a = b"\x01\x02" * 640
+    await client.send_tts_audio(chunk_a, 16000, 1)
+    assert [m.audio_int16_bytes for m in _audio_messages(fake_client)] == [chunk_a]
+
+    assert await client.interrupt() is True
+    assert client._interruption_ongoing is True
+
+    chunk_b = b"\x03\x04" * 640
+    await client.start_turn()  # new turn during the ack window
+    await client.send_tts_audio(chunk_b, 16000, 1)
+    assert client._deferring_input is True
+    assert len(client._interrupt_deferred) == 2  # turn + audio, held
+    assert [m.audio_int16_bytes for m in _audio_messages(fake_client)] == [chunk_a]
+
+    await client._handle_message(_frame(FrameType.IDLE))  # server ack
+    assert client._interruption_ongoing is False
+    assert client._deferring_input is False
+    assert client._interrupt_deferred == []
+    assert [m.audio_int16_bytes for m in _audio_messages(fake_client)] == [
+        chunk_a,
+        chunk_b,
+    ]
+    await client.close()
+
+
 async def test_metadata_watchdog_logs_but_never_fails(caplog) -> None:
     """A 5 s metadata gap logs a warning; the session stays healthy."""
     fake_now = [100.0]
@@ -334,3 +372,38 @@ def test_webrtc_settings_repr_hides_token_and_pins_defaults() -> None:
     assert settings.audio_sample_rate == 16000
     # Must stay strictly above the server's 8 s join bound.
     assert settings.webrtc_join_timeout_s == 10.0
+
+
+def test_native_rate_feed_uses_48_bytes_per_ms() -> None:
+    """A 24 kHz declared rate drives a 48 B/ms outbound clock, not 32 (D3/D5)."""
+    client, _fake_client, _tracer = make_client(audio_sample_rate=24000)
+    assert client._bytes_per_ms == 48.0
+
+
+def test_legacy_client_uses_32_bytes_per_ms() -> None:
+    """The legacy client defaults to the 16 kHz 32 B/ms clock (byte-identical)."""
+    legacy = OjinSTVClient(client=FakeOjinClient(), output=ListOutput())
+    assert legacy._bytes_per_ms == 32.0
+
+
+async def test_24khz_tts_reaches_ws_unresampled() -> None:
+    """At a 24 kHz declared rate, 24 kHz TTS is fed to the server verbatim.
+
+    The declared rate equals the TTS native rate (the intended configuration),
+    so the resample is a no-op and the exact input bytes reach the wire — no
+    down-resample to 16 kHz.
+    """
+    client, fake_client, _tracer = make_client(
+        audio_sample_rate=24000, server_feed_batching_enabled=False
+    )
+    await _connect(client, fake_client)
+    fake_client.sent.clear()
+    await client.start_turn()
+
+    chunk_24k = b"\x01\x02" * 2400  # 100 ms @ 24 kHz mono int16
+    await client.send_tts_audio(chunk_24k, 24000, 1)
+
+    audio = _audio_messages(fake_client)
+    assert len(audio) == 1
+    assert audio[0].audio_int16_bytes == chunk_24k  # identity resample, verbatim
+    await client.close()

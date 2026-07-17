@@ -291,7 +291,15 @@ async def test_trace_records_webrtc_lane_and_other_data() -> None:
     assert set(summary) == {"provider", "join_ms", "participant_id"}
     assert summary["provider"] == "daily"
     assert summary["participant_id"] == "prt-1234"
-    dumped = json.dumps(tracer.other)
+    # The token / room_url must never leak into ANY recorded surface: otherData,
+    # instant args, or span args.
+    dumped = json.dumps(
+        {
+            "other": tracer.other,
+            "instants": [args for (_lane, _name, args) in tracer.instants],
+            "spans": [args for (_lane, _name, _start, args) in tracer.spans],
+        }
+    )
     assert TOKEN not in dumped
     assert ROOM_URL not in dumped
     await client.close()

@@ -10,8 +10,10 @@ from ojin.entities.interaction_messages import ErrorResponseMessage
 from ojin.entities.session_messages import SessionUpdateMessage, SessionUpdatePayload
 from ojin.ojin_client import OjinClient
 from ojin.ojin_client_messages import (
+    FrameType,
     OjinAudioInputMessage,
     OjinCancelInteractionMessage,
+    OjinInteractionResponseMessage,
     OjinSessionReadyMessage,
     OjinWebRTCStatusMessage,
 )
@@ -449,7 +451,12 @@ async def test_webrtc_status_without_callback_is_dropped_quietly() -> None:
 
 
 async def test_webrtc_status_survives_cancel_drain() -> None:
-    """A cancel's response-queue drain cannot lose an already-delivered status."""
+    """A cancel's response-queue drain cannot lose an already-delivered status.
+
+    The drain is real: an interaction response seeded into the drainable queue
+    is discarded by the cancel, proving the callback-delivered status survived
+    precisely because it never entered that queue.
+    """
     client = _client()
     client._running = True
     client._inference_server_ready = True
@@ -460,11 +467,25 @@ async def test_webrtc_status_survives_cancel_drain() -> None:
         received.append(status)
 
     client.set_webrtc_status_callback(on_status)
+    # An interaction response is sitting in the drainable queue; the status is
+    # delivered out-of-band via the callback.
+    seeded_response = OjinInteractionResponseMessage(
+        interaction_id="i1",
+        video_frame_bytes=b"",
+        audio_frame_bytes=b"\x00\x00" * 320,
+        is_final_response=False,
+        index=0,
+        frame_type=FrameType.SPEECH,
+    )
+    client._available_response_messages_queue.put_nowait(seeded_response)
     await client._handle_server_message(json.dumps(WEBRTC_STATUS_FAILED))
+    assert client._available_response_messages_queue.qsize() == 1  # only the seed
     # A barge-in fires before any consumer runs: cancel drains the queue.
     await client.send_message(OjinCancelInteractionMessage())
 
     assert len(received) == 1
     assert received[0].status == "failed"
     assert received[0].error == {"code": "NETWORK", "message": "join failed"}
+    # The seeded interaction response was drained by the cancel; the status,
+    # delivered via the callback, was never at risk.
     assert client._available_response_messages_queue.empty()
