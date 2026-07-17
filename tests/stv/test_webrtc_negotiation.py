@@ -134,6 +134,8 @@ async def test_connecting_does_not_stop_the_join_timer() -> None:
     errors = _record(client, STVEvent.ERROR)
     await client.start()
     await asyncio.sleep(0.05)
+    await client.start_turn()
+    await client.send_tts_audio(b"\x01\x02" * 640, 16000, 1)  # held in the window
 
     await fake_client.push_webrtc_status(STATUS_CONNECTING)
     timer = client._join_timer_task
@@ -142,6 +144,8 @@ async def test_connecting_does_not_stop_the_join_timer() -> None:
     await client._handle_join_timeout()  # deadline reached with no terminal status
     assert errors and errors[0]["code"] == "WEBRTC_JOIN_FAILED"
     assert errors[0]["fatal"] is True
+    assert client._preinit_inputs == []  # held input discarded on timeout
+    assert _audio_messages(fake_client) == []
     await client.close()
 
 

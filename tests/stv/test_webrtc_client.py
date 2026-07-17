@@ -165,7 +165,7 @@ async def test_first_frame_fires_exactly_once_any_frame_type() -> None:
 
 
 async def test_speaking_edges_from_frame_type_transitions() -> None:
-    """IDLE→SPEECH starts speaking; SPEECH→FADE_OUT stops it."""
+    """IDLE/FADE_OUT→SPEECH starts speaking; SPEECH→FADE_OUT/IDLE stops it."""
     client, fake_client, _tracer = make_client()
     started = _record(client, STVEvent.BOT_STARTED_SPEAKING)
     stopped = _record(client, STVEvent.BOT_STOPPED_SPEAKING)
@@ -176,6 +176,10 @@ async def test_speaking_edges_from_frame_type_transitions() -> None:
     assert len(started) == 1 and len(stopped) == 0
     await client._handle_message(_frame(FrameType.FADE_OUT))
     assert len(started) == 1 and len(stopped) == 1
+    await client._handle_message(_frame(FrameType.SPEECH))  # FADE_OUT→SPEECH
+    assert len(started) == 2
+    await client._handle_message(_frame(FrameType.IDLE))  # SPEECH→IDLE
+    assert len(stopped) == 2
     await client.close()
 
 
