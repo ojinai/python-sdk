@@ -36,9 +36,9 @@ class WebRTCSettings:
         The server is the authority on rate acceptance, but this is a public
         dataclass — fail here rather than deep in the outbound loop.
         """
-        if (
-            not _MIN_AUDIO_SAMPLE_RATE <= self.audio_sample_rate <= _MAX_AUDIO_SAMPLE_RATE
-            or self.audio_sample_rate % _FRAMES_PER_SECOND
+        rate = self.audio_sample_rate
+        if not _MIN_AUDIO_SAMPLE_RATE <= rate <= _MAX_AUDIO_SAMPLE_RATE or (
+            rate % _FRAMES_PER_SECOND
         ):
             raise ValueError(
                 f"audio_sample_rate must be within "
