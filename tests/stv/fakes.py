@@ -42,6 +42,9 @@ class FakeOjinClient(IOjinClient):
         self.webrtc_status_callback: Optional[
             Callable[[OjinWebRTCStatusMessage], object]
         ] = None
+        # WebRTC settings declared for the connect exchange (protocol v2:
+        # webrtc_* query params + token header on the upgrade request).
+        self.webrtc_connect_settings: object | None = None
 
     async def connect(self) -> None:
         """Mark connected and enqueue a SessionReady message (or fail)."""
@@ -51,6 +54,10 @@ class FakeOjinClient(IOjinClient):
         await self._queue.put(
             OjinSessionReadyMessage(parameters=self._session_parameters)
         )
+
+    def set_webrtc_connect_settings(self, settings: object) -> None:
+        """Record the declared webrtc settings, mirroring the real OjinClient."""
+        self.webrtc_connect_settings = settings
 
     async def send_message(self, message: BaseModel) -> None:
         """Record an outgoing message."""

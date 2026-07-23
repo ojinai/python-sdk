@@ -9,7 +9,11 @@ import logging
 import socket
 import struct
 import time
-from typing import Callable, Dict, Optional, Type, TypeVar
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Type, TypeVar
+from urllib.parse import urlencode
+
+if TYPE_CHECKING:  # annotation only — avoid a runtime ojin -> ojin.stv cycle
+    from ojin.stv.config import WebRTCSettings
 
 try:  # FIONREAD socket probe is Unix-only; absent on Windows.
     import fcntl
@@ -187,6 +191,25 @@ class OjinClient(IOjinClient):
         self._webrtc_status_callback: Optional[
             Callable[[OjinWebRTCStatusMessage], object]
         ] = None
+        # Direct-WebRTC settings declared in the WebSocket upgrade request
+        # (protocol v2, DR-006 as amended 2026-07-24): non-secret fields as
+        # webrtc_* query params, the meeting token as the X-Ojin-Webrtc-Token
+        # header. Carries a secret — never log it.
+        self._webrtc_settings: Optional["WebRTCSettings"] = None
+
+    def set_webrtc_connect_settings(self, settings: "WebRTCSettings") -> None:
+        """Declare direct-WebRTC settings for the connection's upgrade request.
+
+        Protocol v2 (DR-006, 2026-07-24 amendment): the proxy authors the
+        ``sessionSetup`` the server sees, so the client's request travels in
+        the WebSocket UPGRADE REQUEST itself — ``webrtc_*`` query params for
+        the non-secret fields and the ``X-Ojin-Webrtc-Token`` header for the
+        meeting token (same query/header split as ``config_id`` /
+        ``Authorization``; headers stay out of access logs). Must be called
+        before :meth:`connect`. The token is never placed in the URL and
+        never logged.
+        """
+        self._webrtc_settings = settings
 
     def set_webrtc_status_callback(
         self, callback: Callable[[OjinWebRTCStatusMessage], object]
@@ -210,12 +233,7 @@ class OjinClient(IOjinClient):
 
         while attempt < self.reconnect_attempts:
             try:
-                headers = {"Authorization": f"{self.api_key}"}
-
-                # Add query parameters for API key and config ID
-                url = f"{self.ws_url}?config_id={self.config_id}"
-                if self._mode == "dev":
-                    url = f"{url}&mode={self._mode}"
+                url, headers = self._build_connect_request()
                 self._ws = await websockets.connect(
                     url,
                     additional_headers=headers,
@@ -254,6 +272,24 @@ class OjinClient(IOjinClient):
 
         logger.error("Failed to connect after %d attempts", self.reconnect_attempts)
         raise ConnectionError(f"Failed to connect to OJIN STV service: {last_error}")
+
+    def _build_connect_request(self) -> tuple[str, Dict[str, str]]:
+        """Build the WebSocket upgrade URL and headers.
+
+        Direct-WebRTC settings (when declared) ride the upgrade request per
+        protocol v2: non-secret fields as URL-encoded ``webrtc_*`` query
+        params, the meeting token as the ``X-Ojin-Webrtc-Token`` header. The
+        token never enters the URL, and neither the URL nor the headers are
+        logged.
+        """
+        headers: Dict[str, str] = {"Authorization": f"{self.api_key}"}
+        url = f"{self.ws_url}?config_id={self.config_id}"
+        if self._mode == "dev":
+            url = f"{url}&mode={self._mode}"
+        if self._webrtc_settings is not None:
+            url = f"{url}&{urlencode(self._webrtc_settings.to_connect_query_params())}"
+            headers.update(self._webrtc_settings.to_connect_headers())
+        return url, headers
 
     async def close(self) -> None:
         """Close the WebSocket connection."""

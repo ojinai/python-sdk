@@ -15,12 +15,10 @@ from ojin.stv.events import STVEvent
 from ojin.stv.ojin_stv_client import OjinSTVClient
 from ojin.stv.ojin_stv_webrtc_client import OjinSTVWebRTCClient
 from tests.stv.fakes import FakeOjinClient, ListOutput, RecordingTracer
-from tests.stv.test_webrtc_negotiation import (
-    CAPABILITY_PARAMETERS,
-    STATUS_CONNECTED,
-    STATUS_FAILED,
-)
+from tests.stv.test_webrtc_negotiation import READY_CONNECTED_PARAMETERS
 
+# Canonical v2 post-connect webrtcStatus payloads (design §1.3): a mid-session
+# room drop surfaces as ``disconnected`` then ``failed(REJOIN_FAILED)``.
 STATUS_DISCONNECTED = {
     "status": "disconnected",
     "provider": "daily",
@@ -36,7 +34,7 @@ STATUS_FAILED_REJOIN = {
 
 def make_client(clock=None, audio_sample_rate=16000, **config_overrides):
     """Build a webrtc client on fakes (no receive loop; handlers driven direct)."""
-    fake_client = FakeOjinClient(session_parameters=CAPABILITY_PARAMETERS)
+    fake_client = FakeOjinClient(session_parameters=READY_CONNECTED_PARAMETERS)
     tracer = RecordingTracer()
     kwargs = {"clock": clock} if clock is not None else {}
     client = OjinSTVWebRTCClient(
@@ -56,11 +54,14 @@ def make_client(clock=None, audio_sample_rate=16000, **config_overrides):
 
 
 async def _connect(client: OjinSTVWebRTCClient, fake_client: FakeOjinClient) -> None:
-    """Drive the client to the CONNECTED state deterministically."""
+    """Drive the client to the CONNECTED state deterministically.
+
+    Protocol v2: a single sessionReady carrying the connected result resolves
+    the negotiation — there is no webrtcStatus ack.
+    """
     await client._handle_message(
-        OjinSessionReadyMessage(parameters=CAPABILITY_PARAMETERS)
+        OjinSessionReadyMessage(parameters=READY_CONNECTED_PARAMETERS)
     )
-    await fake_client.push_webrtc_status(STATUS_CONNECTED)
 
 
 def _frame(
@@ -199,14 +200,15 @@ async def test_start_of_speech_to_fadeout_emits_stopped() -> None:
     await client.close()
 
 
-async def test_pre_connected_frames_parsed_and_discarded() -> None:
-    """Frames before connected produce no events, no clock, no crash."""
+async def test_frames_before_session_ready_parsed_and_discarded() -> None:
+    """Frames before the sessionReady outcome produce no events, no clock.
+
+    v2 has no pre-connected legacy-frame window — direct mode starts at the
+    first frame — but a frame racing the outcome must still be harmless.
+    """
     client, fake_client, _tracer = make_client()
     first = _record(client, STVEvent.FIRST_FRAME)
     started = _record(client, STVEvent.BOT_STARTED_SPEAKING)
-    await client._handle_message(
-        OjinSessionReadyMessage(parameters=CAPABILITY_PARAMETERS)
-    )  # state REQUESTED — frames may interleave before the status lands
 
     await client._handle_message(
         _frame(FrameType.SPEECH, video=b"\xff\xd8jpeg-ish", audio=b"\x01\x02" * 320)
@@ -216,9 +218,9 @@ async def test_pre_connected_frames_parsed_and_discarded() -> None:
     assert client._played_real_ms == 0.0
     assert client._last_frame_type is None
 
-    await fake_client.push_webrtc_status(STATUS_CONNECTED)
+    await _connect(client, fake_client)
     await client._handle_message(_frame(FrameType.IDLE))
-    assert len(first) == 1  # the gate re-arms at connected
+    assert len(first) == 1  # the gate arms at the connected outcome
     await client.close()
 
 
@@ -356,7 +358,7 @@ async def test_disconnected_alone_is_telemetry_only() -> None:
     await client._handle_message(_frame(FrameType.IDLE))  # still processing frames
     assert client._played_real_ms == 0.0
 
-    await fake_client.push_webrtc_status(STATUS_FAILED)
+    await fake_client.push_webrtc_status(STATUS_FAILED_REJOIN)
     assert len(errors) == 1 and errors[0]["fatal"] is True
     await client.close()
 
@@ -370,8 +372,17 @@ def test_webrtc_settings_repr_hides_token_and_pins_defaults() -> None:
     assert "super-secret-token" not in str(settings)
     assert settings.provider == "daily"
     assert settings.audio_sample_rate == 16000
-    # Must stay strictly above the server's 8 s join bound.
+    assert settings.version == 2  # protocol v2 (DR-006)
+    # Client-local; in v2 it governs the whole sessionReady wait and must not
+    # appear in the connect declaration.
     assert settings.webrtc_join_timeout_s == 10.0
+    assert "webrtc_join_timeout_s" not in settings.to_connect_query_params()
+    assert settings.to_connect_query_params()["webrtc_version"] == "2"
+    # The token travels only in the header — never in a query param.
+    assert "super-secret-token" not in repr(settings.to_connect_query_params())
+    assert settings.to_connect_headers() == {
+        "X-Ojin-Webrtc-Token": "super-secret-token"
+    }
 
 
 def test_native_rate_feed_uses_48_bytes_per_ms() -> None:
