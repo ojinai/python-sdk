@@ -546,6 +546,9 @@ class OjinSTVClient:
         resampled = await self._resampler.resample(
             pcm, sample_rate, OJIN_PERSONA_SAMPLE_RATE
         )
+        # Head copy of the server-bound bytes, for the swap-time onset-gate
+        # mirror (see Synchronizer._mirror_onset_gate_trim).
+        self._synchronizer.note_resampled_audio(target, resampled)
 
         if self._waiting_for_first_tts:
             self._waiting_for_first_tts = False
