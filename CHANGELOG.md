@@ -4,6 +4,47 @@ All notable changes to `ojin-client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0 — see CONTRIBUTING.md).
 
+## 0.9.3 - 2026-07-24
+
+### Fixed
+- **Constant 40 ms video-ahead lip-sync skew on turns whose TTS opens quietly.**
+  The inference server's audible-onset gate drops a turn's leading
+  sub-threshold speech frames (server pipeline, `OJ_AUDIBLE_ONSET_GATE`), so
+  its speech timeline starts at the first audible frame — but the client plays
+  its own TTS buffer from byte 0, leaving the whole turn with the mouth one
+  frame ahead of the voice per gated frame (staging session `06ad7dcd`, turn
+  @66.38s). The RMS envelope matcher is the designed compensation but can
+  reject the true offset: sibilant windows lose ~5x RMS in the 16 kHz wire
+  audio vs the 24 kHz buffer, blowing past its tolerance cap and margin. The
+  synchronizer now mirrors the server gate deterministically at the swap:
+  leading buffer frames below the same threshold (`onset_gate_min_rms`, default
+  0.01 of full scale) are trimmed with the same 12-frame budget and
+  stop-at-first-audible rule, evaluated over the exact 16 kHz bytes the server
+  classified (`note_resampled_audio` records a capped head copy per turn). The
+  envelope matcher still runs after, for residual skew from other sources.
+  Skipped when the trigger frame is itself sub-threshold (server gate off /
+  ungated head); `onset_gate_mirror_enabled=False` disables the mirror — only
+  ever disable it together with the server's gate kill switch.
+
+## 0.9.2 - 2026-07-14
+
+### Fixed
+- **Server-feed lead-cap deadlock.** The lead cap (`server_feed_max_lead_ms`)
+  advanced its "played" side only on ticks that emitted real audio, so once the
+  cap engaged the gate became self-latching: it withheld audio → the server
+  starved → no speech frames came back → local playback underran → the drain
+  froze → the lead stayed pinned above the cap for the rest of the session. The
+  whole session went silent while video kept pacing at 25 fps; every TTS reply
+  after the first long turn was gated and only flushed at `close()` (staging
+  session `c0e60aab`, trace `5cb4201b`). Two changes: (1) `_emit_tick` now
+  advances the drain by one frame on **every** tick — silence included — since
+  the server consumes fed audio on its own ~1x-realtime timeline regardless of
+  what local playback rendered, so the lead always decays and the feeder
+  self-heals within `(lead − cap)` of wall-clock; (2) `start_turn` now re-levels
+  the lead (`fed = played`) and drops any stale gated backlog at the turn
+  boundary, mirroring `interrupt()`, so one overshooting turn can't strand the
+  turns after it.
+
 ## 0.9.0 - 2026-07-12
 
 ### Changed

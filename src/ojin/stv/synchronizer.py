@@ -83,6 +83,10 @@ class AudioBuffer:
     buffer_id: int = field(default_factory=_next_audio_buffer_id)
     interrupted: bool = False
     fade_samples_emitted: int = 0
+    # Capped head of the 16 kHz server-bound copy of this buffer's audio —
+    # the exact bytes the server's audible-onset gate classified. Filled via
+    # note_resampled_audio; read once by the swap-time onset-gate mirror.
+    resampled_head: bytearray = field(default_factory=bytearray)
 
 
 @dataclass
@@ -224,6 +228,13 @@ class Synchronizer:
         target.num_channels = num_channels
         target.bytes_.extend(pcm)
         return target
+
+    def note_resampled_audio(self, buf: AudioBuffer, resampled: bytes) -> None:
+        """Record a buffer's 16 kHz head copy for the onset-gate mirror (capped)."""
+        cap = (self._config.onset_gate_max_frames + 4) * BYTES_PER_FRAME
+        room = cap - len(buf.resampled_head)
+        if room > 0 and resampled:
+            buf.resampled_head.extend(resampled[:room])
 
     # ------------------------------------------------------------------
     # Interruption (≈ UserStartedSpeaking barge-in)
@@ -437,6 +448,48 @@ class Synchronizer:
             self._pending_align = None
         return 0
 
+    def _mirror_onset_gate_trim(self, buf: AudioBuffer, trigger: VideoFrame) -> int:
+        """Trim the head frames the server's audible-onset gate dropped.
+
+        The server retypes a turn's leading sub-threshold SPEECH frames to IDLE
+        and drops them, so its speech timeline starts at the first audible
+        frame; the locally played buffer must lose the same frames or the whole
+        turn plays with video ahead of audio by 40 ms per gated frame. Replays
+        the gate's exact predicate (RMS below ``onset_gate_min_rms`` of int16
+        full scale, at most ``onset_gate_max_frames``, stop at the first
+        audible frame) over the 16 kHz resampled head — the same bytes the
+        server classified — falling back to the original bytes when no
+        resampled copy was recorded. Skipped when the trigger frame is itself
+        sub-threshold: then the server did not gate (its first speech frame IS
+        the quiet head) and trimming would skew the other way. Returns the
+        number of 40 ms frames trimmed.
+        """
+        if not self._config.onset_gate_mirror_enabled:
+            return 0
+        threshold = self._config.onset_gate_min_rms * 32768.0
+        trigger_rms = rms_int16(trigger.audio_bytes)
+        if trigger_rms is None or trigger_rms < threshold:
+            return 0
+        use_resampled = len(buf.resampled_head) >= BYTES_PER_FRAME
+        src: "bytearray | bytes" = buf.resampled_head if use_resampled else buf.bytes_
+        frame_bytes = BYTES_PER_FRAME if use_resampled else self._buf_frame_bytes(buf)
+        if frame_bytes <= 0:
+            return 0
+        dropped = 0
+        while dropped < self._config.onset_gate_max_frames:
+            window = bytes(src[dropped * frame_bytes : (dropped + 1) * frame_bytes])
+            if len(window) < frame_bytes:
+                break
+            window_rms = rms_int16(window)
+            if window_rms is None or window_rms >= threshold:
+                break
+            dropped += 1
+        if dropped:
+            buf_frame_bytes = self._buf_frame_bytes(buf)
+            del buf.bytes_[: min(dropped * buf_frame_bytes, len(buf.bytes_))]
+            del buf.resampled_head[: dropped * BYTES_PER_FRAME]
+        return dropped
+
     def align_current_buffer_to_frame(self, align_to_frame: VideoFrame) -> int:
         """Shift the buffer head so it lines up with the server's frame timeline.
 
@@ -469,6 +522,11 @@ class Synchronizer:
         if buf_frame_bytes <= 0:
             return 0
 
+        # Deterministic onset-gate mirror first; the envelope matcher below
+        # then only resolves residual skew on the trimmed head. Ordering also
+        # means a deferred alignment snapshots the post-trim head.
+        mirror_trim = self._mirror_onset_gate_trim(buf, align_to_frame)
+
         rms_seq: list[float] = []
         for f in [align_to_frame] + [
             f for f in list(self.video_frames) if not f.is_silence()
@@ -485,7 +543,9 @@ class Synchronizer:
         )
         head = bytes(buf.bytes_[: snap_frames * buf_frame_bytes])
         if anchor_rms is not None:
-            return self._match_and_apply(anchor_rms, lead_silent, head, buf_frame_bytes)
+            return mirror_trim + self._match_and_apply(
+                anchor_rms, lead_silent, head, buf_frame_bytes
+            )
         if starved and rms_seq:
             # Not enough audible frames yet — snapshot the head and gather
             # anchors from the next ticks' pops. Seed with the trigger only:
@@ -498,7 +558,7 @@ class Synchronizer:
                 buf_frame_bytes=buf_frame_bytes,
                 rms_seq=rms_seq[:1],
             )
-        return 0
+        return mirror_trim
 
     @staticmethod
     def _best_alignment_offset(

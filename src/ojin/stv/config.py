@@ -32,6 +32,19 @@ class STVConfig:
     align_audio_on_swap: bool = True
     align_audio_max_frames: int = 50
 
+    # Onset-gate mirror. The inference server's audible-onset gate drops a
+    # turn's leading sub-threshold speech frames so its first emitted speech
+    # frame is the first audible one (cpp pipeline, OJ_AUDIBLE_ONSET_GATE).
+    # The client plays its own TTS buffer, so those dropped frames must be
+    # trimmed here too or the whole turn plays with video one frame ahead of
+    # audio per gated frame (staging session 06ad7dcd, turn @66.38s: constant
+    # 40 ms video lead). At swap, leading buffer frames below the same RMS
+    # threshold are trimmed with the same budget/stop rules as the server
+    # gate. Disable ONLY together with the server's gate kill switch.
+    onset_gate_mirror_enabled: bool = True
+    onset_gate_min_rms: float = 0.01  # fraction of int16 full scale (server parity)
+    onset_gate_max_frames: int = 12  # server OJ_ONSET_GATE_MAX_FRAMES parity
+
     # Mid-speech video-repeat catch-up. When speech audio drains on a tick with
     # no fresh video frame (a delivery stall), the shown frame repeats and the
     # video timeline falls 40 ms behind the audio — permanently, since only one

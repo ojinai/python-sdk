@@ -506,8 +506,10 @@ def test_deferred_align_fires_after_anchors_arrive() -> None:
     s = make_sync(initial_buffer_frames=0)
     s.current_buffer = AudioBuffer(sample_rate=16000)  # drained → replaceable
     s.open_turn()
-    # Buffer: 1 near-zero frame the server dropped, then distinct loud frames.
-    rms_buf = [0, 5000, 12000, 15000, 9000, 6000, 13000, 8000, 11000, 7000]
+    # Buffer: 1 quiet head frame the server dropped, then distinct loud frames.
+    # Quiet but ABOVE the onset-gate threshold (~328), so the deterministic
+    # mirror stays out of the way and the deferred matcher is what fixes it.
+    rms_buf = [1280, 5000, 12000, 15000, 9000, 6000, 13000, 8000, 11000, 7000]
     s.audio_buffers[-1].bytes_.extend(b"".join(pcm_frame(v) for v in rms_buf))
     before = len(s.audio_buffers[-1].bytes_)
     # Server frames arrive one per tick, starting at the buffer's 2nd frame
@@ -645,3 +647,80 @@ def test_ambiguous_match_shifts_nothing() -> None:
     cur = s.current_buffer
     assert cur is not None
     assert len(cur.bytes_) == before - 5 * FB  # only the 5 drained chunks
+
+
+# ----------------------------------------------------------------------
+# Onset-gate mirror (staging session 06ad7dcd, trace 63b3715b, turn @66.38s)
+# ----------------------------------------------------------------------
+
+# The server's audible-onset gate retyped the turn's sub-threshold head frame
+# (RMS 1.4) to IDLE and the pacer dropped it (f1600, pad_trim_speech_ready), so
+# the wire started at the buffer's 2nd frame. The envelope matcher found the
+# true offset d=1 but rejected it: the sibilant windows ("It s-ounds") lose ~5x
+# RMS in the 16 kHz wire audio vs the 24 kHz buffer, busting the tolerance cap
+# and margin. The deterministic mirror must trim the head regardless.
+TURN3_BUFFER = [1.4, 8263, 4461, 7041, 4680, 11352, 11172, 13149, 14960, 8319]
+TURN3_FRAMES = [8258, 4204, 1239, 1092, 11350, 11169, 13147]
+
+
+def test_onset_gate_mirror_trims_gated_head_turn3() -> None:
+    """Session 06ad7dcd turn @66.38s: mirror trims the gated head at the swap."""
+    shifts = _run_session_entry(TURN3_BUFFER, TURN3_FRAMES, trigger_type=3)
+    assert shifts[0] == +1  # deterministic, at the swap tick
+    assert all(v == 0 for v in shifts[1:])  # matcher adds no bogus residual
+
+
+def test_onset_gate_mirror_prefers_resampled_head() -> None:
+    """The mirror classifies the 16 kHz copy but trims the original-rate bytes."""
+    s = make_sync(initial_buffer_frames=0)
+    s.current_buffer = AudioBuffer(sample_rate=16000)
+    buf = s.open_turn()
+    fb24 = int(24000 * (1 / 25)) * 2  # 1920 bytes per 40 ms frame @ 24 kHz
+    s.add_audio(pcm_frame(100, fb24) + pcm_frame(8000, fb24) * 6, 24000, 1)
+    s.note_resampled_audio(buf, pcm_frame(100) + pcm_frame(8000) * 6)
+    before = len(buf.bytes_)
+    s.video_frames.append(vf(3, audio=pcm_frame(8000)))
+    r = s.tick()
+    assert r.swapped is True and r.align_trim_frames == +1
+    cur = s.current_buffer
+    assert cur is not None
+    # One 24 kHz frame trimmed + one 24 kHz chunk drained by the tick itself.
+    assert len(cur.bytes_) == before - 2 * fb24
+    assert len(cur.resampled_head) == 6 * FB
+
+
+def test_onset_gate_mirror_respects_budget() -> None:
+    """The mirror never trims more than the server gate's frame budget."""
+    s = make_sync(initial_buffer_frames=0)
+    s.current_buffer = AudioBuffer(sample_rate=16000)
+    s.open_turn()
+    s.add_audio(pcm_frame(10) * 14 + pcm_frame(9000) * 6, 16000, 1)
+    s.video_frames.append(vf(3, audio=pcm_frame(9000)))
+    r = s.tick()
+    assert r.swapped is True and r.align_trim_frames == 12  # budget parity
+
+
+def test_onset_gate_mirror_skips_quiet_trigger() -> None:
+    """A sub-threshold trigger frame means the server did not gate — no trim."""
+    s = make_sync(initial_buffer_frames=0)
+    s.current_buffer = AudioBuffer(sample_rate=16000)
+    s.open_turn()
+    s.add_audio(pcm_frame(10) * 2 + pcm_frame(9000) * 6, 16000, 1)
+    before = len(s.audio_buffers[-1].bytes_)
+    s.video_frames.append(vf(3, audio=pcm_frame(10)))
+    r = s.tick()
+    assert r.swapped is True and r.align_trim_frames == 0
+    cur = s.current_buffer
+    assert cur is not None
+    assert len(cur.bytes_) == before - FB  # only the tick's own drain
+
+
+def test_onset_gate_mirror_disabled_by_config() -> None:
+    """onset_gate_mirror_enabled=False restores envelope-matcher-only behavior."""
+    s = make_sync(initial_buffer_frames=0, onset_gate_mirror_enabled=False)
+    s.current_buffer = AudioBuffer(sample_rate=16000)
+    s.open_turn()
+    s.audio_buffers[-1].bytes_.extend(b"".join(pcm_frame(v) for v in TURN3_BUFFER))
+    s.video_frames.append(vf(3, audio=pcm_frame(TURN3_FRAMES[0])))
+    r = s.tick()
+    assert r.swapped is True and r.align_trim_frames == 0
