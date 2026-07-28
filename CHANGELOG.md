@@ -4,6 +4,52 @@ All notable changes to `ojin-client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0 — see CONTRIBUTING.md).
 
+## 0.10.0 - 2026-07-24
+
+### Changed
+- **BREAKING — direct-WebRTC protocol v2** (DR-006 incl. the 2026-07-24
+  amendment; lockstep with inference-server 0.12.0 and inference-proxy
+  0.7.0): negotiation collapses into the connect exchange.
+  `OjinSTVWebRTCClient` declares its `WebRTCSettings` in the WebSocket
+  **upgrade request** — non-secret fields as URL-encoded query params
+  (`webrtc_version`, `webrtc_provider`, `webrtc_room_url`,
+  `webrtc_audio_sample_rate`, alongside `config_id`) and the meeting token
+  in the `X-Ojin-Webrtc-Token` header (same query/header split as
+  `Authorization`; headers stay out of access logs). The proxy merges them
+  verbatim into `sessionSetup.payload.parameters.webrtc` of the setup it
+  authors; the client reads the outcome from
+  `sessionReady.payload.parameters.webrtc`:
+  - `status: "connected"` → direct mode from the first frame (all
+    `interactionResponse` frames are 38-byte metadata frames; the v1
+    pre-connected legacy-frame window no longer exists);
+  - `status: "failed"` → fatal `STVEvent.ERROR(WEBRTC_JOIN_FAILED)` (error
+    codes `INVALID_SETTINGS`, `AUTH`, `NETWORK`);
+  - **absent key** → graceful fallback to relay mode (log + trace telemetry
+    only). This **removes** v1's client-fatal `WEBRTC_UNSUPPORTED`: a server
+    kill switch or an unsupporting server degrades instead of erroring.
+- The v1 machinery is removed: no capability-advertisement gate, no webrtc
+  `sessionUpdate` send, no REQUESTED/awaiting-ack states, no separate
+  buffer-until-`connected` window (the existing "no audio before
+  `sessionReady`" rule covers the rate-switch boundary; the declared
+  `audio_sample_rate` applies to the whole connection). `sessionUpdate`
+  reverts to legacy-only semantics (persona re-activation).
+- `webrtc_join_timeout_s` now governs the **whole `sessionReady` wait** (the
+  server joins the room during setup); expiry is fatal as before.
+- Inbound `webrtcStatus` survives only as an async post-connect notification:
+  `disconnected` (telemetry) then `failed(REJOIN_FAILED)` (fatal, fail-fast
+  no-rejoin policy unchanged).
+
+### Added
+- `WebRTCSettings.version` (default `2`), plus the connect-declaration
+  helpers `to_connect_query_params()` (non-secret `webrtc_*` params; never
+  includes the token or `webrtc_join_timeout_s`) and `to_connect_headers()`
+  (the `X-Ojin-Webrtc-Token` header). The token is never logged, never in
+  `repr`, and never enters a URL.
+- `OjinClient.set_webrtc_connect_settings(...)`: `connect()` then builds the
+  upgrade URL with the URL-encoded `webrtc_*` query params and attaches the
+  token header; the existing `Authorization`/`config_id` mechanism is
+  untouched and no first message is sent.
+
 ## 0.9.0 - 2026-07-12
 
 ### Changed

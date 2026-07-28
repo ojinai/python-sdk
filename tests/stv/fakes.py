@@ -3,11 +3,16 @@
 from __future__ import annotations
 
 import asyncio
-from typing import List, Optional
+import inspect
+from typing import Callable, List, Optional
 
 from pydantic import BaseModel
 
-from ojin.ojin_client_messages import IOjinClient, OjinSessionReadyMessage
+from ojin.ojin_client_messages import (
+    IOjinClient,
+    OjinSessionReadyMessage,
+    OjinWebRTCStatusMessage,
+)
 from ojin.stv.events import STVEvent
 from ojin.stv.frames import STVAudioFrame, STVVideoFrame
 
@@ -34,6 +39,12 @@ class FakeOjinClient(IOjinClient):
         self._session_parameters = session_parameters or {"persona": "test"}
         self._raise_on_connect = raise_on_connect
         self.queue_depths: dict[str, int] = {}
+        self.webrtc_status_callback: Optional[
+            Callable[[OjinWebRTCStatusMessage], object]
+        ] = None
+        # WebRTC settings declared for the connect exchange (protocol v2:
+        # webrtc_* query params + token header on the upgrade request).
+        self.webrtc_connect_settings: object | None = None
 
     async def connect(self) -> None:
         """Mark connected and enqueue a SessionReady message (or fail)."""
@@ -43,6 +54,10 @@ class FakeOjinClient(IOjinClient):
         await self._queue.put(
             OjinSessionReadyMessage(parameters=self._session_parameters)
         )
+
+    def set_webrtc_connect_settings(self, settings: object) -> None:
+        """Record the declared webrtc settings, mirroring the real OjinClient."""
+        self.webrtc_connect_settings = settings
 
     async def send_message(self, message: BaseModel) -> None:
         """Record an outgoing message."""
@@ -65,6 +80,20 @@ class FakeOjinClient(IOjinClient):
         """Test helper: enqueue a server message for the receive loop."""
         await self._queue.put(message)
 
+    def set_webrtc_status_callback(
+        self, callback: Callable[[OjinWebRTCStatusMessage], object]
+    ) -> None:
+        """Register the webrtcStatus handler, mirroring the real OjinClient."""
+        self.webrtc_status_callback = callback
+
+    async def push_webrtc_status(self, payload: dict) -> None:
+        """Test helper: parse a status payload and invoke the callback inline."""
+        callback = self.webrtc_status_callback
+        assert callback is not None, "no webrtcStatus callback registered"
+        result = callback(OjinWebRTCStatusMessage(**payload))
+        if inspect.isawaitable(result):
+            await result
+
     def debug_queue_depths(self) -> dict[str, int]:
         """Return canned receive-pipeline depths for trace-forwarding assertions."""
         return dict(self.queue_depths)
@@ -79,6 +108,7 @@ class RecordingTracer:
         self.instants: List[tuple] = []
         self.spans: List[tuple] = []
         self.counters: List[tuple] = []
+        self.other: dict = {}
         self._t = 0.0
 
     def instant(self, lane, name, *, cat="", args=None) -> None:
@@ -107,6 +137,10 @@ class RecordingTracer:
         """Record a response-latency span and return a fake ms value."""
         self.spans.append(("response", f"latency_{kind}", start_us, args or {}))
         return 0.0
+
+    def set_other_data(self, key, value) -> None:
+        """Record an otherData entry (mirrors OjinSessionTrace)."""
+        self.other[key] = value
 
 
 class ListOutput:

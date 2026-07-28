@@ -23,6 +23,8 @@ class STVEvent(Enum):
     """Lifecycle/state events emitted by :class:`OjinSTVClient`."""
 
     SESSION_READY = "session_ready"  # args: session_data
+    WEBRTC_CONNECTED = "webrtc_connected"  # args: participant_id
+    FIRST_FRAME = "first_frame"  # args: frame_type
     BOT_STARTED_SPEAKING = "bot_started_speaking"
     BOT_STOPPED_SPEAKING = "bot_stopped_speaking"
     INTERRUPTED = "interrupted"

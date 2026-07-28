@@ -3,12 +3,17 @@
 import array
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import socket
 import struct
 import time
-from typing import Dict, Optional, Type, TypeVar
+from typing import TYPE_CHECKING, Callable, Dict, Optional, Type, TypeVar
+from urllib.parse import urlencode
+
+if TYPE_CHECKING:  # annotation only — avoid a runtime ojin -> ojin.stv cycle
+    from ojin.stv.config import WebRTCSettings
 
 try:  # FIONREAD socket probe is Unix-only; absent on Windows.
     import fcntl
@@ -35,6 +40,7 @@ from ojin.entities.interaction_messages import (
     InteractionInputMessage,
     InteractionResponseMessage,
 )
+from ojin.entities.session_messages import SessionUpdateMessage
 from ojin.ojin_client_messages import (
     IOjinClient,
     OjinAudioInputMessage,
@@ -45,6 +51,7 @@ from ojin.ojin_client_messages import (
     OjinSessionReadyMessage,
     OjinSessionReadyPing,
     OjinTextInputMessage,
+    OjinWebRTCStatusMessage,
 )
 
 T = TypeVar("T", bound=OjinMessage)
@@ -181,6 +188,39 @@ class OjinClient(IOjinClient):
         )
         self._mode: str | None = mode
         self._pending_first_input: bool = False
+        self._webrtc_status_callback: Optional[
+            Callable[[OjinWebRTCStatusMessage], object]
+        ] = None
+        # Direct-WebRTC settings declared in the WebSocket upgrade request
+        # (protocol v2, DR-006 as amended 2026-07-24): non-secret fields as
+        # webrtc_* query params, the meeting token as the X-Ojin-Webrtc-Token
+        # header. Carries a secret — never log it.
+        self._webrtc_settings: Optional["WebRTCSettings"] = None
+
+    def set_webrtc_connect_settings(self, settings: "WebRTCSettings") -> None:
+        """Declare direct-WebRTC settings for the connection's upgrade request.
+
+        Protocol v2 (DR-006, 2026-07-24 amendment): the proxy authors the
+        ``sessionSetup`` the server sees, so the client's request travels in
+        the WebSocket UPGRADE REQUEST itself — ``webrtc_*`` query params for
+        the non-secret fields and the ``X-Ojin-Webrtc-Token`` header for the
+        meeting token (same query/header split as ``config_id`` /
+        ``Authorization``; headers stay out of access logs). Must be called
+        before :meth:`connect`. The token is never placed in the URL and
+        never logged.
+        """
+        self._webrtc_settings = settings
+
+    def set_webrtc_status_callback(
+        self, callback: Callable[[OjinWebRTCStatusMessage], object]
+    ) -> None:
+        """Register the handler invoked inline for each ``webrtcStatus`` message.
+
+        The callback (sync or async) is called from the receive loop; statuses
+        are never enqueued on the drainable response queue, so a cancel-time
+        drain can never drop one.
+        """
+        self._webrtc_status_callback = callback
 
     async def connect(self) -> None:
         """Establish WebSocket connection and authenticate with the service."""
@@ -193,12 +233,7 @@ class OjinClient(IOjinClient):
 
         while attempt < self.reconnect_attempts:
             try:
-                headers = {"Authorization": f"{self.api_key}"}
-
-                # Add query parameters for API key and config ID
-                url = f"{self.ws_url}?config_id={self.config_id}"
-                if self._mode == "dev":
-                    url = f"{url}&mode={self._mode}"
+                url, headers = self._build_connect_request()
                 self._ws = await websockets.connect(
                     url,
                     additional_headers=headers,
@@ -237,6 +272,24 @@ class OjinClient(IOjinClient):
 
         logger.error("Failed to connect after %d attempts", self.reconnect_attempts)
         raise ConnectionError(f"Failed to connect to OJIN STV service: {last_error}")
+
+    def _build_connect_request(self) -> tuple[str, Dict[str, str]]:
+        """Build the WebSocket upgrade URL and headers.
+
+        Direct-WebRTC settings (when declared) ride the upgrade request per
+        protocol v2: non-secret fields as URL-encoded ``webrtc_*`` query
+        params, the meeting token as the ``X-Ojin-Webrtc-Token`` header. The
+        token never enters the URL, and neither the URL nor the headers are
+        logged.
+        """
+        headers: Dict[str, str] = {"Authorization": f"{self.api_key}"}
+        url = f"{self.ws_url}?config_id={self.config_id}"
+        if self._mode == "dev":
+            url = f"{url}&mode={self._mode}"
+        if self._webrtc_settings is not None:
+            url = f"{url}&{urlencode(self._webrtc_settings.to_connect_query_params())}"
+            headers.update(self._webrtc_settings.to_connect_headers())
+        return url, headers
 
     async def close(self) -> None:
         """Close the WebSocket connection."""
@@ -373,6 +426,10 @@ class OjinClient(IOjinClient):
                 return
             msg_type = data.get("type")
 
+            if msg_type == "webrtcStatus":
+                await self._dispatch_webrtc_status(data)
+                return
+
             # Map message types to their corresponding classes
             message_types: Dict[str, Type[BaseModel]] = {
                 "sessionReady": OjinSessionReadyMessage,
@@ -408,6 +465,25 @@ class OjinClient(IOjinClient):
         except Exception as e:
             logger.exception("Error handling message: %s", e)
             raise RuntimeError(e) from e
+
+    async def _dispatch_webrtc_status(self, data: dict) -> None:
+        """Parse a ``webrtcStatus`` message and deliver it to the callback.
+
+        Parse and dispatch share one try/except: neither a malformed payload
+        nor a throwing callback may escape into the receive loop's fatal
+        error path.
+        """
+        try:
+            status = OjinWebRTCStatusMessage(**(data.get("payload") or {}))
+            callback = self._webrtc_status_callback
+            if callback is None:
+                logger.warning("webrtcStatus received with no callback registered")
+                return
+            result = callback(status)
+            if inspect.isawaitable(result):
+                await result
+        except Exception:
+            logger.exception("Error handling webrtcStatus message — dropped")
 
     async def start_interaction(self) -> None:
         """Drain any pending response messages before starting a new interaction."""
@@ -458,6 +534,10 @@ class OjinClient(IOjinClient):
 
             self._cancelled = False
 
+            return
+
+        if isinstance(message, SessionUpdateMessage):
+            await self._ws.send(message.model_dump_json())
             return
 
         if isinstance(

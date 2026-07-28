@@ -4,13 +4,41 @@ import asyncio
 import contextlib
 import json
 
+import pytest
+
 from ojin.entities.interaction_messages import ErrorResponseMessage
+from ojin.entities.session_messages import SessionUpdateMessage, SessionUpdatePayload
 from ojin.ojin_client import OjinClient
 from ojin.ojin_client_messages import (
+    FrameType,
     OjinAudioInputMessage,
     OjinCancelInteractionMessage,
+    OjinInteractionResponseMessage,
     OjinSessionReadyMessage,
+    OjinWebRTCStatusMessage,
 )
+
+# Canonical webrtcStatus wire literals (parent design §1.3, protocol v2). In
+# v2 the message survives only as an async post-connect notification — a
+# mid-session room drop is ``disconnected`` then ``failed(REJOIN_FAILED)``;
+# parser drift from these shapes must fail here.
+WEBRTC_STATUS_DISCONNECTED = {
+    "type": "webrtcStatus",
+    "payload": {
+        "status": "disconnected",
+        "provider": "daily",
+        "timestamp": 1789000000000,
+    },
+}
+WEBRTC_STATUS_FAILED = {
+    "type": "webrtcStatus",
+    "payload": {
+        "status": "failed",
+        "provider": "daily",
+        "error": {"code": "REJOIN_FAILED", "message": "publisher dropped"},
+        "timestamp": 1789000000000,
+    },
+}
 
 
 def _client() -> OjinClient:
@@ -303,3 +331,220 @@ def test_debug_queue_depths_never_raises_on_broken_internals() -> None:
         "server_msgs": 0,
         "ingress_bytes_total": 0,
     }
+
+
+# ----------------------------------------------------------------------
+# Direct-WebRTC (protocol v2): connect-time declaration + webrtcStatus
+# inbound, plus the legacy-only sessionUpdate outbound branch
+# ----------------------------------------------------------------------
+
+ROOM_URL = "https://ojin.daily.co/room-1"
+TOKEN = "tok-secret"
+
+
+def _webrtc_settings():
+    """Build direct-WebRTC settings for connect-declaration tests."""
+    from ojin.stv.config import WebRTCSettings
+
+    return WebRTCSettings(room_url=ROOM_URL, token=TOKEN)
+
+
+def test_connect_request_pins_webrtc_query_params_and_token_header() -> None:
+    """The upgrade request carries the pinned webrtc_* params + token header.
+
+    Protocol v2 (DR-006, 2026-07-24 amendment): the proxy authors the
+    sessionSetup, so the client's request travels in the WebSocket upgrade
+    request — URL-encoded query params for the non-secret fields, the
+    X-Ojin-Webrtc-Token header for the token.
+    """
+    client = _client()
+    client.set_webrtc_connect_settings(_webrtc_settings())
+
+    url, headers = client._build_connect_request()
+
+    assert url == (
+        "ws://test/realtime?config_id=c"
+        "&webrtc_version=2"
+        "&webrtc_provider=daily"
+        "&webrtc_room_url=https%3A%2F%2Fojin.daily.co%2Froom-1"
+        "&webrtc_audio_sample_rate=16000"
+    )
+    assert headers == {
+        "Authorization": "k",  # existing credential mechanism untouched
+        "X-Ojin-Webrtc-Token": TOKEN,
+    }
+    assert TOKEN not in url  # the token never enters a URL
+
+
+def test_connect_request_without_webrtc_settings_is_unchanged() -> None:
+    """Without declared settings the legacy URL/header shape is byte-identical."""
+    client = _client()
+    url, headers = client._build_connect_request()
+    assert url == "ws://test/realtime?config_id=c"
+    assert headers == {"Authorization": "k"}
+
+
+def test_connect_request_keeps_dev_mode_param_with_webrtc() -> None:
+    """The dev-mode query flag composes with the webrtc params."""
+    client = OjinClient(
+        ws_url="ws://test/realtime", api_key="k", config_id="c", mode="dev"
+    )
+    client.set_webrtc_connect_settings(_webrtc_settings())
+    url, _headers = client._build_connect_request()
+    assert url.startswith("ws://test/realtime?config_id=c&mode=dev&webrtc_version=2")
+
+
+def test_connect_request_building_never_logs_the_token(caplog) -> None:
+    """Building the upgrade request emits no log carrying the token."""
+    import logging
+
+    client = _client()
+    client.set_webrtc_connect_settings(_webrtc_settings())
+    with caplog.at_level(logging.DEBUG):
+        client._build_connect_request()
+    for record in caplog.records:
+        assert TOKEN not in record.getMessage()
+
+
+def _legacy_session_update() -> SessionUpdateMessage:
+    """Build a legacy persona-re-activation sessionUpdate (v2: the only kind)."""
+    return SessionUpdateMessage(
+        payload=SessionUpdatePayload(
+            parameters={"persona_id": "persona-1"},
+            timestamp=1789000000000,
+        )
+    )
+
+
+async def test_session_update_sent_verbatim_post_ready() -> None:
+    """A SessionUpdateMessage is serialized and sent directly on the socket.
+
+    Protocol v2 reverted sessionUpdate to legacy-only semantics (persona
+    re-activation); the transport branch stays for that use.
+    """
+    client = _client()
+    client._running = True
+    client._inference_server_ready = True
+    client._ws = _FakeWS()  # type: ignore[assignment]
+
+    await client.send_message(_legacy_session_update())
+
+    assert len(client._ws.sent) == 1
+    assert json.loads(client._ws.sent[0]) == {
+        "type": "sessionUpdate",
+        "payload": {
+            "parameters": {"persona_id": "persona-1"},
+            "timestamp": 1789000000000,
+        },
+    }
+    # It bypasses the paced client-message queue like the cancel branch does.
+    assert client._pending_client_messages_queue.qsize() == 0
+
+
+async def test_session_update_gated_before_ready() -> None:
+    """The sessionUpdate branch honors the existing readiness gates."""
+    client = _client()
+    client._running = True
+    client._inference_server_ready = False
+    client._ws = _FakeWS()  # type: ignore[assignment]
+
+    with pytest.raises(ConnectionError):
+        await client.send_message(_legacy_session_update())
+    assert client._ws.sent == []
+
+
+async def test_webrtc_status_routed_to_callback_never_queued() -> None:
+    """A webrtcStatus goes to the registered callback, not the response queue."""
+    client = _client()
+    received: list[OjinWebRTCStatusMessage] = []
+
+    async def on_status(status: OjinWebRTCStatusMessage) -> None:
+        received.append(status)
+
+    client.set_webrtc_status_callback(on_status)
+    await client._handle_server_message(json.dumps(WEBRTC_STATUS_DISCONNECTED))
+
+    assert len(received) == 1
+    status = received[0]
+    assert status.status == "disconnected"
+    assert status.provider == "daily"
+    assert status.participant_id is None
+    assert status.error is None
+    assert client._available_response_messages_queue.empty()
+
+    # The receive path survives and later messages are still delivered.
+    payload = {"type": "sessionReady", "payload": {"parameters": {"persona": "x"}}}
+    await client._handle_server_message(json.dumps(payload))
+    msg = client._available_response_messages_queue.get_nowait()
+    assert isinstance(msg, OjinSessionReadyMessage)
+
+
+async def test_webrtc_status_throwing_callback_is_contained(caplog) -> None:
+    """A throwing status callback is caught and logged; the loop survives."""
+
+    def on_status(status: OjinWebRTCStatusMessage) -> None:
+        raise ValueError("handler boom")
+
+    client = _client()
+    client.set_webrtc_status_callback(on_status)
+    await client._handle_server_message(json.dumps(WEBRTC_STATUS_FAILED))  # no raise
+
+    assert client._available_response_messages_queue.empty()
+    assert any("webrtcStatus" in record.message for record in caplog.records)
+
+    payload = {"type": "sessionReady", "payload": {"parameters": {"persona": "x"}}}
+    await client._handle_server_message(json.dumps(payload))
+    assert isinstance(
+        client._available_response_messages_queue.get_nowait(), OjinSessionReadyMessage
+    )
+
+
+async def test_webrtc_status_without_callback_is_dropped_quietly() -> None:
+    """With no callback registered, a status is parsed and dropped, no raise."""
+    client = _client()
+    await client._handle_server_message(json.dumps(WEBRTC_STATUS_DISCONNECTED))
+    assert client._available_response_messages_queue.empty()
+
+
+async def test_webrtc_status_survives_cancel_drain() -> None:
+    """A cancel's response-queue drain cannot lose an already-delivered status.
+
+    The drain is real: an interaction response seeded into the drainable queue
+    is discarded by the cancel, proving the callback-delivered status survived
+    precisely because it never entered that queue.
+    """
+    client = _client()
+    client._running = True
+    client._inference_server_ready = True
+    client._ws = _FakeWS()  # type: ignore[assignment]
+    received: list[OjinWebRTCStatusMessage] = []
+
+    def on_status(status: OjinWebRTCStatusMessage) -> None:
+        received.append(status)
+
+    client.set_webrtc_status_callback(on_status)
+    # An interaction response is sitting in the drainable queue; the status is
+    # delivered out-of-band via the callback.
+    seeded_response = OjinInteractionResponseMessage(
+        interaction_id="i1",
+        video_frame_bytes=b"",
+        audio_frame_bytes=b"\x00\x00" * 320,
+        is_final_response=False,
+        index=0,
+        frame_type=FrameType.SPEECH,
+    )
+    client._available_response_messages_queue.put_nowait(seeded_response)
+    await client._handle_server_message(json.dumps(WEBRTC_STATUS_FAILED))
+    assert client._available_response_messages_queue.qsize() == 1  # only the seed
+    # A barge-in fires before any consumer runs: cancel drains the queue.
+    await client.send_message(OjinCancelInteractionMessage())
+
+    assert len(received) == 1
+    assert received[0].status == "failed"
+    assert received[0].error == {
+        "code": "REJOIN_FAILED",
+        "message": "publisher dropped",
+    }
+    # The seeded interaction response was drained by the cancel; the status,
+    # delivered via the callback, was never at risk.
+    assert client._available_response_messages_queue.empty()
