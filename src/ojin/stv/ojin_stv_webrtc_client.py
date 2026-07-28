@@ -1,13 +1,27 @@
 """High-level Ojin STV client for direct-WebRTC sessions (no local playback).
 
 ``OjinSTVWebRTCClient`` negotiates direct WebRTC publishing with the inference
-server over the existing WebSocket control channel: it sends a ``webrtc``
-``sessionUpdate`` when the server advertises the capability, drives its state
-machine from ``webrtcStatus`` replies, and — once connected — feeds TTS audio
-through the shared outbound-feed machinery while the server publishes A/V into
-the room itself. The server's 38-byte metadata frames replace local playback as
-the signal layer: they advance the lead-gate clock, acknowledge barge-ins, and
-derive the speaking/first-frame events.
+server at connect time (protocol v2, DR-006 as amended 2026-07-24): the
+settings are declared in the WebSocket **upgrade request** (``webrtc_*`` query
+params + the ``X-Ojin-Webrtc-Token`` header), the proxy merges them verbatim
+into the ``sessionSetup.payload.parameters.webrtc`` it authors, and the server
+reports the outcome inside ``sessionReady.payload.parameters.webrtc`` after
+joining the room concurrently with model activation. One round trip, no
+capability advertisement, no post-ready ack:
+
+- ``status: "connected"`` — direct mode from the first frame: the server
+  publishes A/V into the room and every ``interactionResponse`` is a 38-byte
+  metadata frame. Those frames replace local playback as the signal layer:
+  they advance the lead-gate clock, acknowledge barge-ins, and derive the
+  speaking/first-frame events.
+- ``status: "failed"`` — fatal (``WEBRTC_JOIN_FAILED``): credentials were
+  supplied and a real error occurred; silent fallback would mask breakage.
+- absent ``webrtc`` key — graceful fallback to **relay mode** (the server
+  doesn't support direct mode); the session continues as a legacy relay
+  session. This replaces v1's client-fatal ``WEBRTC_UNSUPPORTED``.
+
+``webrtcStatus`` survives only as an async post-connect notification
+(mid-session room drop: ``disconnected`` then ``failed(REJOIN_FAILED)``).
 
 Typical use::
 
@@ -32,7 +46,6 @@ from typing import Callable, Optional
 from pydantic import BaseModel
 
 from ojin.entities.interaction_messages import ErrorResponseMessage
-from ojin.entities.session_messages import SessionUpdateMessage, SessionUpdatePayload
 from ojin.ojin_client import OjinClient
 from ojin.ojin_client_messages import (
     FrameType,
@@ -59,17 +72,21 @@ _WATCHDOG_POLL_S = 1.0
 _SPEECH_TYPES = (int(FrameType.SPEECH), int(FrameType.START_OF_SPEECH))
 _SILENCE_TYPES = (int(FrameType.IDLE), int(FrameType.FADE_OUT))
 
-WEBRTC_UNSUPPORTED = "WEBRTC_UNSUPPORTED"
 WEBRTC_JOIN_FAILED = "WEBRTC_JOIN_FAILED"
 
 
-class _NegotiationState(Enum):
-    """Client-side webrtc negotiation states."""
+class _DirectState(Enum):
+    """Client-side direct-path states (protocol v2 — one negotiation, at setup).
 
-    IDLE = "idle"
-    REQUESTED = "requested"
+    ``PENDING`` covers the whole ``sessionReady`` wait (the request rode the
+    ``sessionSetup``); the outcome inside ``sessionReady`` resolves it to
+    ``CONNECTED`` (direct mode), ``RELAY`` (graceful fallback — the server
+    doesn't support direct mode), or ``FAILED`` (fatal).
+    """
+
+    PENDING = "pending"
     CONNECTED = "connected"
-    UNSUPPORTED = "unsupported"
+    RELAY = "relay"
     FAILED = "failed"
 
 
@@ -93,12 +110,16 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         """Create a client; pass your own transport/resampler/tracer as needed.
 
         ``webrtc_settings`` carries the room credentials the server needs to
-        join; ``token`` is never logged and never appears in traces. Input sent
-        via :meth:`start_turn` / :meth:`send_tts_audio` before the server
-        reports ``connected`` is held client-side (when
+        join; ``token`` is never logged and never appears in traces or URLs.
+        The settings are declared in the connection's upgrade request
+        (``webrtc_*`` query params + token header, protocol v2) — the
+        transport must support :meth:`OjinClient.set_webrtc_connect_settings`.
+        Input sent via :meth:`start_turn` / :meth:`send_tts_audio` before the
+        ``sessionReady`` outcome arrives is held client-side (when
         ``buffer_preinit_tts_audio`` is ``True``) and replayed at that moment;
-        nothing is ever sent on the wire during negotiation. ``clock`` is a
-        monotonic seconds source, injectable for deterministic timer tests.
+        nothing is ever sent on the wire while the outcome is pending.
+        ``clock`` is a monotonic seconds source, injectable for deterministic
+        timer tests.
         """
         super().__init__()
         self._config = config or STVConfig()
@@ -125,7 +146,7 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         )
 
         self._session_data: Optional[dict] = None
-        self._state = _NegotiationState.IDLE
+        self._state = _DirectState.PENDING
         self._receive_task: Optional[asyncio.Task] = None
         self._join_timer_task: Optional[asyncio.Task] = None
         self._watchdog_task: Optional[asyncio.Task] = None
@@ -160,7 +181,21 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         else:
             logger.warning(
                 "transport has no set_webrtc_status_callback — "
-                "webrtcStatus replies will never reach this client"
+                "webrtcStatus notifications will never reach this client"
+            )
+        # Protocol v2 (amended): the webrtc request rides the WebSocket
+        # upgrade request (webrtc_* query params + X-Ojin-Webrtc-Token
+        # header), so the transport must know the settings before connect().
+        # They contain the meeting token — the transport must never log them
+        # or place the token in a URL.
+        declare = getattr(self._client, "set_webrtc_connect_settings", None)
+        if callable(declare):
+            declare(self._webrtc_settings)
+        else:
+            logger.warning(
+                "transport has no set_webrtc_connect_settings — the webrtc "
+                "request cannot ride the connect exchange; the session will "
+                "fall back to relay mode"
             )
 
     # ------------------------------------------------------------------
@@ -215,12 +250,22 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         return False
 
     async def start(self) -> None:
-        """Connect the control channel and run the receive loop."""
+        """Connect the control channel and run the receive loop.
+
+        The webrtc request rides the connect exchange itself (declared on the
+        transport at construction), so once the connection is up the
+        negotiation is already in flight: the join timer armed here governs
+        the whole ``sessionReady`` wait (``webrtc_join_timeout_s``).
+        """
         self._tr_session_start = self._tracer.mark()
         self._tr_connect_start = self._tr_session_start
         if not await self.connect_with_retry():
             await self.close()
             return
+        self._request_sent_at = self._clock()
+        self._tr_negotiate_start = self._tracer.mark()
+        self._tracer.instant("webrtc", "request_sent")
+        self._join_timer_task = asyncio.create_task(self._join_timer())
         self._receive_task = asyncio.create_task(self._receive_loop())
         await self._client.start_interaction()
 
@@ -247,9 +292,10 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         if was_initialized:
             self._tracer.span("lifecycle", "session", self._tr_session_start)
         await self._stop_feed_tasks()
-        # Flush the owed tail only when the direct path actually opened; before
-        # `connected` the wire must stay silent even through teardown.
-        if was_initialized and self._state is _NegotiationState.CONNECTED:
+        # Flush the owed tail only when a path actually opened (direct or
+        # relay); while the outcome was pending the wire must stay silent even
+        # through teardown.
+        if was_initialized and self._path_open():
             await self._flush_outbound_tail()
         try:
             await self._client.close()
@@ -266,9 +312,13 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
     # Input — turn + audio + interrupt (cores; guards live in the mixin)
     # ------------------------------------------------------------------
 
+    def _path_open(self) -> bool:
+        """Whether the sessionReady outcome opened a path (direct or relay)."""
+        return self._state in (_DirectState.CONNECTED, _DirectState.RELAY)
+
     def _feed_gate_open(self) -> bool:
-        """Input flows only once the server has confirmed the direct path."""
-        return self._initialized and self._state is _NegotiationState.CONNECTED
+        """Input flows only once sessionReady resolved the path (either mode)."""
+        return self._initialized and self._path_open()
 
     async def _start_turn_core(self) -> None:
         """Open the next turn's bookkeeping and flush the prior turn's tail."""
@@ -315,11 +365,12 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
     async def interrupt(self) -> bool:
         """Barge-in: cancel the current turn server-side if it is speaking.
 
-        Before ``connected`` nothing was ever sent, so a barge-in only clears
-        the held input and reports INTERRUPTED locally — no wire cancel, no
-        ack-suppression window. Once connected, this mirrors the legacy client:
-        the window stays open from the cancel until the server's first
-        idle/fade-out metadata frame acknowledges it.
+        Before the ``sessionReady`` outcome nothing was ever sent, so a
+        barge-in only clears the held input and reports INTERRUPTED locally —
+        no wire cancel, no ack-suppression window. Once the path is open
+        (direct or relay), this mirrors the legacy client: the window stays
+        open from the cancel until the server's first idle/fade-out frame
+        acknowledges it.
         """
         if self._interruption_ongoing:
             self._tracer.instant("interruption", "interrupt_suppressed")
@@ -401,87 +452,43 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
             await self.close()
 
     async def _on_session_ready(self, message: OjinSessionReadyMessage) -> None:
-        """Emit SESSION_READY, then gate on the capability advert."""
+        """Emit SESSION_READY, then resolve the connect-time webrtc outcome.
+
+        Protocol v2 (DR-006): the request rode ``sessionSetup``; the server
+        reports the join outcome inside ``sessionReady.parameters.webrtc`` —
+        ``connected`` (direct mode), ``failed`` (fatal), or an absent key
+        (graceful relay fallback).
+        """
         if message.parameters is not None:
             self._session_data = message.parameters
         self._initialized = True
         self._tracer.span("lifecycle", "connect", self._tr_connect_start)
         await self._events.emit(STVEvent.SESSION_READY, session_data=self._session_data)
-        if self._state is not _NegotiationState.IDLE:
-            return  # one negotiation per session
-        capability = (message.parameters or {}).get("webrtc")
-        if not isinstance(capability, dict):
-            self._state = _NegotiationState.UNSUPPORTED
-            self._discard_held_input()
-            self._tracer.instant("webrtc", "capability_absent")
-            await self._events.emit(
-                STVEvent.ERROR,
-                message="Server did not advertise the webrtc capability",
-                code=WEBRTC_UNSUPPORTED,
-                fatal=True,
-            )
+        if self._state is not _DirectState.PENDING:
+            return  # one negotiation per connection — already resolved
+        self._cancel_join_timer()
+        result = (message.parameters or {}).get("webrtc")
+        if not isinstance(result, dict):
+            await self._enter_relay_fallback("absent")
             return
-        await self._send_webrtc_request()
-
-    async def _send_webrtc_request(self) -> None:
-        """Send the webrtc sessionUpdate and arm the join timer."""
-        settings = self._webrtc_settings
-        request = SessionUpdateMessage(
-            payload=SessionUpdatePayload(
-                parameters={
-                    "webrtc": {
-                        "version": 1,
-                        "provider": settings.provider,
-                        "room_url": settings.room_url,
-                        "token": settings.token,
-                        "audio_sample_rate": settings.audio_sample_rate,
-                    }
-                },
-                timestamp=int(time.time() * 1000),
-            )
-        )
-        self._state = _NegotiationState.REQUESTED
-        self._request_sent_at = self._clock()
-        self._tr_negotiate_start = self._tracer.mark()
-        await self._client.send_message(request)
-        self._tracer.instant("webrtc", "request_sent")
-        self._join_timer_task = asyncio.create_task(self._join_timer())
-
-    # ------------------------------------------------------------------
-    # Negotiation state machine
-    # ------------------------------------------------------------------
-
-    async def _on_webrtc_status(self, status: OjinWebRTCStatusMessage) -> None:
-        """Advance the negotiation state machine from one webrtcStatus reply."""
-        error = status.error or {}
-        error_code = str(error.get("code") or "")
-        args: dict = {"status": status.status}
-        if error_code:
-            args["error_code"] = error_code
-        self._tracer.instant("webrtc", "webrtc_status", args=args)
-        if status.status == "connecting":
-            return  # not terminal: the join timer keeps running
-        if status.status == "connected":
-            await self._on_webrtc_connected(status)
-        elif status.status == "failed":
-            await self._on_webrtc_failed(status, error_code)
-        elif status.status == "disconnected":
-            logger.warning(
-                "webrtc transport disconnected (provider=%s)", status.provider
+        status = str(result.get("status") or "")
+        if status == "connected":
+            await self._on_direct_connected(result)
+        elif status == "failed":
+            error = result.get("error") or {}
+            await self._fail_direct(
+                str(error.get("code") or ""),
+                str(error.get("message") or ""),
+                outcome="failed",
             )
         else:
-            logger.warning("Unknown webrtcStatus status: %s", status.status)
+            await self._enter_relay_fallback(f"unknown status {status!r}")
 
-    async def _on_webrtc_connected(self, status: OjinWebRTCStatusMessage) -> None:
+    async def _on_direct_connected(self, result: dict) -> None:
         """Open the direct path: start feed tasks and flush held input (no seed)."""
-        if self._state is not _NegotiationState.REQUESTED:
-            logger.warning(
-                "webrtcStatus connected in state %s — ignored", self._state.value
-            )
-            return
-        self._cancel_join_timer()
-        self._state = _NegotiationState.CONNECTED
+        self._state = _DirectState.CONNECTED
         join_ms = round((self._clock() - self._request_sent_at) * 1000.0, 1)
+        participant_id = str(result.get("participant_id") or "")
         if self._tr_negotiate_start is not None:
             self._tracer.span(
                 "webrtc",
@@ -493,9 +500,12 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         self._set_trace_other(
             "webrtc",
             {
-                "provider": status.provider or self._webrtc_settings.provider,
+                "mode": "direct",
+                "provider": str(
+                    result.get("provider") or self._webrtc_settings.provider
+                ),
                 "join_ms": join_ms,
-                "participant_id": status.participant_id or "",
+                "participant_id": participant_id,
             },
         )
         self._first_frame_pending = True
@@ -504,46 +514,108 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         if self._watchdog_task is None:
             self._watchdog_task = asyncio.create_task(self._metadata_watchdog_loop())
         await self._events.emit(
-            STVEvent.WEBRTC_CONNECTED, participant_id=status.participant_id
+            STVEvent.WEBRTC_CONNECTED, participant_id=participant_id or None
         )
         await self._flush_preinit_inputs()
 
-    async def _on_webrtc_failed(
-        self, status: OjinWebRTCStatusMessage, error_code: str
-    ) -> None:
-        """Handle a terminal failure, pre- or post-connected — always fatal."""
-        if self._state in (_NegotiationState.FAILED, _NegotiationState.UNSUPPORTED):
+    async def _enter_relay_fallback(self, reason: str) -> None:
+        """Continue as a legacy relay session — telemetry, never an error.
+
+        Replaces v1's client-fatal ``WEBRTC_UNSUPPORTED``: a server without
+        direct support (kill switch, ``max_capacity != 1``, old server) omits
+        the ``webrtc`` result key and the session proceeds with full-payload
+        relay frames. This client still has no local playback — frames are
+        processed for their signal value (clock, speaking edges, ack) only.
+        """
+        self._state = _DirectState.RELAY
+        logger.warning(
+            "No webrtc result in sessionReady (%s) — continuing in relay mode",
+            reason,
+        )
+        if self._tr_negotiate_start is not None:
+            self._tracer.span(
+                "webrtc",
+                "negotiate",
+                self._tr_negotiate_start,
+                args={"outcome": "relay", "reason": reason},
+            )
+            self._tr_negotiate_start = None
+        self._tracer.instant("webrtc", "relay_fallback", args={"reason": reason})
+        self._set_trace_other("webrtc", {"mode": "relay", "reason": reason})
+        self._first_frame_pending = True
+        self._last_metadata_at = self._clock()
+        self._start_feed_tasks()
+        await self._flush_preinit_inputs()
+
+    # ------------------------------------------------------------------
+    # Failure paths + async post-connect notifications
+    # ------------------------------------------------------------------
+
+    async def _fail_direct(self, error_code: str, detail: str, outcome: str) -> None:
+        """Terminal direct-path failure — always fatal (fail-fast, no rejoin)."""
+        if self._state is _DirectState.FAILED:
             return
         self._cancel_join_timer()
-        self._state = _NegotiationState.FAILED
+        self._state = _DirectState.FAILED
         self._discard_held_input()
         if self._tr_negotiate_start is not None:
             self._tracer.span(
                 "webrtc",
                 "negotiate",
                 self._tr_negotiate_start,
-                args={"outcome": "failed", "error_code": error_code},
+                args={"outcome": outcome, "error_code": error_code},
             )
             self._tr_negotiate_start = None
-        message = str((status.error or {}).get("message") or "")
         await self._events.emit(
             STVEvent.ERROR,
             message=f"webrtc negotiation failed ({error_code or 'unknown'})"
-            + (f": {message}" if message else ""),
+            + (f": {detail}" if detail else ""),
             code=WEBRTC_JOIN_FAILED,
             fatal=True,
         )
 
+    async def _on_webrtc_status(self, status: OjinWebRTCStatusMessage) -> None:
+        """Handle an async post-connect ``webrtcStatus`` notification.
+
+        Protocol v2 demoted ``webrtcStatus`` to mid-session transitions only:
+        ``disconnected`` (telemetry) then ``failed`` with ``REJOIN_FAILED``
+        (fatal — the v1 fail-fast, no-rejoin policy is unchanged). The
+        negotiation-phase statuses (``connecting``/``connected``) no longer
+        exist on the wire.
+        """
+        error = status.error or {}
+        error_code = str(error.get("code") or "")
+        args: dict = {"status": status.status}
+        if error_code:
+            args["error_code"] = error_code
+        self._tracer.instant("webrtc", "webrtc_status", args=args)
+        if status.status == "failed":
+            await self._fail_direct(
+                error_code, str(error.get("message") or ""), outcome="failed"
+            )
+        elif status.status == "disconnected":
+            logger.warning(
+                "webrtc transport disconnected (provider=%s)", status.provider
+            )
+        else:
+            logger.warning(
+                "Unexpected webrtcStatus %r in protocol v2 — ignored", status.status
+            )
+
     async def _join_timer(self) -> None:
-        """Fire the join timeout unless a terminal status lands first."""
+        """Fire the sessionReady timeout unless the outcome lands first."""
         await asyncio.sleep(self._webrtc_settings.webrtc_join_timeout_s)
         await self._handle_join_timeout()
 
     async def _handle_join_timeout(self) -> None:
-        """Fail the negotiation if no terminal status arrived in time."""
-        if self._state is not _NegotiationState.REQUESTED:
+        """Fail the session if no sessionReady arrived within the join timeout.
+
+        In v2 the server joins the room during setup, so
+        ``webrtc_join_timeout_s`` governs the whole ``sessionReady`` wait.
+        """
+        if self._state is not _DirectState.PENDING:
             return
-        self._state = _NegotiationState.FAILED
+        self._state = _DirectState.FAILED
         self._discard_held_input()
         if self._tr_negotiate_start is not None:
             self._tracer.span(
@@ -557,7 +629,7 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         await self._events.emit(
             STVEvent.ERROR,
             message=(
-                f"No terminal webrtcStatus within "
+                f"No sessionReady within "
                 f"{self._webrtc_settings.webrtc_join_timeout_s} s"
             ),
             code=WEBRTC_JOIN_FAILED,
@@ -600,8 +672,8 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         self, message: OjinInteractionResponseMessage
     ) -> None:
         """Process one frame: discard payloads, derive clock/events from metadata."""
-        if self._state is not _NegotiationState.CONNECTED:
-            return  # pre-connected frames: parsed and discarded, nothing else
+        if not self._path_open():
+            return  # frames before the sessionReady outcome: parsed, discarded
         self._last_metadata_at = self._clock()
         frame_type = int(message.frame_type)
         if not self._validate_frame_type(frame_type):
@@ -668,7 +740,7 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
 
     def _check_metadata_watchdog(self) -> bool:
         """Log when no metadata frame arrived within the watchdog window."""
-        if self._state is not _NegotiationState.CONNECTED or not self._initialized:
+        if self._state is not _DirectState.CONNECTED or not self._initialized:
             return False
         gap_s = self._clock() - self._last_metadata_at
         if gap_s < _METADATA_WATCHDOG_S:

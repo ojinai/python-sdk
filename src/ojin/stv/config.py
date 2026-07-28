@@ -17,11 +17,20 @@ _FRAMES_PER_SECOND = 25
 
 @dataclass
 class WebRTCSettings:
-    """Room credentials + knobs for the direct-WebRTC negotiation.
+    """Room credentials + knobs for the direct-WebRTC negotiation (protocol v2).
 
-    ``token`` is excluded from ``repr`` and must never be logged.
-    ``webrtc_join_timeout_s`` is client-local and is never serialized into the
-    ``sessionUpdate`` payload.
+    The settings are declared in the WebSocket **upgrade request** (DR-006 as
+    amended 2026-07-24): the non-secret fields ride ``webrtc_*`` query params
+    (:meth:`to_connect_query_params`) and the meeting token rides the
+    ``X-Ojin-Webrtc-Token`` header (:meth:`to_connect_headers`) — mirroring
+    how the ``Authorization`` credential already travels; headers stay out of
+    access logs. The proxy merges them verbatim into ``parameters.webrtc`` of
+    the ``sessionSetup`` it authors.
+
+    ``token`` is excluded from ``repr``, must never be logged, and never
+    appears in a URL. ``webrtc_join_timeout_s`` is client-local and is never
+    serialized; in v2 it governs the whole ``sessionReady`` wait (the server
+    joins the room during setup, so there is no separate ack to time).
     """
 
     room_url: str
@@ -29,6 +38,29 @@ class WebRTCSettings:
     provider: str = "daily"
     audio_sample_rate: int = 16000
     webrtc_join_timeout_s: float = 10.0
+    version: int = 2
+
+    def to_connect_query_params(self) -> dict:
+        """Return the non-secret ``webrtc_*`` query params for the connect URL.
+
+        Values are strings ready for URL-encoding. The ``token`` is
+        deliberately absent — a URL lands in access logs; the token travels
+        via :meth:`to_connect_headers` instead. ``webrtc_join_timeout_s`` is
+        likewise absent (client-local, never serialized).
+        """
+        return {
+            "webrtc_version": str(self.version),
+            "webrtc_provider": self.provider,
+            "webrtc_room_url": self.room_url,
+            "webrtc_audio_sample_rate": str(self.audio_sample_rate),
+        }
+
+    def to_connect_headers(self) -> dict:
+        """Return the secret-bearing connect headers (the meeting token).
+
+        The result contains the ``token`` — never log it.
+        """
+        return {"X-Ojin-Webrtc-Token": self.token}
 
     def __post_init__(self) -> None:
         """Reject a feed rate that would misframe the 40 ms slice or divide by zero.
