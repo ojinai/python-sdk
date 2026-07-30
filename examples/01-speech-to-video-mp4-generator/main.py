@@ -1,18 +1,19 @@
-"""Generate a talking-avatar MP4 (with audio) from a WAV file via the Ojin STV model.
+"""Generate a talking-avatar MP4 (with audio) from an audio file via the Ojin STV model.
 
 Usage:
-    python main.py [INPUT.wav] [OUTPUT.mp4]
+    python main.py [INPUT.wav|INPUT.mp3|...] [OUTPUT.mp4]
 
-Reads mono 16-bit PCM speech audio, drives an Ojin avatar with it, and writes a
-lip-synced MP4 with the original audio muxed in. Needs OJIN_API_KEY and
-OJIN_CONFIG_ID — the preflight prints how to get them if they're missing.
+Reads speech audio (WAV, MP3, M4A, ... — anything ffmpeg can open), drives an Ojin
+avatar with it, and writes a lip-synced MP4 with the original audio muxed in. Needs
+OJIN_API_KEY and OJIN_CONFIG_ID — the preflight prints how to get them if they're
+missing.
 """
 
 import asyncio
 import pathlib
 import sys
-import wave
 
+from audio_input import AudioDecodeError, load_audio
 from mp4_writer import Mp4Writer
 
 from ojin import MissingCredentialsError, load_env, resolve_credentials
@@ -21,28 +22,29 @@ from ojin.stv import OjinSTVClient, QueueOutput, STVEvent, STVVideoFrame
 FPS = 25
 
 
-def read_mono_wav(path: pathlib.Path) -> tuple[bytes, int]:
-    """Read a mono 16-bit PCM WAV as (pcm_bytes, sample_rate), or exit with a hint."""
+def read_audio(path: pathlib.Path) -> tuple[bytes, int]:
+    """Read any audio file as mono 16-bit (pcm_bytes, sample_rate), or exit with a hint."""
     if not path.exists():
         sys.exit(
             f"\n  No audio file at '{path}'.\n"
-            "  Pass one:  python main.py myvoice.wav\n"
-            "  Need a WAV? Convert anything with ffmpeg:\n"
-            f"    ffmpeg -i input.mp3 -ac 1 -ar 16000 {path}\n"
+            "  Pass one:  python main.py myvoice.mp3\n"
+            "  WAV, MP3, M4A, FLAC, OGG — anything ffmpeg can read works.\n"
         )
-    with wave.open(str(path), "rb") as wav:
-        if wav.getnchannels() != 1 or wav.getsampwidth() != 2:
-            sys.exit(
-                f"\n  '{path}' must be MONO 16-bit PCM. Convert it:\n"
-                f"    ffmpeg -i '{path}' -ac 1 -ar 16000 mono.wav\n"
-            )
-        return wav.readframes(wav.getnframes()), wav.getframerate()
+    try:
+        return load_audio(path)
+    except AudioDecodeError as exc:
+        sys.exit(
+            f"\n  Could not read any audio out of '{path}':\n"
+            f"    {exc}\n"
+            "  Is it really an audio file? Try converting it first:\n"
+            f"    ffmpeg -i '{path}' -ac 1 -ar 16000 speech.wav\n"
+        )
 
 
 async def render(
-    creds, pcm: bytes, rate: int, wav_path: pathlib.Path, out: pathlib.Path
+    creds, pcm: bytes, rate: int, audio_path: pathlib.Path, out: pathlib.Path
 ) -> None:
-    """Drive the avatar with `pcm` and write its frames + `wav_path` audio to `out`."""
+    """Drive the avatar with `pcm` and write its frames + `audio_path` audio to `out`."""
     seconds = len(pcm) / (rate * 2)  # mono 16-bit, for the finish timeout
     ready, done, error = asyncio.Event(), asyncio.Event(), {}
     writer: Mp4Writer | None = None
@@ -94,7 +96,11 @@ async def render(
                     if writer is None:
                         # Size the MP4 to whatever the server sends (first frame wins).
                         writer = Mp4Writer(
-                            out, frame.width, frame.height, fps=FPS, audio_wav=wav_path
+                            out,
+                            frame.width,
+                            frame.height,
+                            fps=FPS,
+                            audio_path=audio_path,
                         )
                     writer.write(frame.rgb)
                     print(
@@ -141,7 +147,7 @@ def main() -> None:
 
     in_path = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "input.wav")
     out_path = pathlib.Path(sys.argv[2] if len(sys.argv) > 2 else "output.mp4")
-    pcm, rate = read_mono_wav(in_path)
+    pcm, rate = read_audio(in_path)
 
     seconds = len(pcm) / (rate * 2)
     print(f"  Driving Face model '{creds.config_id}' with {seconds:.1f}s of audio...")

@@ -1,6 +1,6 @@
 # 01 · Speech-To-Video MP4 Generator
 
-Turn a WAV file of speech into a lip-synced talking-avatar **MP4** with the Ojin
+Turn an audio file of speech into a lip-synced talking-avatar **MP4** with the Ojin
 Speech-To-Video model. The smallest end-to-end example: one audio file in, one
 video file out.
 
@@ -12,7 +12,8 @@ video file out.
    - a **Face model** to drive, and its **config id** → `OJIN_CONFIG_ID`
 
    Don't have these yet? Just run the script — it prints exactly where to get them.
-3. **A mono 16-bit WAV** of speech (defaults to `input.wav`).
+3. **An audio file** of speech — WAV, MP3, M4A, FLAC, OGG, anything ffmpeg reads
+   (defaults to `input.wav`).
 
 ## Setup
 
@@ -43,14 +44,17 @@ cp .env.example .env
 
 ```bash
 python main.py                       # input.wav  ->  output.mp4
-python main.py myvoice.wav clip.mp4  # custom paths
+python main.py myvoice.mp3 clip.mp4  # custom paths, any audio format
 ```
 
 ## How it works
 
-- `main.py` reads the WAV, opens an `OjinSTVClient`, sends the audio with `say()`,
-  and streams the returned RGB frames to the writer — a few dozen lines of logic.
-- `mp4_writer.py` muxes those frames **and the original WAV** into a single MP4
+- `main.py` reads the audio, opens an `OjinSTVClient`, sends it with `say()`, and
+  streams the returned RGB frames to the writer — a few dozen lines of logic.
+- `audio_input.py` hands mono 16-bit WAVs straight to the SDK and runs everything
+  else (MP3, stereo, other sample rates) through ffmpeg first — the model is fed
+  mono 16 kHz PCM either way.
+- `mp4_writer.py` muxes those frames **and the original audio** into a single MP4
   with sound, using [imageio-ffmpeg](https://github.com/imageio/imageio-ffmpeg)
   (it ships its own ffmpeg binary, so there's nothing else to install).
 
