@@ -127,7 +127,7 @@ class STVConfig:
     # payloads are split) and spaces consecutive sends ``server_feed_send_gap_ms``
     # apart — but ONLY while a backlog remains, so steady-state realtime streaming is
     # never delayed. Both are passed to OjinClient at construction.
-    server_feed_max_chunk_bytes: int = 1024 * 50
+    server_feed_max_chunk_bytes: int = 1024 * 200
     server_feed_send_gap_ms: int = 200
     # Server-feed lead cap: never ship audio more than this far ahead of local
     # playback. The server renders at ~1x realtime, so sending a long answer's
