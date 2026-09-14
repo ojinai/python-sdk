@@ -1,7 +1,8 @@
-"""OjinSTVWebRTCClient protocol-v2 negotiation: setup embedding + ready outcome.
+"""OjinSTVWebRTCClient protocol-v2 negotiation: connect declaration + ready outcome.
 
-Protocol v2 (DR-006): the webrtc request rides ``sessionSetup.parameters`` —
-the connection's first message — and the server reports the outcome inside
+Protocol v2 (DR-006 as amended 2026-07-24): the webrtc request rides the
+WebSocket upgrade request (``webrtc_*`` query params + the
+``X-Ojin-Webrtc-Token`` header) and the server reports the outcome inside
 ``sessionReady.parameters.webrtc``. All wire inputs here are the canonical
 pinned literals from the direct-webrtc design, shared verbatim with the
 server-side suites so emitter and parser drift are both unrepresentable
@@ -54,8 +55,8 @@ READY_FAILED_PARAMETERS = {
         "error": {"code": "AUTH", "message": "token rejected"},
     }
 }
-# A server without direct-webrtc support omits the key entirely (relay mode).
-READY_RELAY_PARAMETERS = {"persona": "x"}
+# A server without direct-webrtc support omits the key entirely.
+READY_UNSUPPORTED_PARAMETERS = {"persona": "x"}
 
 
 def make_client(session_parameters=None, tracer=None, **config_overrides):
@@ -146,14 +147,15 @@ async def test_connected_result_opens_direct_mode_and_flushes_held_input() -> No
     await client.close()
 
 
-async def test_failed_result_is_fatal_and_discards_held_input() -> None:
-    """status=failed maps to a fatal WEBRTC_JOIN_FAILED (fail-fast retained)."""
+async def test_failed_result_is_fatal_discards_held_input_and_closes() -> None:
+    """status=failed maps to a fatal WEBRTC_JOIN_FAILED, then the session closes."""
     client, fake_client, _tracer = make_client(
         session_parameters=READY_FAILED_PARAMETERS,
         server_feed_batching_enabled=False,
     )
     errors = _record(client, STVEvent.ERROR)
     connected = _record(client, STVEvent.WEBRTC_CONNECTED)
+    closed = _record(client, STVEvent.CLOSED)
     await client.start_turn()
     await client.send_tts_audio(b"\x01\x02" * 640, 16000, 1)
 
@@ -167,47 +169,47 @@ async def test_failed_result_is_fatal_and_discards_held_input() -> None:
     assert connected == []
     assert client._preinit_inputs == []  # held input discarded, never sent
     assert _audio_messages(fake_client) == []
-    await client.close()
+    # The failure closed the session on its own.
+    assert closed == [{}]
+    assert fake_client.closed is True
+    assert client.is_connected is False
+    await client.close()  # idempotent: no second teardown
+    assert closed == [{}]
 
 
-async def test_absent_key_falls_back_to_relay_nonfatal(caplog) -> None:
-    """No webrtc result key → graceful relay fallback, NOT an error.
+async def test_absent_key_is_fatal_unsupported() -> None:
+    """No webrtc result key → fatal WEBRTC_UNSUPPORTED; nothing sent, closed.
 
-    This replaces v1's client-fatal WEBRTC_UNSUPPORTED: the session continues
-    as a legacy relay session — the feed opens and held input flushes — with
-    only log + trace telemetry surfacing the fallback.
+    The caller asked for WebRTC; a server that cannot publish into the room
+    would otherwise leave the room with no avatar and nothing pointing at why.
     """
     client, fake_client, tracer = make_client(
-        session_parameters=READY_RELAY_PARAMETERS,
+        session_parameters=READY_UNSUPPORTED_PARAMETERS,
         server_feed_batching_enabled=False,
     )
     errors = _record(client, STVEvent.ERROR)
     connected = _record(client, STVEvent.WEBRTC_CONNECTED)
-    ready = _record(client, STVEvent.SESSION_READY)
-    chunk_16k = b"\x01\x02" * 640
+    closed = _record(client, STVEvent.CLOSED)
     await client.start_turn()
-    await client.send_tts_audio(chunk_16k, 16000, 1)
+    await client.send_tts_audio(b"\x01\x02" * 640, 16000, 1)
 
-    with caplog.at_level(logging.WARNING):
-        await client.start()
-        await asyncio.sleep(0.05)
+    await client.start()
+    await asyncio.sleep(0.05)
 
-    assert errors == []  # pinned: relay fallback is non-fatal
-    assert connected == []  # the direct path never opened
-    assert len(ready) == 1
-    # The session continues: the held input flushed onto the relay session.
-    assert [m.audio_int16_bytes for m in _audio_messages(fake_client)] == [chunk_16k]
-    # Telemetry surfaces the fallback.
-    assert any("relay mode" in record.message for record in caplog.records)
-    assert ("relay_fallback", {"reason": "absent"}) in [
+    assert len(errors) == 1
+    assert errors[0]["code"] == "WEBRTC_UNSUPPORTED"
+    assert errors[0]["fatal"] is True
+    assert connected == []
+    assert _audio_messages(fake_client) == []  # held input never replayed
+    assert closed == [{}]
+    assert ("unsupported", {"reason": "sessionReady carried no webrtc result"}) in [
         (name, args) for (lane, name, args) in tracer.instants if lane == "webrtc"
     ]
-    assert tracer.other["webrtc"] == {"mode": "relay", "reason": "absent"}
     await client.close()
 
 
-async def test_unknown_result_status_falls_back_to_relay() -> None:
-    """A webrtc result with an unrecognized status degrades to relay, not fatal."""
+async def test_unknown_result_status_is_fatal_unsupported() -> None:
+    """A webrtc result with an unrecognized status is reported, not ignored."""
     client, _fake_client, _tracer = make_client(
         session_parameters={"webrtc": {"version": 2, "status": "connecting"}},
         server_feed_batching_enabled=False,
@@ -216,21 +218,24 @@ async def test_unknown_result_status_falls_back_to_relay() -> None:
     await client.start()
     await asyncio.sleep(0.05)
 
-    assert errors == []
-    assert client._feed_gate_open() is True
+    assert [e["code"] for e in errors] == ["WEBRTC_UNSUPPORTED"]
+    assert "connecting" in errors[0]["message"]
+    assert client._feed_gate_open() is False
     await client.close()
 
 
-async def test_no_session_ready_within_timeout_is_fatal() -> None:
+async def test_no_session_ready_within_timeout_is_fatal_and_closes() -> None:
     """The join timer governs the whole sessionReady wait; expiry is fatal."""
     client, fake_client, _tracer = make_client(server_feed_batching_enabled=False)
     errors = _record(client, STVEvent.ERROR)
+    closed = _record(client, STVEvent.CLOSED)
     await client.start_turn()
     await client.send_tts_audio(b"\x01\x02" * 640, 16000, 1)
 
     # Arm the timer as start() does, but resolve nothing (no sessionReady).
     client._request_sent_at = 0.0
     await client._handle_join_timeout()
+    await asyncio.sleep(0.01)
 
     assert len(errors) == 1
     assert errors[0]["code"] == "WEBRTC_JOIN_FAILED"
@@ -238,22 +243,43 @@ async def test_no_session_ready_within_timeout_is_fatal() -> None:
     assert "sessionReady" in errors[0]["message"]
     assert client._preinit_inputs == []  # held input discarded on timeout
     assert _audio_messages(fake_client) == []
+    assert closed == [{}]
+    await client.close()
+    assert closed == [{}]
+
+
+async def test_session_ready_after_timeout_is_ignored() -> None:
+    """A sessionReady landing after the timeout fired cannot revive the session."""
+    client, _fake_client, _tracer = make_client(server_feed_batching_enabled=False)
+    ready = _record(client, STVEvent.SESSION_READY)
+    connected = _record(client, STVEvent.WEBRTC_CONNECTED)
+    await client._handle_join_timeout()
+
+    await client._handle_message(
+        OjinSessionReadyMessage(parameters=READY_CONNECTED_PARAMETERS)
+    )
+
+    assert ready == []
+    assert connected == []
+    assert client.is_connected is False
     await client.close()
 
 
 async def test_second_session_ready_never_renegotiates() -> None:
     """One negotiation per connection: a later sessionReady changes nothing."""
     client, _fake_client, tracer = make_client()
+    errors = _record(client, STVEvent.ERROR)
     await client.start()
     await asyncio.sleep(0.05)
     assert client._state.value == "connected"
 
     await client._handle_message(
-        OjinSessionReadyMessage(parameters=READY_RELAY_PARAMETERS)
+        OjinSessionReadyMessage(parameters=READY_UNSUPPORTED_PARAMETERS)
     )
-    assert client._state.value == "connected"  # not demoted to relay
+    assert client._state.value == "connected"  # not demoted
+    assert errors == []
     assert not any(
-        name == "relay_fallback"
+        name == "unsupported"
         for (lane, name, _args) in tracer.instants
         if lane == "webrtc"
     )
@@ -288,7 +314,7 @@ async def test_token_never_in_logs_or_traces_any_outcome(caplog) -> None:
     for parameters in (
         READY_CONNECTED_PARAMETERS,
         READY_FAILED_PARAMETERS,
-        READY_RELAY_PARAMETERS,
+        READY_UNSUPPORTED_PARAMETERS,
     ):
         client, _fake_client, tracer = make_client(session_parameters=parameters)
         with caplog.at_level(logging.DEBUG):

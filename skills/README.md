@@ -21,6 +21,10 @@ when your transport is Pipecat. The same pattern (inject a custom output sink, f
 `send_tts_audio()`) is designed to adapt to LiveKit Agents or any other framework —
 though Pipecat is the only one with a reference adapter shipped so far.
 
+If your users are already in a **Daily** or **LiveKit** room, both skills also cover
+**direct WebRTC**: pass `webrtc=WebRTCSettings(...)` and Ojin publishes the avatar
+straight into the room, with the rest of the integration unchanged.
+
 ## Using them
 
 **Claude Code / Claude Agent SDK:** copy a skill folder into your project's

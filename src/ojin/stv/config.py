@@ -9,15 +9,43 @@ client constructor, not here.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from enum import Enum
 
 _MIN_AUDIO_SAMPLE_RATE = 8000
 _MAX_AUDIO_SAMPLE_RATE = 48000
 _FRAMES_PER_SECOND = 25
 
 
+class WebRTCProvider(str, Enum):
+    """WebRTC room providers the inference server can publish the avatar into."""
+
+    DAILY = "daily"
+    LIVEKIT = "livekit"
+
+    def __str__(self) -> str:
+        """Return the wire value (``"daily"`` / ``"livekit"``)."""
+        return self.value
+
+
 @dataclass
 class WebRTCSettings:
-    """Room credentials + knobs for the direct-WebRTC negotiation (protocol v2).
+    """Room credentials + knobs for a direct-WebRTC session (protocol v2).
+
+    Pass these as ``OjinSTVClient(webrtc=...)``: the inference server joins
+    the room as the ``ojin-avatar`` participant and publishes the avatar's
+    audio and video there, so your viewers watch it directly in the room.
+
+    - **Daily** — ``room_url`` is the room URL
+      (``https://<domain>.daily.co/<room>``) and ``token`` a meeting token for
+      that room.
+    - **LiveKit** — ``room_url`` is the LiveKit server URL
+      (``wss://<project>.livekit.cloud``) and ``token`` an access token whose
+      identity is ``ojin-avatar``, granted publish-only rights (camera and
+      microphone) for the room.
+
+    Set ``audio_sample_rate`` to the rate your TTS emits to avoid resampling.
+    ``webrtc_join_timeout_s`` bounds the whole wait for the session to become
+    ready — the room join *and* a model cold start — so leave headroom.
 
     The settings are declared in the WebSocket **upgrade request** (DR-006 as
     amended 2026-07-24): the non-secret fields ride ``webrtc_*`` query params
@@ -29,13 +57,12 @@ class WebRTCSettings:
 
     ``token`` is excluded from ``repr``, must never be logged, and never
     appears in a URL. ``webrtc_join_timeout_s`` is client-local and is never
-    serialized; in v2 it governs the whole ``sessionReady`` wait (the server
-    joins the room during setup, so there is no separate ack to time).
+    serialized.
     """
 
     room_url: str
     token: str = field(repr=False)
-    provider: str = "daily"
+    provider: WebRTCProvider | str = WebRTCProvider.DAILY
     audio_sample_rate: int = 16000
     webrtc_join_timeout_s: float = 10.0
     version: int = 2
@@ -50,7 +77,7 @@ class WebRTCSettings:
         """
         return {
             "webrtc_version": str(self.version),
-            "webrtc_provider": self.provider,
+            "webrtc_provider": str(self.provider),
             "webrtc_room_url": self.room_url,
             "webrtc_audio_sample_rate": str(self.audio_sample_rate),
         }
@@ -63,11 +90,28 @@ class WebRTCSettings:
         return {"X-Ojin-Webrtc-Token": self.token}
 
     def __post_init__(self) -> None:
-        """Reject a feed rate that would misframe the 40 ms slice or divide by zero.
+        """Validate provider, credentials, timeout and feed rate at construction.
 
-        The server is the authority on rate acceptance, but this is a public
-        dataclass — fail here rather than deep in the outbound loop.
+        The server is the authority on acceptance, but this is a public
+        dataclass — fail here with a clear message rather than as a failed room
+        join, or deep in the outbound loop (a feed rate that would misframe the
+        40 ms slice or divide by zero).
         """
+        try:
+            self.provider = WebRTCProvider(str(self.provider).strip().lower())
+        except ValueError:
+            known = ", ".join(p.value for p in WebRTCProvider)
+            raise ValueError(
+                f"provider must be one of: {known}; got {self.provider!r}"
+            ) from None
+        if not self.room_url or not self.room_url.strip():
+            raise ValueError("room_url must not be empty")
+        if not self.token:
+            raise ValueError("token must not be empty")
+        if self.webrtc_join_timeout_s <= 0:
+            raise ValueError(
+                f"webrtc_join_timeout_s must be > 0, got {self.webrtc_join_timeout_s}"
+            )
         rate = self.audio_sample_rate
         if not _MIN_AUDIO_SAMPLE_RATE <= rate <= _MAX_AUDIO_SAMPLE_RATE or (
             rate % _FRAMES_PER_SECOND

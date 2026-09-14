@@ -13,6 +13,7 @@ It's the same client that powers Ojin's own [Pipecat](https://github.com/pipecat
 
 - 🗣️ **One image → a persona.** Drive any avatar configuration from your Ojin account by its `config_id`.
 - ⚡ **Real-time by design.** TCP_NODELAY, off-loop JPEG decode, and an audio-as-clock loop emit a steady 25 fps A/V stream.
+- 📡 **WebSocket or direct WebRTC.** Get frames back over a WebSocket, or have the avatar published straight into your **Daily** or **LiveKit** room — one argument, same code.
 - 🔌 **Framework-agnostic.** No Pipecat, no LiveKit, no web framework required. Drop it into anything async.
 - 🎚️ **Interruptible.** First-class barge-in with audio fade and server-side cancel re-sync.
 - 🧩 **Swappable internals.** Bring your own transport, resampler, JPEG decoder, output sink, or tracer behind small protocols.
@@ -25,7 +26,7 @@ It's the same client that powers Ojin's own [Pipecat](https://github.com/pipecat
 |---|---|---|
 | Import | `from ojin.stv import OjinSTVClient` | `from ojin.ojin_client import OjinClient` |
 | You give it | TTS audio at **any** sample rate | 16 kHz mono `int16` PCM |
-| It gives you | Synced `STVAudioFrame` + `STVVideoFrame` on a 25 fps clock | Raw `OjinInteractionResponseMessage` (JPEG + PCM) |
+| It gives you | Synced `STVAudioFrame` + `STVVideoFrame` on a 25 fps clock — or, with [direct WebRTC](#direct-webrtc-daily--livekit), the avatar live in your Daily/LiveKit room | Raw `OjinInteractionResponseMessage` (JPEG + PCM) |
 | Handles for you | Buffering, playback clock, resampling, interruption re-sync, decode | Just the WebSocket + wire protocol |
 | Extra deps | `ojin-client[stv]` (numpy / opencv-python-headless / soxr) | none |
 | Use it when | You want a working talking avatar fast | You need full control of the loop |
@@ -91,7 +92,7 @@ client = OjinSTVClient(api_key=creds.api_key, config_id=creds.config_id)
 
 By default the client connects to `wss://models.ojin.ai/realtime`. Override it with the `ws_url` argument if you're pointed at another environment.
 
-> **Run it server-side.** The realtime transport is a WebSocket built for **server-to-server** delivery over a stable connection — run the client on your backend (not an end-user device), ideally in **US East** near Ojin's inference, and relay the final media to your users over a realtime transport such as WebRTC.
+> **Run it server-side.** The WebSocket transport is built for **server-to-server** delivery over a stable connection — run the client on your backend (not an end-user device), ideally in **US East** near Ojin's inference, and relay the final media to your users over a realtime transport such as WebRTC. If your users are already in a Daily or LiveKit room, skip the relay: [direct WebRTC](#direct-webrtc-daily--livekit) publishes the avatar straight into the room.
 
 ---
 
@@ -177,10 +178,12 @@ Register handlers with `@client.on(STVEvent.X)` or `client.add_listener(STVEvent
 | Event | Fires when | Handler kwargs |
 |---|---|---|
 | `SESSION_READY` | The session is live and ready for audio | `session_data: dict \| None` |
+| `WEBRTC_CONNECTED` | Direct WebRTC only: the avatar has joined your room | `participant_id: str \| None` |
+| `FIRST_FRAME` | The avatar's first video frame is out (emitted to your output, or published to the room) | `frame_type: int` |
 | `BOT_STARTED_SPEAKING` | The first speech frame of a turn is played | — |
 | `BOT_STOPPED_SPEAKING` | A turn has finished playing | — |
 | `INTERRUPTED` | A barge-in was accepted | — |
-| `ERROR` | A transport or server error occurred | `message: str`, `code: str` (server only), `fatal: bool` |
+| `ERROR` | A transport, server or WebRTC error occurred | `message: str`, `code: str` (server / WebRTC), `fatal: bool` |
 | `CLOSED` | The session has been torn down | — |
 
 ---
@@ -287,6 +290,75 @@ With a `PassthroughDecoder`, `STVVideoFrame.rgb` is `None` and the raw JPEG arri
 
 ---
 
+## Direct WebRTC (Daily / LiveKit)
+
+By default the avatar's frames stream back to your process over the WebSocket. If your viewers are in a **Daily** or **LiveKit** room, Ojin can publish the avatar **straight into that room** instead: the inference server joins as a participant named `ojin-avatar` and publishes its audio and video there. No media flows through your backend, and viewers get the lowest latency.
+
+Switching is one argument — the rest of your program stays the same:
+
+```python
+import os
+
+from ojin.stv import OjinSTVClient, WebRTCSettings
+
+client = OjinSTVClient(
+    api_key=os.environ["OJIN_API_KEY"],
+    config_id=os.environ["OJIN_CONFIG_ID"],
+    webrtc=WebRTCSettings(
+        provider="daily",                              # or "livekit"
+        room_url="https://your-domain.daily.co/room",  # LiveKit: wss://your-project.livekit.cloud
+        token=avatar_token,                            # credential for the ojin-avatar participant
+        audio_sample_rate=24000,                       # the rate your TTS emits (avoids resampling)
+    ),
+)
+
+async with client:
+    await client.say(pcm, sample_rate=24000, num_channels=1)  # the avatar speaks in the room
+```
+
+Leave out `webrtc` and the same code runs over the WebSocket.
+
+**Credentials.** The SDK doesn't create rooms or tokens — mint the avatar's credential with your provider account:
+
+| Provider | `room_url` | `token` |
+|---|---|---|
+| Daily | The room URL | A meeting token for that room |
+| LiveKit | Your LiveKit server URL (`wss://…`) | An access token with identity **`ojin-avatar`** that can join the room and publish (no subscribe needed) |
+
+```python
+from livekit import api  # pip install livekit-api
+
+avatar_token = (
+    api.AccessToken(os.environ["LIVEKIT_API_KEY"], os.environ["LIVEKIT_API_SECRET"])
+    .with_identity("ojin-avatar")
+    .with_grants(
+        api.VideoGrants(
+            room_join=True,
+            room="my-room",
+            can_publish=True,
+            can_subscribe=False,
+            can_publish_data=False,
+        )
+    )
+    .to_jwt()
+)
+```
+
+**What stays the same.** `start_turn()`, `send_tts_audio()`, `say()`, `interrupt()`, `close()` and every event. Speaking and first-frame events come from lightweight timing frames the server still sends over the WebSocket; `WEBRTC_CONNECTED` fires once the avatar has joined the room.
+
+**What differs.** The audio and video go to the room, not to your process: `output_stream()` (or your `STVOutput`) receives no frames and simply ends when the session closes.
+
+**Failures are reported, never hidden.** There is no silent fallback to the WebSocket. If the avatar can't get into the room, the client emits a fatal `ERROR` and closes the session:
+
+| `code` | Meaning |
+|---|---|
+| `WEBRTC_JOIN_FAILED` | The join was rejected (the message carries `AUTH`, `NETWORK` or `INVALID_SETTINGS`), the session wasn't ready within `webrtc_join_timeout_s` (default 10 s — it includes the model's cold start, so leave headroom), or the avatar lost the room mid-session |
+| `WEBRTC_UNSUPPORTED` | The server can't publish this session into a room |
+
+**Is your own bot in the room too?** Don't let it listen to the avatar, or it will transcribe the avatar's voice as user speech. Recognise the avatar with `is_avatar_participant(participant)` (a Daily participant dict) or `is_avatar_identity(identity)` (a LiveKit identity) — both exported from `ojin` — and unsubscribe from its audio.
+
+---
+
 ## Configuration
 
 `STVConfig` holds the behavioral knobs (connection identity stays on the client constructor):
@@ -307,6 +379,8 @@ With a `PassthroughDecoder`, `STVVideoFrame.rgb` is `None` and the raw JPEG arri
 | `server_feed_flush_idle_ms` | `200` | Quiet time before flushing a sub-threshold tail |
 
 Video frames are emitted at the server's native resolution — read `STVVideoFrame.width`/`height` per frame rather than configuring an output size. Set `OJIN_MODE=dev` in the environment to attach the dev-mode query flag when connecting with the default transport.
+
+For direct WebRTC, `WebRTCSettings` takes `provider`, `room_url`, `token`, `audio_sample_rate` (default `16000`) and `webrtc_join_timeout_s` (default `10.0`); the playback fields above don't apply because the media goes to the room.
 
 ---
 
@@ -371,9 +445,9 @@ async def main(pcm_16k_mono: bytes) -> None:
 
 ## Integrations
 
-- **Pipecat** — this SDK is the engine behind Ojin's `OjinVideoService` for [Pipecat](https://github.com/pipecat-ai/pipecat). `OjinSTVClient` exposes the same behavior with no Pipecat dependency, so you can adopt it directly.
+- **Pipecat** — this SDK is the engine behind Ojin's `OjinVideoService` for [Pipecat](https://github.com/pipecat-ai/pipecat). `OjinSTVClient` exposes the same behavior with no Pipecat dependency, so you can adopt it directly. For direct WebRTC, pass `OjinVideoSettings(webrtc=WebRTCSettings(...))` (pipecat-ojin 0.1.5+).
+- **Daily / LiveKit rooms** — use [direct WebRTC](#direct-webrtc-daily--livekit) and the avatar joins your room as `ojin-avatar`; your viewers need nothing Ojin-specific.
 - **LiveKit Agents / custom transports** — feed `send_tts_audio()` from your TTS and push `STVVideoFrame` / `STVAudioFrame` into any media pipeline. Inject a custom `STVOutput` to write straight into your transport.
-- **WebRTC (roadmap)** — the transport sits behind the `IOjinClient` protocol; a WebRTC transport can be dropped in without touching `OjinSTVClient`.
 
 ---
 
@@ -383,7 +457,10 @@ async def main(pcm_16k_mono: bytes) -> None:
 - **Avatar mouth stays still / only idle frames** — the server is starved of audio and can't sustain 25 fps speech, so it emits idle frames in between. `OjinSTVClient` shapes the input to prevent this (see **Input shaping** above); it should only surface if you set `server_feed_batching_enabled=False` or drive the low-level `OjinClient` — then send a ~1 s lead up front, followed by the largest chunks you can.
 - **`Inference Server is not ready`** (low-level) — wait for `OjinSessionReadyMessage` before calling `send_message()`.
 - **Choppy playback** — keep the event loop free; the SDK already decodes JPEG off-loop, but heavy synchronous work in your frame handlers will stall the 40 ms tick. Enable `STVConfig(lipsync_trace_enabled=True)` to inspect per-tick timing.
-- **Latency higher than expected** — the WebSocket transport is built for **server-to-server** use over a stable connection. Run the client on a backend (not an end-user device), ideally in **US East**, close to Ojin's inference; deliver the final media to end users over a realtime transport such as WebRTC. The client keeps a small video buffer (`initial_buffer_frames`) to absorb network jitter, since the server delivers at realtime 25 fps.
+- **Latency higher than expected** — the WebSocket transport is built for **server-to-server** use over a stable connection. Run the client on a backend (not an end-user device), ideally in **US East**, close to Ojin's inference; deliver the final media to end users over a realtime transport such as WebRTC — or publish straight into their room with [direct WebRTC](#direct-webrtc-daily--livekit). The client keeps a small video buffer (`initial_buffer_frames`) to absorb network jitter, since the server delivers at realtime 25 fps.
+- **`WEBRTC_JOIN_FAILED` with `AUTH`** — the token doesn't grant the avatar access to that room. On LiveKit, check the token's identity is exactly `ojin-avatar` and it allows publishing; on Daily, check the meeting token is for the same room as `room_url`.
+- **`WEBRTC_JOIN_FAILED` with no `sessionReady`** — the session didn't become ready within `webrtc_join_timeout_s`. It covers the model's cold start as well as the room join, so raise it (e.g. `30.0`) if it trips on first sessions.
+- **Your bot hears the avatar** — it's subscribed to the `ojin-avatar` participant's microphone. Detect it with `is_avatar_participant()` / `is_avatar_identity()` and unsubscribe.
 
 ---
 

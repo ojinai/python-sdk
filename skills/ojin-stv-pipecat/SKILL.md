@@ -81,6 +81,26 @@ DailyParams(audio_in_enabled=True, audio_out_enabled=True,
 
 That's the whole integration. Run it like any example (e.g. `uv run python bot.py -t daily`).
 
+### Direct WebRTC variant (Daily / LiveKit transports)
+
+On a Daily or LiveKit transport you can skip relaying frames through the bot: pass
+`webrtc=WebRTCSettings(...)` to the client and Ojin publishes the avatar straight into
+the room as the participant `ojin-avatar`. With the maintained
+[`pipecat-ojin`](https://github.com/ojinai/pipecat-ojin) package (0.1.5+) that's
+`OjinVideoService(OjinVideoSettings(..., webrtc=WebRTCSettings(provider="daily",
+room_url=room_url, token=avatar_token)))`; with the adapter below, add the same
+`webrtc=` argument where it builds `OjinSTVClient`. Then:
+
+- **Disable the transport's audio/video out** (`audio_out_enabled=False`,
+  `video_out_enabled=False`) — the service pushes no media frames in this mode.
+- **Give the avatar its own credential.** On LiveKit the token's identity must be
+  `ojin-avatar`; on Daily a meeting token for the same room.
+- **Don't let the bot hear the avatar.** Unsubscribe from the participant for which
+  `ojin.is_avatar_participant(participant)` (Daily) or
+  `ojin.is_avatar_identity(identity)` (LiveKit) is true.
+- **Failures are fatal, never a silent fallback:** `WEBRTC_JOIN_FAILED` /
+  `WEBRTC_UNSUPPORTED` arrive as a fatal `ERROR` and the session closes.
+
 ## The avatar service
 
 Self-contained — paste this into your bot file (or a small local module) and import

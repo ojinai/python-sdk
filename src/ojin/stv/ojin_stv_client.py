@@ -7,8 +7,18 @@ loop diagnostics — behind an anam-inspired API, with no pipecat dependency.
 
 The avatar plays the **original** TTS audio buffered here; only a separate copy is
 resampled and sent to the inference server for lip-sync. Cross-cutting concerns
-(transport, resampler, decoder, tracer, output) are injected behind protocols, so
-the WebSocket transport can later be swapped for WebRTC without touching this class.
+(transport, resampler, decoder, tracer, output) are injected behind protocols.
+
+Two transports, one program:
+
+- **WebSocket** (default) — the server streams frames back and this client plays
+  them out as synced audio/video through ``output_stream()`` / your ``STVOutput``.
+- **Direct WebRTC** — pass ``webrtc=WebRTCSettings(...)`` and the server publishes
+  the avatar straight into your Daily or LiveKit room instead (see
+  :class:`~ojin.stv.ojin_stv_webrtc_client.OjinSTVWebRTCClient`, the engine this
+  client delegates to). Input, interrupts and events are identical; the media goes
+  to the room, so the output receives no frames. A failed or unsupported WebRTC
+  session is reported as a fatal ``ERROR`` — there is no silent fallback.
 
 Typical use::
 
@@ -45,10 +55,11 @@ from ojin.ojin_client_messages import (
 )
 from ojin.stv._outbound_feed import OutboundFeedMixin
 from ojin.stv.audio_utils import rms_int16
-from ojin.stv.config import STVConfig
+from ojin.stv.config import STVConfig, WebRTCSettings
 from ojin.stv.diagnostics import LoopDiagnostics
 from ojin.stv.events import EventEmitter, STVEvent
 from ojin.stv.frames import STVAudioFrame, STVVideoFrame
+from ojin.stv.ojin_stv_webrtc_client import OjinSTVWebRTCClient
 from ojin.stv.output import QueueOutput, STVOutput
 from ojin.stv.resampler import Resampler, default_resampler
 from ojin.stv.synchronizer import (
@@ -90,6 +101,7 @@ class OjinSTVClient(OutboundFeedMixin):
         client: Optional[IOjinClient] = None,
         config: Optional[STVConfig] = None,
         buffer_preinit_tts_audio: bool = True,
+        webrtc: Optional[WebRTCSettings] = None,
     ) -> None:
         """Create a client; pass your own transport/resampler/decoder/tracer/output.
 
@@ -105,25 +117,65 @@ class OjinSTVClient(OutboundFeedMixin):
         cold-start handshake (e.g. an opening line) without losing audio. Set it to
         ``False`` to restore the previous behaviour: input before initialization is
         dropped with a warning.
+
+        Pass ``webrtc`` to have the server publish the avatar straight into your
+        Daily or LiveKit room instead of streaming frames back over the WebSocket.
+        Input, interrupts and events work exactly the same; since the media goes to
+        the room, ``output``/``decoder`` receive nothing and the output is simply
+        closed when the session ends. A failed or unsupported WebRTC session is a
+        fatal ``ERROR`` (``WEBRTC_JOIN_FAILED`` / ``WEBRTC_UNSUPPORTED``) that closes
+        the session.
         """
         super().__init__()
         self._config = config or STVConfig()
-
-        self._client: IOjinClient = client or OjinClient(
-            ws_url=ws_url,
-            api_key=api_key,
-            config_id=config_id,
-            mode=os.getenv("OJIN_MODE", ""),
-            # Transport-level send pacing: cap a single send and gap a backlog so a
-            # buffered burst (e.g. TTS replayed after a barge-in) can't flood.
-            max_input_chunk_bytes=max(1, int(self._config.server_feed_max_chunk_bytes)),
-            send_chunk_gap_s=self._config.server_feed_send_gap_ms / 1000.0,
-        )
         self._resampler: Resampler = resampler or default_resampler()
-        self._decoder: VideoDecoder = decoder or OpenCVDecoder()
         self._tracer: Tracer = tracer or NullTracer()
         self._output: STVOutput = output or QueueOutput()
-        self._events = EventEmitter()
+
+        # Direct-WebRTC engine. When set, the public API delegates to it and the
+        # local playback pipeline below is never started.
+        self._webrtc: Optional[OjinSTVWebRTCClient] = None
+        if webrtc is not None:
+            self._webrtc = OjinSTVWebRTCClient(
+                webrtc_settings=webrtc,
+                api_key=api_key,
+                config_id=config_id,
+                ws_url=ws_url,
+                resampler=self._resampler,
+                tracer=self._tracer,
+                client=client,
+                config=self._config,
+                buffer_preinit_tts_audio=buffer_preinit_tts_audio,
+            )
+
+        self._client: IOjinClient = (
+            self._webrtc._client
+            if self._webrtc is not None
+            else client
+            or OjinClient(
+                ws_url=ws_url,
+                api_key=api_key,
+                config_id=config_id,
+                mode=os.getenv("OJIN_MODE", ""),
+                # Transport-level send pacing: cap a single send and gap a backlog so
+                # a buffered burst (e.g. TTS replayed after a barge-in) can't flood.
+                max_input_chunk_bytes=max(
+                    1, int(self._config.server_feed_max_chunk_bytes)
+                ),
+                send_chunk_gap_s=self._config.server_feed_send_gap_ms / 1000.0,
+            )
+        )
+        self._decoder: VideoDecoder = decoder or OpenCVDecoder()
+        # One emitter for both transports, so listeners registered on this client
+        # hear the WebRTC engine's events directly.
+        self._events = (
+            self._webrtc._events if self._webrtc is not None else EventEmitter()
+        )
+        if self._webrtc is not None:
+            # End a waiting output_stream() whenever the session closes — including
+            # a close triggered by a fatal WebRTC error, not just close().
+            self._events.add_listener(STVEvent.CLOSED, self._aclose_output)
+        self._first_frame_emitted = False
         self._synchronizer = Synchronizer(self._config)
         self._initialized = False
         self._init_outbound_feed(buffer_preinit_tts_audio)
@@ -178,11 +230,15 @@ class OjinSTVClient(OutboundFeedMixin):
     @property
     def is_connected(self) -> bool:
         """Whether the session is live (SessionReady received, not closed)."""
+        if self._webrtc is not None:
+            return self._webrtc.is_connected
         return self._initialized
 
     @property
     def session_data(self) -> Optional[dict]:
         """Server-provided session parameters, available after SESSION_READY."""
+        if self._webrtc is not None:
+            return self._webrtc.session_data
         return self._session_data
 
     def on(self, event: STVEvent) -> Callable:
@@ -212,6 +268,8 @@ class OjinSTVClient(OutboundFeedMixin):
 
     async def connect_with_retry(self) -> bool:
         """Connect the transport, retrying up to the configured max attempts."""
+        if self._webrtc is not None:
+            return await self._webrtc.connect_with_retry()
         last_error: Optional[Exception] = None
         for attempt in range(self._config.client_connect_max_retries):
             try:
@@ -232,7 +290,15 @@ class OjinSTVClient(OutboundFeedMixin):
         return False
 
     async def start(self) -> None:
-        """Connect, start diagnostics + decode worker, and run the receive loop."""
+        """Connect, start diagnostics + decode worker, and run the receive loop.
+
+        With ``webrtc`` set this starts the direct-WebRTC session instead; the
+        local playback pipeline (decode worker, playback loop, diagnostics) is
+        never started, since the media goes to the room.
+        """
+        if self._webrtc is not None:
+            await self._webrtc.start()
+            return
         self._tr_session_start = self._tracer.mark()
         self._tr_connect_start = self._tr_session_start
         self._diagnostics.start()
@@ -252,8 +318,23 @@ class OjinSTVClient(OutboundFeedMixin):
         """Context-manager exit: :meth:`close`."""
         await self.close()
 
+    async def _aclose_output(self, **_: object) -> None:
+        """End a live output_stream() (default QueueOutput) so consumers finish.
+
+        Custom sinks without ``aclose`` are left alone.
+        """
+        aclose = getattr(self._output, "aclose", None)
+        if aclose is not None:
+            with contextlib.suppress(Exception):
+                await aclose()
+
     async def close(self) -> None:
         """Tear down loops, decode worker, and transport; record the session span."""
+        if self._webrtc is not None:
+            # The engine emits CLOSED on the shared emitter, whose listener ends
+            # the output (_aclose_output). Idempotent, like the engine's close.
+            await self._webrtc.close()
+            return
         was_initialized = self._initialized
         self._initialized = False
         # Drop any input buffered before init; we never became ready to replay it.
@@ -366,6 +447,22 @@ class OjinSTVClient(OutboundFeedMixin):
         await self.start_turn()
         await self.send_tts_audio(pcm, sample_rate, num_channels)
 
+    async def start_turn(self) -> None:
+        """Open a new turn for the next utterance (≈ TTSStartedFrame)."""
+        if self._webrtc is not None:
+            await self._webrtc.start_turn()
+            return
+        await super().start_turn()
+
+    async def send_tts_audio(
+        self, pcm: bytes, sample_rate: int, num_channels: int
+    ) -> None:
+        """Feed one chunk of TTS audio (int16 PCM, any rate/channel count)."""
+        if self._webrtc is not None:
+            await self._webrtc.send_tts_audio(pcm, sample_rate, num_channels)
+            return
+        await super().send_tts_audio(pcm, sample_rate, num_channels)
+
     async def interrupt(self) -> bool:
         """Barge-in: fade the current turn and cancel it server-side if playing.
 
@@ -373,6 +470,8 @@ class OjinSTVClient(OutboundFeedMixin):
         the cancel until the server's first idle/fade-out frame acknowledges it (see
         :meth:`_on_interaction_response`), so a re-fire can't stack a second cancel.
         """
+        if self._webrtc is not None:
+            return await self._webrtc.interrupt()
         if self._interruption_ongoing:
             self._tracer.instant("interruption", "interrupt_suppressed")
             return False
@@ -845,6 +944,11 @@ class OjinSTVClient(OutboundFeedMixin):
                 volume=volume,
             )
         )
+        if not self._first_frame_emitted:
+            # Parity with direct-WebRTC mode, so the same FIRST_FRAME listener works
+            # on either transport.
+            self._first_frame_emitted = True
+            await self._events.emit(STVEvent.FIRST_FRAME, frame_type=frame_type)
 
     async def _emit_audio(self, result: TickResult, pts: int) -> None:
         """Emit exactly one audio frame this tick (real chunk or silence)."""

@@ -33,13 +33,16 @@ You'll need **Python 3.10+**. The `stv` extra brings in `numpy` / `opencv-python
 src/ojin/
 ├── ojin_client.py            # low-level WebSocket client (OjinClient)
 ├── ojin_client_messages.py   # high-level message types + FrameType
+├── avatar_participant.py     # ojin-avatar participant helpers (direct WebRTC; no deps)
 ├── profiling_utils.py        # lightweight profiling helpers
 ├── entities/                 # wire-format (de)serialization
 │   ├── interaction_messages.py
 │   └── session_messages.py
 └── stv/                      # high-level OjinSTVClient and its parts
-    ├── ojin_stv_client.py    #   the client itself
-    ├── config.py             #   STVConfig
+    ├── ojin_stv_client.py    #   the client itself (WebSocket, or direct WebRTC via webrtc=)
+    ├── ojin_stv_webrtc_client.py  # direct-WebRTC session engine it delegates to
+    ├── _outbound_feed.py     #   server-feed batching + lead cap shared by both
+    ├── config.py             #   STVConfig, WebRTCSettings, WebRTCProvider
     ├── events.py             #   STVEvent + emitter
     ├── frames.py / output.py #   output frame types + sinks
     ├── synchronizer.py       #   audio-as-clock A/V sync

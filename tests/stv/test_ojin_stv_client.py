@@ -810,3 +810,47 @@ def test_close_ends_output_stream() -> None:
         assert items  # some frames were emitted before close
 
     asyncio.run(run())
+
+
+def test_first_frame_event_fires_once_on_first_emitted_video() -> None:
+    """FIRST_FRAME fires once, when the first video frame reaches the output.
+
+    Parity with direct-WebRTC mode, so one listener works on both transports.
+    """
+
+    async def run() -> None:
+        fc = FakeOjinClient()
+        out = ListOutput()
+        c = OjinSTVClient(
+            client=fc,
+            output=out,
+            tracer=RecordingTracer(),
+            config=STVConfig(
+                initial_buffer_frames=0, loop_stall_watchdog_ms=0, stall_probe_ms=0
+            ),
+        )
+        first: list[dict] = []
+        c.add_listener(STVEvent.FIRST_FRAME, lambda **kwargs: first.append(kwargs))
+        await c.start()
+        await asyncio.sleep(0.02)
+        assert first == []  # silence ticks with no video yet do not count
+
+        jpeg = cv2.imencode(".jpg", np.zeros((8, 8, 3), dtype=np.uint8))[1].tobytes()
+        for index in range(3):
+            await fc.push(
+                OjinInteractionResponseMessage(
+                    interaction_id="i1",
+                    video_frame_bytes=jpeg,
+                    audio_frame_bytes=b"\x10\x00" * 320,
+                    is_final_response=False,
+                    index=index,
+                    frame_type=FrameType.IDLE,
+                )
+            )
+        await asyncio.sleep(0.25)  # decode worker + several playback ticks
+
+        assert len(out.video) >= 2
+        assert first == [{"frame_type": int(FrameType.IDLE)}]
+        await c.close()
+
+    asyncio.run(run())

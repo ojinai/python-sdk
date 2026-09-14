@@ -1,12 +1,18 @@
 """Ojin Speech-To-Video high-level client (framework-agnostic).
 
-``OjinSTVClient`` turns a stream of TTS audio into a lip-synced talking-avatar
-audio/video stream, handling buffering, the audio-as-clock playback loop, and
-post-interruption re-sync. It is pipecat-free and built on the swappable
-``IOjinClient`` transport (WebSocket today, WebRTC later).
+``OjinSTVClient`` turns a stream of TTS audio into a lip-synced talking avatar.
+Over the default WebSocket transport it hands you synced audio/video frames,
+handling buffering, the audio-as-clock playback loop, and post-interruption
+re-sync. Pass ``webrtc=WebRTCSettings(...)`` instead and the avatar is published
+straight into your Daily or LiveKit room — same program, same events.
 """
 
-from ojin.stv.config import STVConfig, WebRTCSettings
+from ojin.avatar_participant import (
+    AVATAR_PARTICIPANT_USER_NAME,
+    is_avatar_identity,
+    is_avatar_participant,
+)
+from ojin.stv.config import STVConfig, WebRTCProvider, WebRTCSettings
 from ojin.stv.events import STVEvent
 from ojin.stv.frames import FrameType, STVAudioFrame, STVVideoFrame
 from ojin.stv.ojin_stv_client import OjinSTVClient
@@ -32,6 +38,7 @@ from ojin.stv.tracing import NullTracer, Tracer
 from ojin.stv.video_decode import OpenCVDecoder, PassthroughDecoder, VideoDecoder
 
 __all__ = [
+    "AVATAR_PARTICIPANT_USER_NAME",
     "FrameType",
     "NullTracer",
     "NumpyLinearResampler",
@@ -53,9 +60,12 @@ __all__ = [
     "TickSample",
     "Tracer",
     "VideoDecoder",
+    "WebRTCProvider",
     "WebRTCSettings",
     "cross_correlation_lag",
     "default_resampler",
+    "is_avatar_identity",
+    "is_avatar_participant",
     "luma_motion_rms",
     "report_to_dict",
     "summarize",
