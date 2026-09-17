@@ -5,8 +5,8 @@ Usage:
 
 Needs OJIN_API_KEY and OJIN_CONFIG_ID, plus the room the avatar should join:
 
-    OJIN_WEBRTC_PROVIDER   daily | livekit            (default: daily)
-    OJIN_WEBRTC_ROOM_URL   Daily room URL, or LiveKit server URL (wss://...)
+    OJIN_WEBRTC_PROVIDER   livekit | daily            (default: livekit)
+    OJIN_WEBRTC_ROOM_URL   LiveKit server URL (wss://...), or Daily room URL
     OJIN_WEBRTC_TOKEN      credential for the `ojin-avatar` participant
 
 Open the room in a browser first, then run this: the avatar joins as `ojin-avatar`
@@ -56,7 +56,7 @@ def webrtc_settings_from_env(sample_rate: int) -> WebRTCSettings:
         )
     try:
         return WebRTCSettings(
-            provider=os.environ.get("OJIN_WEBRTC_PROVIDER", "daily"),
+            provider=os.environ.get("OJIN_WEBRTC_PROVIDER", "livekit"),
             room_url=room_url,
             token=token,
             audio_sample_rate=sample_rate,  # publish at the clip's own rate

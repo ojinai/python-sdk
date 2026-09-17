@@ -176,9 +176,9 @@ client = OjinSTVClient(api_key=..., config_id=..., output=MyTransportSink())
 # NOTE: with a custom sink, do NOT call output_stream() — consume your sink directly.
 ```
 
-## Direct WebRTC (Daily / LiveKit rooms)
+## Direct WebRTC (LiveKit / Daily rooms)
 
-If your users are already in a **Daily** or **LiveKit** room, have Ojin publish the
+If your users are already in a **LiveKit** or **Daily** room, have Ojin publish the
 avatar straight into it instead of streaming frames back to you. It's one extra
 argument — every call, event and barge-in rule above stays the same:
 

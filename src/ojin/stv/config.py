@@ -35,13 +35,13 @@ class WebRTCSettings:
     the room as the ``ojin-avatar`` participant and publishes the avatar's
     audio and video there, so your viewers watch it directly in the room.
 
-    - **Daily** — ``room_url`` is the room URL
-      (``https://<domain>.daily.co/<room>``) and ``token`` a meeting token for
-      that room.
     - **LiveKit** — ``room_url`` is the LiveKit server URL
       (``wss://<project>.livekit.cloud``) and ``token`` an access token whose
       identity is ``ojin-avatar``, granted publish-only rights (camera and
       microphone) for the room.
+    - **Daily** — ``room_url`` is the room URL
+      (``https://<domain>.daily.co/<room>``) and ``token`` a meeting token for
+      that room.
 
     Set ``audio_sample_rate`` to the rate your TTS emits to avoid resampling.
     ``webrtc_join_timeout_s`` bounds the whole wait for the session to become

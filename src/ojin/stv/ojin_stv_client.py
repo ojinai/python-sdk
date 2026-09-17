@@ -14,7 +14,7 @@ Two transports, one program:
 - **WebSocket** (default) — the server streams frames back and this client plays
   them out as synced audio/video through ``output_stream()`` / your ``STVOutput``.
 - **Direct WebRTC** — pass ``webrtc=WebRTCSettings(...)`` and the server publishes
-  the avatar straight into your Daily or LiveKit room instead (see
+  the avatar straight into your LiveKit or Daily room instead (see
   :class:`~ojin.stv.ojin_stv_webrtc_client.OjinSTVWebRTCClient`, the engine this
   client delegates to). Input, interrupts and events are identical; the media goes
   to the room, so the output receives no frames. A failed or unsupported WebRTC
@@ -119,7 +119,7 @@ class OjinSTVClient(OutboundFeedMixin):
         dropped with a warning.
 
         Pass ``webrtc`` to have the server publish the avatar straight into your
-        Daily or LiveKit room instead of streaming frames back over the WebSocket.
+        LiveKit or Daily room instead of streaming frames back over the WebSocket.
         Input, interrupts and events work exactly the same; since the media goes to
         the room, ``output``/``decoder`` receive nothing and the output is simply
         closed when the session ends. A WebRTC session that cannot be opened (or

@@ -4,7 +4,7 @@
 Over the default WebSocket transport it hands you synced audio/video frames,
 handling buffering, the audio-as-clock playback loop, and post-interruption
 re-sync. Pass ``webrtc=WebRTCSettings(...)`` instead and the avatar is published
-straight into your Daily or LiveKit room — same program, same events.
+straight into your LiveKit or Daily room — same program, same events.
 """
 
 from ojin.avatar_participant import (
