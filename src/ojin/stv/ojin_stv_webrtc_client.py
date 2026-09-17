@@ -17,12 +17,17 @@ capability advertisement, no post-ready ack:
   metadata frame. Those frames replace local playback as the signal layer:
   they advance the lead-gate clock, acknowledge barge-ins, and derive the
   speaking/first-frame events.
-- ``status: "failed"`` — fatal (``WEBRTC_JOIN_FAILED``): credentials were
+- ``status: "failed"`` — fatal, under the code the server's own error maps to
+  (``WEBRTC_AUTH_FAILED`` / ``WEBRTC_NETWORK_FAILED`` /
+  ``WEBRTC_INVALID_SETTINGS``, else ``WEBRTC_JOIN_FAILED``): credentials were
   supplied and a real error occurred; silent fallback would mask breakage.
 - absent ``webrtc`` key, or an unrecognised status — fatal
-  (``WEBRTC_UNSUPPORTED``): the server cannot publish this session into the
+  (``WEBRTC_NOT_SUPPORTED``): the server cannot publish this session into the
   room. The caller asked for WebRTC, so carrying on without it would only hide
   the problem — no avatar would ever reach the room.
+
+A join that never resolves is ``WEBRTC_JOIN_TIMEOUT``; a room lost after
+connecting is ``WEBRTC_ROOM_LOST``.
 
 Every fatal WebRTC error closes the session. ``webrtcStatus`` survives only as
 an async post-connect notification (mid-session room drop: ``disconnected``
@@ -75,8 +80,23 @@ _WATCHDOG_POLL_S = 1.0
 _SPEECH_TYPES = (int(FrameType.SPEECH), int(FrameType.START_OF_SPEECH))
 _SILENCE_TYPES = (int(FrameType.IDLE), int(FrameType.FADE_OUT))
 
+# Fatal ERROR codes — one per cause, so a caller can branch on ``code`` alone
+# instead of parsing the message.
+WEBRTC_AUTH_FAILED = "WEBRTC_AUTH_FAILED"
+WEBRTC_NETWORK_FAILED = "WEBRTC_NETWORK_FAILED"
+WEBRTC_INVALID_SETTINGS = "WEBRTC_INVALID_SETTINGS"
+WEBRTC_JOIN_TIMEOUT = "WEBRTC_JOIN_TIMEOUT"
+WEBRTC_ROOM_LOST = "WEBRTC_ROOM_LOST"
+WEBRTC_NOT_SUPPORTED = "WEBRTC_NOT_SUPPORTED"
+# Fallback: the server reported a join failure whose code we don't recognise.
 WEBRTC_JOIN_FAILED = "WEBRTC_JOIN_FAILED"
-WEBRTC_UNSUPPORTED = "WEBRTC_UNSUPPORTED"
+
+# The server's own join-failure codes, mapped onto the event codes above.
+_SERVER_ERROR_CODES = {
+    "AUTH": WEBRTC_AUTH_FAILED,
+    "NETWORK": WEBRTC_NETWORK_FAILED,
+    "INVALID_SETTINGS": WEBRTC_INVALID_SETTINGS,
+}
 
 
 class _DirectState(Enum):
@@ -571,22 +591,39 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         self._schedule_close()
 
     async def _fail_direct(self, error_code: str, detail: str, outcome: str) -> None:
-        """Report that the server could not join (or lost) the room — fatal."""
+        """Report that the server could not join the room — fatal.
+
+        The server's own code (``AUTH`` / ``NETWORK`` / ``INVALID_SETTINGS``)
+        picks the event code, so a caller can branch on the cause instead of
+        parsing the message. An unrecognised code keeps the generic
+        ``WEBRTC_JOIN_FAILED``.
+        """
         await self._fail(
-            WEBRTC_JOIN_FAILED,
-            f"webrtc negotiation failed ({error_code or 'unknown'})"
+            _SERVER_ERROR_CODES.get(error_code.upper(), WEBRTC_JOIN_FAILED),
+            f"The room rejected the avatar's join ({error_code or 'unknown'})"
             + (f": {detail}" if detail else ""),
             {"outcome": outcome, "error_code": error_code},
         )
 
-    async def _fail_unsupported(self, reason: str) -> None:
-        """Report that the server cannot publish this session into a room — fatal."""
-        logger.error("Direct WebRTC is not available for this session: %s", reason)
-        self._tracer.instant("webrtc", "unsupported", args={"reason": reason})
+    async def _fail_room_lost(self, error_code: str, detail: str) -> None:
+        """Report that the avatar dropped out of the room mid-session — fatal."""
         await self._fail(
-            WEBRTC_UNSUPPORTED,
-            f"The server does not support direct WebRTC for this session ({reason})",
-            {"outcome": "unsupported", "reason": reason},
+            WEBRTC_ROOM_LOST,
+            f"The avatar lost the room ({error_code or 'unknown'})"
+            + (f": {detail}" if detail else ""),
+            {"outcome": "room_lost", "error_code": error_code},
+        )
+
+    async def _fail_unsupported(self, reason: str) -> None:
+        """Report that the server published no room result for this session — fatal."""
+        logger.error("Direct WebRTC is not available for this session: %s", reason)
+        self._tracer.instant("webrtc", "not_supported", args={"reason": reason})
+        await self._fail(
+            WEBRTC_NOT_SUPPORTED,
+            "This session cannot be published into a room: the server returned no "
+            f"webrtc result ({reason}). Connect without `webrtc` to receive frames "
+            "over the WebSocket instead.",
+            {"outcome": "not_supported", "reason": reason},
         )
 
     async def _on_webrtc_status(self, status: OjinWebRTCStatusMessage) -> None:
@@ -605,9 +642,7 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
             args["error_code"] = error_code
         self._tracer.instant("webrtc", "webrtc_status", args=args)
         if status.status == "failed":
-            await self._fail_direct(
-                error_code, str(error.get("message") or ""), outcome="failed"
-            )
+            await self._fail_room_lost(error_code, str(error.get("message") or ""))
         elif status.status == "disconnected":
             logger.warning(
                 "webrtc transport disconnected (provider=%s)", status.provider
@@ -632,8 +667,10 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
             return
         self._tracer.instant("webrtc", "join_timeout")
         await self._fail(
-            WEBRTC_JOIN_FAILED,
-            f"No sessionReady within {self._webrtc_settings.webrtc_join_timeout_s} s",
+            WEBRTC_JOIN_TIMEOUT,
+            "The session was not ready within "
+            f"{self._webrtc_settings.webrtc_join_timeout_s} s (the wait covers the "
+            "room join and the model's cold start)",
             {"outcome": "timeout"},
         )
 

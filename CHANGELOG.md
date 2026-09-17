@@ -28,12 +28,17 @@ All notable changes to `ojin-client` are documented here. The format follows
 ### Changed
 - **BREAKING:** a server that answers a WebRTC request without a `webrtc` result, or
   with an unrecognised status, is now a fatal `ERROR` with code
-  `WEBRTC_UNSUPPORTED`. Previously the session silently continued in "relay" mode,
+  `WEBRTC_NOT_SUPPORTED`. Previously the session silently continued in "relay" mode,
   which fed audio at the declared rate to a server expecting 16 kHz and never put an
   avatar in the room.
-- **BREAKING:** every fatal error in WebRTC mode (`WEBRTC_JOIN_FAILED`,
-  `WEBRTC_UNSUPPORTED`, a server `errorResponse`) now closes the session: `CLOSED`
-  follows the `ERROR`. `close()` is idempotent.
+- WebRTC failures carry a `code` per cause, so a caller can branch on it without
+  parsing the message: `WEBRTC_AUTH_FAILED`, `WEBRTC_NETWORK_FAILED`,
+  `WEBRTC_INVALID_SETTINGS` (mapped from the server's join error), plus
+  `WEBRTC_JOIN_TIMEOUT`, `WEBRTC_ROOM_LOST` and `WEBRTC_NOT_SUPPORTED`.
+  `WEBRTC_JOIN_FAILED` remains only as the fallback for an unrecognised server code.
+- **BREAKING:** every fatal error in WebRTC mode (the codes above, or a server
+  `errorResponse`) now closes the session: `CLOSED` follows the `ERROR`. `close()`
+  is idempotent.
 - **BREAKING:** `WebRTCSettings` validates at construction. An unknown `provider`,
   an empty `room_url` or `token`, or a non-positive `webrtc_join_timeout_s` raises
   `ValueError`.

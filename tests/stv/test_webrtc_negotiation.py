@@ -56,7 +56,7 @@ READY_FAILED_PARAMETERS = {
     }
 }
 # A server without direct-webrtc support omits the key entirely.
-READY_UNSUPPORTED_PARAMETERS = {"persona": "x"}
+READY_NOT_SUPPORTED_PARAMETERS = {"persona": "x"}
 
 
 def make_client(session_parameters=None, tracer=None, **config_overrides):
@@ -148,7 +148,11 @@ async def test_connected_result_opens_direct_mode_and_flushes_held_input() -> No
 
 
 async def test_failed_result_is_fatal_discards_held_input_and_closes() -> None:
-    """status=failed maps to a fatal WEBRTC_JOIN_FAILED, then the session closes."""
+    """status=failed maps the server's code onto a fatal ERROR, then closes.
+
+    The event code names the cause (AUTH -> WEBRTC_AUTH_FAILED) so a caller can
+    branch on it without parsing the message.
+    """
     client, fake_client, _tracer = make_client(
         session_parameters=READY_FAILED_PARAMETERS,
         server_feed_batching_enabled=False,
@@ -163,7 +167,7 @@ async def test_failed_result_is_fatal_discards_held_input_and_closes() -> None:
     await asyncio.sleep(0.05)
 
     assert len(errors) == 1
-    assert errors[0]["code"] == "WEBRTC_JOIN_FAILED"
+    assert errors[0]["code"] == "WEBRTC_AUTH_FAILED"
     assert errors[0]["fatal"] is True
     assert "AUTH" in errors[0]["message"]
     assert connected == []
@@ -177,14 +181,35 @@ async def test_failed_result_is_fatal_discards_held_input_and_closes() -> None:
     assert closed == [{}]
 
 
-async def test_absent_key_is_fatal_unsupported() -> None:
-    """No webrtc result key → fatal WEBRTC_UNSUPPORTED; nothing sent, closed.
+async def test_unrecognised_server_error_code_falls_back_to_join_failed() -> None:
+    """A join error this SDK doesn't know still fails, under the generic code."""
+    client, _fake_client, _tracer = make_client(
+        session_parameters={
+            "webrtc": {
+                "version": 2,
+                "status": "failed",
+                "error": {"code": "TEAPOT", "message": "short and stout"},
+            }
+        },
+        server_feed_batching_enabled=False,
+    )
+    errors = _record(client, STVEvent.ERROR)
+    await client.start()
+    await asyncio.sleep(0.05)
+
+    assert [e["code"] for e in errors] == ["WEBRTC_JOIN_FAILED"]
+    assert "TEAPOT" in errors[0]["message"]
+    await client.close()
+
+
+async def test_absent_key_is_fatal_not_supported() -> None:
+    """No webrtc result key → fatal WEBRTC_NOT_SUPPORTED; nothing sent, closed.
 
     The caller asked for WebRTC; a server that cannot publish into the room
     would otherwise leave the room with no avatar and nothing pointing at why.
     """
     client, fake_client, tracer = make_client(
-        session_parameters=READY_UNSUPPORTED_PARAMETERS,
+        session_parameters=READY_NOT_SUPPORTED_PARAMETERS,
         server_feed_batching_enabled=False,
     )
     errors = _record(client, STVEvent.ERROR)
@@ -197,18 +222,18 @@ async def test_absent_key_is_fatal_unsupported() -> None:
     await asyncio.sleep(0.05)
 
     assert len(errors) == 1
-    assert errors[0]["code"] == "WEBRTC_UNSUPPORTED"
+    assert errors[0]["code"] == "WEBRTC_NOT_SUPPORTED"
     assert errors[0]["fatal"] is True
     assert connected == []
     assert _audio_messages(fake_client) == []  # held input never replayed
     assert closed == [{}]
-    assert ("unsupported", {"reason": "sessionReady carried no webrtc result"}) in [
+    assert ("not_supported", {"reason": "sessionReady carried no webrtc result"}) in [
         (name, args) for (lane, name, args) in tracer.instants if lane == "webrtc"
     ]
     await client.close()
 
 
-async def test_unknown_result_status_is_fatal_unsupported() -> None:
+async def test_unknown_result_status_is_fatal_not_supported() -> None:
     """A webrtc result with an unrecognized status is reported, not ignored."""
     client, _fake_client, _tracer = make_client(
         session_parameters={"webrtc": {"version": 2, "status": "connecting"}},
@@ -218,7 +243,7 @@ async def test_unknown_result_status_is_fatal_unsupported() -> None:
     await client.start()
     await asyncio.sleep(0.05)
 
-    assert [e["code"] for e in errors] == ["WEBRTC_UNSUPPORTED"]
+    assert [e["code"] for e in errors] == ["WEBRTC_NOT_SUPPORTED"]
     assert "connecting" in errors[0]["message"]
     assert client._feed_gate_open() is False
     await client.close()
@@ -238,9 +263,9 @@ async def test_no_session_ready_within_timeout_is_fatal_and_closes() -> None:
     await asyncio.sleep(0.01)
 
     assert len(errors) == 1
-    assert errors[0]["code"] == "WEBRTC_JOIN_FAILED"
+    assert errors[0]["code"] == "WEBRTC_JOIN_TIMEOUT"
     assert errors[0]["fatal"] is True
-    assert "sessionReady" in errors[0]["message"]
+    assert "not ready within" in errors[0]["message"]
     assert client._preinit_inputs == []  # held input discarded on timeout
     assert _audio_messages(fake_client) == []
     assert closed == [{}]
@@ -274,12 +299,12 @@ async def test_second_session_ready_never_renegotiates() -> None:
     assert client._state.value == "connected"
 
     await client._handle_message(
-        OjinSessionReadyMessage(parameters=READY_UNSUPPORTED_PARAMETERS)
+        OjinSessionReadyMessage(parameters=READY_NOT_SUPPORTED_PARAMETERS)
     )
     assert client._state.value == "connected"  # not demoted
     assert errors == []
     assert not any(
-        name == "unsupported"
+        name == "not_supported"
         for (lane, name, _args) in tracer.instants
         if lane == "webrtc"
     )
@@ -314,7 +339,7 @@ async def test_token_never_in_logs_or_traces_any_outcome(caplog) -> None:
     for parameters in (
         READY_CONNECTED_PARAMETERS,
         READY_FAILED_PARAMETERS,
-        READY_UNSUPPORTED_PARAMETERS,
+        READY_NOT_SUPPORTED_PARAMETERS,
     ):
         client, _fake_client, tracer = make_client(session_parameters=parameters)
         with caplog.at_level(logging.DEBUG):

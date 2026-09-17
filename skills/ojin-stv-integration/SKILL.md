@@ -207,7 +207,9 @@ client = OjinSTVClient(
   speaking events still fire.
 - **No fallback.** A failed join, a `webrtc_join_timeout_s` expiry (default 10 s,
   includes cold start — use ~30 s in production) or an unsupporting server is a fatal
-  `ERROR` (`WEBRTC_JOIN_FAILED` / `WEBRTC_UNSUPPORTED`) and the session closes.
+  `ERROR` naming the cause (`WEBRTC_AUTH_FAILED`, `WEBRTC_NETWORK_FAILED`,
+  `WEBRTC_INVALID_SETTINGS`, `WEBRTC_JOIN_TIMEOUT`, `WEBRTC_ROOM_LOST` or
+  `WEBRTC_NOT_SUPPORTED`) and the session closes.
 - If your own bot is in the room, **unsubscribe from the avatar's audio** — detect it
   with `ojin.is_avatar_participant(participant)` (Daily) or
   `ojin.is_avatar_identity(identity)` (LiveKit) — or it will transcribe the avatar.

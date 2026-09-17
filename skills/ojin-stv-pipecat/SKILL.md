@@ -98,8 +98,10 @@ room_url=room_url, token=avatar_token)))`; with the adapter below, add the same
 - **Don't let the bot hear the avatar.** Unsubscribe from the participant for which
   `ojin.is_avatar_participant(participant)` (Daily) or
   `ojin.is_avatar_identity(identity)` (LiveKit) is true.
-- **Failures are fatal, never a silent fallback:** `WEBRTC_JOIN_FAILED` /
-  `WEBRTC_UNSUPPORTED` arrive as a fatal `ERROR` and the session closes.
+- **Failures are fatal, never a silent fallback:** `WEBRTC_AUTH_FAILED`,
+  `WEBRTC_NETWORK_FAILED`, `WEBRTC_INVALID_SETTINGS`, `WEBRTC_JOIN_TIMEOUT`,
+  `WEBRTC_ROOM_LOST` and `WEBRTC_NOT_SUPPORTED` arrive as a fatal `ERROR`, each
+  naming its cause, and the session closes.
 
 ## The avatar service
 

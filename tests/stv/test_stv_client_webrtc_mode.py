@@ -23,7 +23,7 @@ from tests.stv.test_webrtc_client import STATUS_FAILED_REJOIN, _frame
 from tests.stv.test_webrtc_negotiation import (
     READY_CONNECTED_PARAMETERS,
     READY_FAILED_PARAMETERS,
-    READY_UNSUPPORTED_PARAMETERS,
+    READY_NOT_SUPPORTED_PARAMETERS,
     ROOM_URL,
     TOKEN,
 )
@@ -201,8 +201,8 @@ async def test_custom_output_receives_no_frames() -> None:
 @pytest.mark.parametrize(
     ("parameters", "code"),
     [
-        (READY_FAILED_PARAMETERS, "WEBRTC_JOIN_FAILED"),
-        (READY_UNSUPPORTED_PARAMETERS, "WEBRTC_UNSUPPORTED"),
+        (READY_FAILED_PARAMETERS, "WEBRTC_AUTH_FAILED"),
+        (READY_NOT_SUPPORTED_PARAMETERS, "WEBRTC_NOT_SUPPORTED"),
     ],
 )
 async def test_webrtc_failure_is_reported_and_closes(
@@ -230,7 +230,7 @@ async def test_webrtc_failure_is_reported_and_closes(
 
 
 async def test_join_timeout_is_reported_and_closes() -> None:
-    """No sessionReady within the join timeout → fatal WEBRTC_JOIN_FAILED."""
+    """No sessionReady within the join timeout → fatal WEBRTC_JOIN_TIMEOUT."""
     client, _fake_client = make_client(fake=_NeverReadyClient(), join_timeout_s=0.05)
     errors = _record(client, STVEvent.ERROR)
     closed = _record(client, STVEvent.CLOSED)
@@ -238,7 +238,7 @@ async def test_join_timeout_is_reported_and_closes() -> None:
     await client.start()
     await asyncio.sleep(0.2)
 
-    assert [e["code"] for e in errors] == ["WEBRTC_JOIN_FAILED"]
+    assert [e["code"] for e in errors] == ["WEBRTC_JOIN_TIMEOUT"]
     assert closed == [{}]
 
 
@@ -253,7 +253,7 @@ async def test_mid_session_room_loss_is_reported_and_closes() -> None:
     await fake_client.push_webrtc_status(STATUS_FAILED_REJOIN)
     await asyncio.sleep(0.05)
 
-    assert [e["code"] for e in errors] == ["WEBRTC_JOIN_FAILED"]
+    assert [e["code"] for e in errors] == ["WEBRTC_ROOM_LOST"]
     assert "REJOIN_FAILED" in errors[0]["message"]
     assert closed == [{}]
     assert client.is_connected is False

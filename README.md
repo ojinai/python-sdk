@@ -352,8 +352,13 @@ avatar_token = (
 
 | `code` | Meaning |
 |---|---|
-| `WEBRTC_JOIN_FAILED` | The join was rejected (the message carries `AUTH`, `NETWORK` or `INVALID_SETTINGS`), the session wasn't ready within `webrtc_join_timeout_s` (default 10 s — it includes the model's cold start, so leave headroom), or the avatar lost the room mid-session |
-| `WEBRTC_UNSUPPORTED` | The server can't publish this session into a room |
+| `WEBRTC_AUTH_FAILED` | The room rejected the avatar's token |
+| `WEBRTC_NETWORK_FAILED` | Ojin couldn't reach the room |
+| `WEBRTC_INVALID_SETTINGS` | The room URL or provider was unusable |
+| `WEBRTC_JOIN_TIMEOUT` | The session wasn't ready within `webrtc_join_timeout_s` (default 10 s — it covers the model's cold start too, so leave headroom) |
+| `WEBRTC_ROOM_LOST` | The avatar dropped out of the room mid-session |
+| `WEBRTC_NOT_SUPPORTED` | The server returned no room result for this session |
+| `WEBRTC_JOIN_FAILED` | Fallback: the join failed with a code this SDK doesn't recognise |
 
 **Is your own bot in the room too?** Don't let it listen to the avatar, or it will transcribe the avatar's voice as user speech. Recognise the avatar with `is_avatar_participant(participant)` (a Daily participant dict) or `is_avatar_identity(identity)` (a LiveKit identity) — both exported from `ojin` — and unsubscribe from its audio.
 
@@ -458,8 +463,8 @@ async def main(pcm_16k_mono: bytes) -> None:
 - **`Inference Server is not ready`** (low-level) — wait for `OjinSessionReadyMessage` before calling `send_message()`.
 - **Choppy playback** — keep the event loop free; the SDK already decodes JPEG off-loop, but heavy synchronous work in your frame handlers will stall the 40 ms tick. Enable `STVConfig(lipsync_trace_enabled=True)` to inspect per-tick timing.
 - **Latency higher than expected** — the WebSocket transport is built for **server-to-server** use over a stable connection. Run the client on a backend (not an end-user device), ideally in **US East**, close to Ojin's inference; deliver the final media to end users over a realtime transport such as WebRTC — or publish straight into their room with [direct WebRTC](#direct-webrtc-daily--livekit). The client keeps a small video buffer (`initial_buffer_frames`) to absorb network jitter, since the server delivers at realtime 25 fps.
-- **`WEBRTC_JOIN_FAILED` with `AUTH`** — the token doesn't grant the avatar access to that room. On LiveKit, check the token's identity is exactly `ojin-avatar` and it allows publishing; on Daily, check the meeting token is for the same room as `room_url`.
-- **`WEBRTC_JOIN_FAILED` with no `sessionReady`** — the session didn't become ready within `webrtc_join_timeout_s`. It covers the model's cold start as well as the room join, so raise it (e.g. `30.0`) if it trips on first sessions.
+- **`WEBRTC_AUTH_FAILED`** — the token doesn't grant the avatar access to that room. On LiveKit, check the token's identity is exactly `ojin-avatar` and it allows publishing; on Daily, check the meeting token is for the same room as `room_url`.
+- **`WEBRTC_JOIN_TIMEOUT`** — the session didn't become ready within `webrtc_join_timeout_s`. It covers the model's cold start as well as the room join, so raise it (e.g. `30.0`) if it trips on first sessions.
 - **Your bot hears the avatar** — it's subscribed to the `ojin-avatar` participant's microphone. Detect it with `is_avatar_participant()` / `is_avatar_identity()` and unsubscribe.
 
 ---

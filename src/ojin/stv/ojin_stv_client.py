@@ -122,9 +122,11 @@ class OjinSTVClient(OutboundFeedMixin):
         Daily or LiveKit room instead of streaming frames back over the WebSocket.
         Input, interrupts and events work exactly the same; since the media goes to
         the room, ``output``/``decoder`` receive nothing and the output is simply
-        closed when the session ends. A failed or unsupported WebRTC session is a
-        fatal ``ERROR`` (``WEBRTC_JOIN_FAILED`` / ``WEBRTC_UNSUPPORTED``) that closes
-        the session.
+        closed when the session ends. A WebRTC session that cannot be opened (or
+        that loses the room) emits a fatal ``ERROR`` naming the cause —
+        ``WEBRTC_AUTH_FAILED``, ``WEBRTC_NETWORK_FAILED``,
+        ``WEBRTC_INVALID_SETTINGS``, ``WEBRTC_JOIN_TIMEOUT``, ``WEBRTC_ROOM_LOST``
+        or ``WEBRTC_NOT_SUPPORTED`` — and closes the session.
         """
         super().__init__()
         self._config = config or STVConfig()
