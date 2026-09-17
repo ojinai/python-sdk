@@ -134,10 +134,12 @@ Handlers may be sync or async; one failing handler never breaks the loops.
 | Event | Fires when | Kwargs |
 |---|---|---|
 | `SESSION_READY` | session is live (safe to send audio) | `session_data` |
+| `WEBRTC_CONNECTED` | direct WebRTC only: the avatar joined your room | `participant_id` |
+| `FIRST_FRAME` | the avatar's first video frame is out (to your output, or into the room) | `frame_type` |
 | `BOT_STARTED_SPEAKING` | a buffer is promoted to current | — |
 | `BOT_STOPPED_SPEAKING` | current buffer drains, none queued | — |
 | `INTERRUPTED` | `interrupt()` took effect | — |
-| `ERROR` | server/connection error | `message`, `fatal` (+ `code` on server-side errors) |
+| `ERROR` | server/connection/WebRTC error | `message`, `fatal` (+ `code` on server-side and WebRTC errors) |
 | `CLOSED` | session torn down | — |
 
 > Write handlers with defaults + `**_`, e.g. `def _err(message="", code=None,
@@ -173,6 +175,44 @@ class MyTransportSink:                          # structurally an STVOutput
 client = OjinSTVClient(api_key=..., config_id=..., output=MyTransportSink())
 # NOTE: with a custom sink, do NOT call output_stream() — consume your sink directly.
 ```
+
+## Direct WebRTC (LiveKit / Daily rooms)
+
+If your users are already in a **LiveKit** or **Daily** room, have Ojin publish the
+avatar straight into it instead of streaming frames back to you. It's one extra
+argument — every call, event and barge-in rule above stays the same:
+
+```python
+from ojin.stv import OjinSTVClient, WebRTCSettings
+
+client = OjinSTVClient(
+    api_key=creds.api_key,
+    config_id=creds.config_id,
+    webrtc=WebRTCSettings(
+        provider="livekit",                        # or "daily"
+        room_url="wss://my-project.livekit.cloud",  # Daily: the room URL
+        token=avatar_token,                        # the avatar participant's credential
+        audio_sample_rate=24000,                   # your TTS rate (avoids resampling)
+    ),
+)
+```
+
+- The server joins the room as the participant **`ojin-avatar`** and publishes its
+  audio + video. On LiveKit the token's identity must be exactly `ojin-avatar`
+  (publish rights; no subscribe needed); on Daily use a meeting token for the room.
+  The SDK does not create rooms or tokens.
+- **No frames come back**: `output_stream()` / your `STVOutput` receives nothing and
+  ends at close. Don't build a render path in this mode.
+- `WEBRTC_CONNECTED` fires when the avatar is in the room; `FIRST_FRAME` and the
+  speaking events still fire.
+- **No fallback.** A failed join, a `webrtc_join_timeout_s` expiry (default 10 s,
+  includes cold start — use ~30 s in production) or an unsupporting server is a fatal
+  `ERROR` naming the cause (`WEBRTC_AUTH_FAILED`, `WEBRTC_NETWORK_FAILED`,
+  `WEBRTC_INVALID_SETTINGS`, `WEBRTC_JOIN_TIMEOUT`, `WEBRTC_ROOM_LOST` or
+  `WEBRTC_NOT_SUPPORTED`) and the session closes.
+- If your own bot is in the room, **unsubscribe from the avatar's audio** — detect it
+  with `ojin.is_avatar_participant(participant)` (Daily) or
+  `ojin.is_avatar_identity(identity)` (LiveKit) — or it will transcribe the avatar.
 
 ## Barge-in (interruption)
 

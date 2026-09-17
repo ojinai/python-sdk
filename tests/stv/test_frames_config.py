@@ -2,7 +2,7 @@
 
 import pytest
 
-from ojin.stv.config import STVConfig, WebRTCSettings
+from ojin.stv.config import STVConfig, WebRTCProvider, WebRTCSettings
 from ojin.stv.frames import FrameType, STVAudioFrame, STVVideoFrame
 
 
@@ -46,3 +46,56 @@ def test_webrtc_settings_rejects_bad_rate(rate: int) -> None:
     """A rate that would misframe the 40 ms feed or divide-by-zero is rejected."""
     with pytest.raises(ValueError):
         WebRTCSettings(room_url="u", token="t", audio_sample_rate=rate)
+
+
+def test_webrtc_provider_defaults_to_daily() -> None:
+    """Omitting the provider keeps the historical Daily default."""
+    settings = WebRTCSettings(room_url="u", token="t")
+    assert settings.provider is WebRTCProvider.DAILY
+    assert settings.to_connect_query_params()["webrtc_provider"] == "daily"
+
+
+@pytest.mark.parametrize(
+    ("given", "expected"),
+    [
+        ("livekit", WebRTCProvider.LIVEKIT),
+        (" LiveKit ", WebRTCProvider.LIVEKIT),
+        ("DAILY", WebRTCProvider.DAILY),
+        (WebRTCProvider.LIVEKIT, WebRTCProvider.LIVEKIT),
+    ],
+)
+def test_webrtc_provider_normalized(given: object, expected: WebRTCProvider) -> None:
+    """Strings are normalized to the enum; the wire value stays the bare name."""
+    settings = WebRTCSettings(room_url="u", token="t", provider=given)  # type: ignore[arg-type]
+    assert settings.provider is expected
+    assert settings.to_connect_query_params()["webrtc_provider"] == expected.value
+
+
+def test_webrtc_provider_str_is_wire_value() -> None:
+    """Logging/f-strings show the bare provider name on every Python version."""
+    assert str(WebRTCProvider.DAILY) == "daily"
+    assert f"{WebRTCProvider.LIVEKIT}" == "livekit"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"provider": "zoom"},
+        {"room_url": ""},
+        {"room_url": "   "},
+        {"token": ""},
+        {"webrtc_join_timeout_s": 0},
+        {"webrtc_join_timeout_s": -1.0},
+    ],
+)
+def test_webrtc_settings_rejects_invalid_fields(overrides: dict) -> None:
+    """Unknown providers, empty credentials and non-positive timeouts fail early."""
+    kwargs = {"room_url": "u", "token": "t", **overrides}
+    with pytest.raises(ValueError):
+        WebRTCSettings(**kwargs)
+
+
+def test_webrtc_settings_invalid_provider_message_lists_known() -> None:
+    """The error names the supported providers."""
+    with pytest.raises(ValueError, match="daily, livekit"):
+        WebRTCSettings(room_url="u", token="t", provider="zoom")

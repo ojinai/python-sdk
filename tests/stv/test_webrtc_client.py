@@ -333,7 +333,7 @@ async def test_metadata_watchdog_logs_but_never_fails(caplog) -> None:
 
 
 async def test_failed_after_connected_is_fatal() -> None:
-    """A post-connected failed status (REJOIN_FAILED) is fatal like any other."""
+    """A post-connected failed status (REJOIN_FAILED) is a fatal room loss."""
     client, fake_client, _tracer = make_client()
     errors = _record(client, STVEvent.ERROR)
     await _connect(client, fake_client)
@@ -341,7 +341,7 @@ async def test_failed_after_connected_is_fatal() -> None:
 
     await fake_client.push_webrtc_status(STATUS_FAILED_REJOIN)
     assert len(errors) == 1
-    assert errors[0]["code"] == "WEBRTC_JOIN_FAILED"
+    assert errors[0]["code"] == "WEBRTC_ROOM_LOST"
     assert errors[0]["fatal"] is True
     assert "REJOIN_FAILED" in errors[0]["message"]
     await client.close()

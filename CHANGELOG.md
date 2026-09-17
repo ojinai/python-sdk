@@ -4,6 +4,55 @@ All notable changes to `ojin-client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0 — see CONTRIBUTING.md).
 
+## 0.11.0 - 2026-09-14
+
+### Added
+- **Direct WebRTC on `OjinSTVClient`.** Pass `webrtc=WebRTCSettings(...)` and the
+  inference server publishes the avatar straight into your Daily or LiveKit room;
+  omit it and the client uses the WebSocket path as before. `start()`,
+  `start_turn()`, `send_tts_audio()`, `say()`, `interrupt()`, `close()` and every
+  event behave the same on both transports. In WebRTC mode the media goes to the
+  room, so the output (`output_stream()` / your `STVOutput`) receives no frames and
+  is closed when the session ends. `OjinSTVWebRTCClient` remains available as the
+  underlying engine.
+- `WebRTCProvider` enum (`DAILY`, `LIVEKIT`). `WebRTCSettings.provider` accepts the
+  enum or a case-insensitive string; the wire value is unchanged.
+- `ojin.avatar_participant` (re-exported from `ojin` and `ojin.stv`):
+  `AVATAR_PARTICIPANT_USER_NAME`, `is_avatar_participant()` (Daily participant
+  dict) and `is_avatar_identity()` (LiveKit identity), so a bot sharing the room can
+  recognise the `ojin-avatar` participant and not listen to it. Dependency-free.
+- `STVEvent.FIRST_FRAME` now also fires in WebSocket mode, on the first video frame
+  emitted, so one listener works on both transports.
+- `examples/03-direct-webrtc`.
+
+### Changed
+- **BREAKING:** a server that answers a WebRTC request without a `webrtc` result, or
+  with an unrecognised status, is now a fatal `ERROR` with code
+  `WEBRTC_NOT_SUPPORTED`. Previously the session silently continued in "relay" mode,
+  which fed audio at the declared rate to a server expecting 16 kHz and never put an
+  avatar in the room.
+- WebRTC failures carry a `code` per cause, so a caller can branch on it without
+  parsing the message: `WEBRTC_AUTH_FAILED`, `WEBRTC_NETWORK_FAILED`,
+  `WEBRTC_INVALID_SETTINGS` (mapped from the server's join error), plus
+  `WEBRTC_JOIN_TIMEOUT`, `WEBRTC_ROOM_LOST` and `WEBRTC_NOT_SUPPORTED`.
+  `WEBRTC_JOIN_FAILED` remains only as the fallback for an unrecognised server code.
+- **BREAKING:** every fatal error in WebRTC mode (the codes above, or a server
+  `errorResponse`) now closes the session: `CLOSED` follows the `ERROR`. `close()`
+  is idempotent.
+- **BREAKING:** `WebRTCSettings` validates at construction. An unknown `provider`,
+  an empty `room_url` or `token`, or a non-positive `webrtc_join_timeout_s` raises
+  `ValueError`.
+
+### Fixed
+- A `sessionReady` arriving after the WebRTC join timeout no longer marks the
+  session connected, and the join timer is stopped before `SESSION_READY` handlers
+  run.
+
+## 0.10.1 - 2026-08-05
+
+### Changed
+- `STVConfig.server_feed_max_chunk_bytes` default raised from 50 KB to 200 KB.
+
 ## 0.10.0 - 2026-07-24
 
 ### Changed
