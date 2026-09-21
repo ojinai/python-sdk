@@ -182,7 +182,6 @@ class OjinClient(IOjinClient):
         self._inference_server_ready: bool = False
         self._cancelled: bool = False
         self._outbound_generation: int = 0
-        self._audio_send_callback: Callable[[str, int], None] | None = None
         self._active_interaction_id: str | None = None
         self._process_messages_task: Optional[asyncio.Task] = None
         self._pending_client_messages_queue: asyncio.Queue[OjinMessage] = (
@@ -198,25 +197,6 @@ class OjinClient(IOjinClient):
         # webrtc_* query params, the meeting token as the X-Ojin-Webrtc-Token
         # header. Carries a secret — never log it.
         self._webrtc_settings: Optional["WebRTCSettings"] = None
-
-    def set_audio_send_callback(
-        self, callback: Callable[[str, int], None] | None
-    ) -> None:
-        """Observe audio socket-call start/completion with PCM byte counts.
-
-        The synchronous callback runs after pacing, immediately before
-        ``ws.send`` and after it returns. Completion includes socket flow-control
-        waits; neither event acknowledges server receipt. Exceptions are logged
-        without interrupting audio delivery. Pass ``None`` to remove the observer.
-        """
-        self._audio_send_callback = callback
-
-    def _record_audio_send(self, event: str, byte_count: int) -> None:
-        if self._audio_send_callback is not None:
-            try:
-                self._audio_send_callback(event, byte_count)
-            except Exception:
-                logger.exception("Audio send observer failed")
 
     def set_webrtc_connect_settings(self, settings: "WebRTCSettings") -> None:
         """Declare direct-WebRTC settings for the connection's upgrade request.
@@ -632,10 +612,7 @@ class OjinClient(IOjinClient):
                     )
                     proxy_message = InteractionInputMessage(payload=interaction_input)
 
-                    payload = proxy_message.to_bytes()
-                    self._record_audio_send("audio_send_start", len(chunk))
-                    await self._ws.send(payload)
-                    self._record_audio_send("audio_send_complete", len(chunk))
+                    await self._ws.send(proxy_message.to_bytes())
                     self._last_audio_send_t = time.monotonic()
 
             elif isinstance(message, OjinTextInputMessage):

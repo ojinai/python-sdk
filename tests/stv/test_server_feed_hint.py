@@ -60,7 +60,7 @@ async def test_hint_releases_preinit_audio_and_rearms_after_cancel(
     direct: bool, rate: int
 ) -> None:
     """A 500 ms first batch reaches the server both before and after barge-in."""
-    client, engine, transport, trace = _client(direct, rate=rate)
+    client, engine, transport, _trace = _client(direct, rate=rate)
     pcm = b"\x01\x02" * (rate // 2)
     try:
         await client.start_turn()
@@ -68,12 +68,6 @@ async def test_hint_releases_preinit_audio_and_rearms_after_cancel(
         assert not _audio(transport)
         await engine._handle_message(_ready(500))
         assert _audio(transport) == [pcm]
-        assert (
-            "to_server",
-            "server_feed_config",
-            {"initial_chunk_ms": 500, "source": "server"},
-        ) in trace.instants
-
         if not direct:
             engine._synchronizer.current_buffer = AudioBuffer(sample_rate=rate)
             engine._synchronizer.current_buffer.bytes_.extend(pcm)

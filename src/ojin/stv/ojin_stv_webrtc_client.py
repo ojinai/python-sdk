@@ -202,8 +202,7 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         self._set_trace_other("producer", "ojin_stv_webrtc_client")
         self._set_trace_other(
             "recv_latency_semantics",
-            "recv marks local receipt of speech metadata over WebSocket, "
-            "not server publication or browser media playback",
+            "recv marks server publish time of the metadata frame, not media arrival",
         )
         register = getattr(self._client, "set_webrtc_status_callback", None)
         if callable(register):
