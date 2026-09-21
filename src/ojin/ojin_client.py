@@ -181,6 +181,7 @@ class OjinClient(IOjinClient):
         self._ingress_bytes_total: int = 0
         self._inference_server_ready: bool = False
         self._cancelled: bool = False
+        self._outbound_generation: int = 0
         self._active_interaction_id: str | None = None
         self._process_messages_task: Optional[asyncio.Task] = None
         self._pending_client_messages_queue: asyncio.Queue[OjinMessage] = (
@@ -520,11 +521,11 @@ class OjinClient(IOjinClient):
             raise ConnectionError("Inference Server is not ready to receive messages")
 
         if isinstance(message, OjinCancelInteractionMessage):
+            self._outbound_generation += 1
             self._cancelled = True
             # Drop any audio still queued to be sent for the turn being cancelled:
-            # the server discards post-cancel input, so forwarding it would only
-            # desync the next turn. (The in-flight send loop also bails on
-            # ``_cancelled`` between chunks — see _process_client_messages.)
+            # the generation also retires the sender's current message when a
+            # cancel finishes before its pacing sleep or socket send returns.
             self._drain_client_messages()
             cancel_input = CancelInteractionMessage(payload=message.to_proxy_message())
 
@@ -570,6 +571,7 @@ class OjinClient(IOjinClient):
                 continue
 
             message: OjinMessage = await self._pending_client_messages_queue.get()
+            generation = self._outbound_generation
             if isinstance(message, OjinAudioInputMessage):
                 max_chunk_size = self._max_input_chunk_bytes
                 audio_chunks = [
@@ -582,7 +584,7 @@ class OjinClient(IOjinClient):
                     audio_chunks.append(bytes())
 
                 for chunk in audio_chunks:
-                    if self._cancelled:
+                    if self._cancelled or generation != self._outbound_generation:
                         # A cancel landed mid-send: abandon the rest of this (now
                         # cancelled) turn's audio instead of finishing the burst.
                         break
@@ -600,7 +602,7 @@ class OjinClient(IOjinClient):
                         elapsed = time.monotonic() - self._last_audio_send_t
                         if elapsed < self._send_chunk_gap_s:
                             await asyncio.sleep(self._send_chunk_gap_s - elapsed)
-                        if self._cancelled:
+                        if self._cancelled or generation != self._outbound_generation:
                             break  # a cancel landed during the pacing sleep
                     interaction_input = InteractionInput(
                         payload_type="audio",

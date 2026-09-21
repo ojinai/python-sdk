@@ -4,6 +4,14 @@ All notable changes to `ojin-client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0 — see CONTRIBUTING.md).
 
+## Unreleased
+
+### Fixed
+
+- Cancelling speech now discards the unsent remainder of a split audio message
+  even when cancellation finishes during a pacing delay or socket send. Fresh
+  replies continue normally after cancellation.
+
 ## 0.11.0 - 2026-09-14
 
 ### Added
