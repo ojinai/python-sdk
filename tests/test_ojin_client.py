@@ -141,6 +141,10 @@ async def test_cancel_retires_inflight_audio_and_preserves_fresh_reply(
     client._running = True
     client._inference_server_ready = True
     client._ws = PausedWS()  # type: ignore[assignment]
+    send_events = []
+    client.set_audio_send_callback(
+        lambda event, size: send_events.append((event, size))
+    )
     await client.send_message(_audio_msg(b"\x01\x02" * 279014))
     await client.send_message(_audio_msg(b"\x05\x06" * 640))
     task = asyncio.create_task(client._process_client_messages())
@@ -169,6 +173,27 @@ async def test_cancel_retires_inflight_audio_and_preserves_fresh_reply(
     assert all(
         json.loads(message)["type"] == "cancelInteraction" for message in sent[1:-1]
     )
+    assert send_events == [
+        ("audio_send_start", 204800),
+        ("audio_send_complete", 204800),
+        ("audio_send_start", len(fresh_audio)),
+        ("audio_send_complete", len(fresh_audio)),
+    ]
+
+
+async def test_audio_send_callback_failure_does_not_stop_sending():
+    """Trace observers cannot interrupt audio delivery or its sender task."""
+    client = _client()
+    client._running = True
+    client._ws = _FakeWS()
+
+    def fail_observer(_event, _size):
+        raise RuntimeError("trace collector unavailable")
+
+    client.set_audio_send_callback(fail_observer)
+    await client._pending_client_messages_queue.put(_audio_msg(b"\x01\x02" * 3200))
+    await _drain_send_loop(client, expected_sends=1, real_sleep=asyncio.sleep)
+    assert len(client._ws.sent) == 1
 
 
 async def test_reply_after_cancel_survives_sender_waiting_on_empty_queue() -> None:

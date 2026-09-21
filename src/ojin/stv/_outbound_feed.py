@@ -33,6 +33,8 @@ logger = logging.getLogger(__name__)
 # conversion is an instance value (`_bytes_per_ms`) derived from the feed rate;
 # 16 kHz stays the default so the legacy client is byte-identical.
 FEED_SAMPLE_RATE = 16_000
+_DEFAULT_INITIAL_CHUNK_MS = 1000
+_MAX_SERVER_INITIAL_CHUNK_MS = 8000
 
 
 class OutboundFeedMixin:
@@ -60,10 +62,14 @@ class OutboundFeedMixin:
         # ms = bytes / _bytes_per_ms, for the batcher thresholds and the lead
         # clock. Derived from the feed rate so both clients share one formula.
         self._bytes_per_ms = feed_sample_rate * 2 / 1000.0
+        observe_send = getattr(self._client, "set_audio_send_callback", None)
+        if callable(observe_send):
+            observe_send(self._trace_audio_send)
+        initial_ms = self._config.server_feed_initial_chunk_ms
+        if initial_ms is None:
+            initial_ms = _DEFAULT_INITIAL_CHUNK_MS
         self._batcher = SendBatcher(
-            initial_chunk_bytes=int(
-                self._config.server_feed_initial_chunk_ms * self._bytes_per_ms
-            ),
+            initial_chunk_bytes=int(initial_ms * self._bytes_per_ms),
             min_chunk_bytes=int(
                 self._config.server_feed_min_chunk_ms * self._bytes_per_ms
             ),
@@ -107,6 +113,26 @@ class OutboundFeedMixin:
         # turn's own trailing audio must still be dropped, not replayed).
         self._interrupt_deferred: list[tuple] = []
         self._deferring_input = False
+
+    def _configure_server_feed(self, parameters: dict | None) -> None:
+        initial_ms = self._config.server_feed_initial_chunk_ms
+        source = "explicit"
+        if initial_ms is None:
+            hint = (parameters or {}).get("server_feed_initial_chunk_ms")
+            if (
+                isinstance(hint, int)
+                and not isinstance(hint, bool)
+                and 0 < hint <= _MAX_SERVER_INITIAL_CHUNK_MS
+            ):
+                initial_ms, source = hint, "server"
+            else:
+                initial_ms, source = _DEFAULT_INITIAL_CHUNK_MS, "fallback"
+        self._batcher.set_initial_chunk_bytes(int(initial_ms * self._bytes_per_ms))
+        self._tracer.instant(
+            "to_server",
+            "server_feed_config",
+            args={"initial_chunk_ms": initial_ms, "source": source},
+        )
 
     # ------------------------------------------------------------------
     # Host seams
@@ -288,11 +314,14 @@ class OutboundFeedMixin:
             args={"bytes": len(pcm), "lead_ms": round(self._server_lead_ms())},
         )
 
+    def _trace_audio_send(self, event: str, byte_count: int) -> None:
+        self._tracer.instant("to_server", event, args={"bytes": byte_count})
+
     async def _send_audio_now(self, pcm: bytes) -> None:
         """Send one server-bound audio payload and record the to_server trace."""
         await self._client.send_message(OjinAudioInputMessage(audio_int16_bytes=pcm))
         self._server_fed_ms += len(pcm) / self._bytes_per_ms
-        self._tracer.instant("to_server", "audio_sent", args={"bytes": len(pcm)})
+        self._tracer.instant("to_server", "audio_enqueued", args={"bytes": len(pcm)})
 
     async def _server_feed_loop(self) -> None:
         """Release lead-gated payloads as playback advances (lead cap only).

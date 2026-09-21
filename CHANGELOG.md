@@ -6,6 +6,24 @@ All notable changes to `ojin-client` are documented here. The format follows
 
 ## Unreleased
 
+## 0.12.0 - 2026-09-21
+
+### Added
+
+- STV clients accept the server's recommended initial audio batch size before
+  replaying queued TTS. Human Portrait 2 servers can request 500 ms; servers
+  without a valid hint retain 1000 ms. Explicit `server_feed_initial_chunk_ms`
+  settings still take precedence; the default `None` selects automatic tuning.
+- Audio traces record `audio_send_start` and `audio_send_complete` around each
+  WebSocket send. `OjinClient.set_audio_send_callback()` exposes the same events
+  with PCM byte counts; send completion does not acknowledge server receipt.
+
+### Changed
+
+- Renamed the STV trace marker `audio_sent` to `audio_enqueued` to describe its
+  actual timing. Direct WebRTC receive-latency metadata now identifies local
+  speech-metadata receipt, which precedes browser media playback.
+
 ### Fixed
 
 - Cancelling speech now discards the unsent remainder of a split audio message

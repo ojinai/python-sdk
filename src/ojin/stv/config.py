@@ -161,7 +161,9 @@ class STVConfig:
     # chunk per turn, then a steady-state minimum. Disable to restore per-chunk
     # sends. (Playback of the original audio is unaffected.)
     server_feed_batching_enabled: bool = True
-    server_feed_initial_chunk_ms: int = 1000
+    # None accepts the server's startup recommendation, or 1000 ms without one.
+    # An explicit value preserves application tuning across server upgrades.
+    server_feed_initial_chunk_ms: int | None = None
     server_feed_min_chunk_ms: int = 400
     server_feed_flush_idle_ms: int = 200
     # Server-feed send pacing (enforced by the transport, OjinClient). A backlog can
