@@ -6,7 +6,10 @@ import json
 
 import pytest
 
-from ojin.entities.interaction_messages import ErrorResponseMessage
+from ojin.entities.interaction_messages import (
+    ErrorResponseMessage,
+    InteractionInputMessage,
+)
 from ojin.entities.session_messages import SessionUpdateMessage, SessionUpdatePayload
 from ojin.ojin_client import OjinClient
 from ojin.ojin_client_messages import (
@@ -97,6 +100,118 @@ async def test_cancel_drops_pending_client_messages() -> None:
     assert len(client._ws.sent) == 1  # only the cancel frame reached the wire
 
 
+@pytest.mark.parametrize("blocked_at", ["pacing", "send"])
+@pytest.mark.parametrize("cancel_count", [1, 2])
+async def test_cancel_retires_inflight_audio_and_preserves_fresh_reply(
+    monkeypatch, blocked_at: str, cancel_count: int
+) -> None:
+    """Cancel split audio across an await while keeping the next reply intact."""
+    blocked = asyncio.Event()
+    release = asyncio.Event()
+    fresh_sent = asyncio.Event()
+    real_sleep = asyncio.sleep
+    fresh_audio = b"\x03\x04" * 640
+
+    class PausedWS(_FakeWS):
+        async def send(self, data) -> None:
+            await super().send(data)
+            if isinstance(data, bytes):
+                audio = InteractionInputMessage.from_bytes(data).payload.payload
+                if audio == fresh_audio:
+                    fresh_sent.set()
+                elif blocked_at == "send" and not blocked.is_set():
+                    blocked.set()
+                    await release.wait()
+
+    async def paced_sleep(delay):
+        if blocked_at == "pacing" and delay > 0 and not blocked.is_set():
+            blocked.set()
+            await release.wait()
+        else:
+            await real_sleep(0)
+
+    monkeypatch.setattr(asyncio, "sleep", paced_sleep)
+    client = OjinClient(
+        ws_url="ws://test/realtime",
+        api_key="k",
+        config_id="c",
+        max_input_chunk_bytes=204800,
+        send_chunk_gap_s=0.2,
+    )
+    client._running = True
+    client._inference_server_ready = True
+    client._ws = PausedWS()  # type: ignore[assignment]
+    await client.send_message(_audio_msg(b"\x01\x02" * 279014))
+    await client.send_message(_audio_msg(b"\x05\x06" * 640))
+    task = asyncio.create_task(client._process_client_messages())
+    try:
+        await asyncio.wait_for(blocked.wait(), 1)
+        assert client._pending_client_messages_queue.qsize() == 1
+        for _ in range(cancel_count):
+            await client.send_message(OjinCancelInteractionMessage())
+        assert client._pending_client_messages_queue.empty()
+        await client.send_message(_audio_msg(fresh_audio))
+        release.set()
+        await asyncio.wait_for(fresh_sent.wait(), 1)
+    finally:
+        client._running = False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    sent = client._ws.sent
+    assert [
+        len(InteractionInputMessage.from_bytes(message).payload.payload)
+        for message in sent
+        if isinstance(message, bytes)
+    ] == [204800, len(fresh_audio)]
+    assert len(sent) == cancel_count + 2
+    assert all(
+        json.loads(message)["type"] == "cancelInteraction" for message in sent[1:-1]
+    )
+
+
+async def test_reply_after_cancel_survives_sender_waiting_on_empty_queue() -> None:
+    """A sender awaiting its next message must use that message's generation."""
+    waiting = asyncio.Event()
+    sent = asyncio.Event()
+
+    class WaitingQueue(asyncio.Queue):
+        async def get(self):
+            waiting.set()
+            return await super().get()
+
+    class NotifyingWS(_FakeWS):
+        async def send(self, data) -> None:
+            await super().send(data)
+            if isinstance(data, bytes):
+                sent.set()
+
+    client = _client()
+    client._running = True
+    client._inference_server_ready = True
+    client._ws = NotifyingWS()  # type: ignore[assignment]
+    client._pending_client_messages_queue = WaitingQueue()
+    task = asyncio.create_task(client._process_client_messages())
+    fresh_audio = b"\x03\x04" * 640
+    try:
+        await asyncio.wait_for(waiting.wait(), 1)
+        await client.send_message(OjinCancelInteractionMessage())
+        await client.send_message(_audio_msg(fresh_audio))
+        await asyncio.wait_for(sent.wait(), 1)
+    finally:
+        client._running = False
+        task.cancel()
+        with contextlib.suppress(asyncio.CancelledError):
+            await task
+
+    assert len(client._ws.sent) == 2
+    assert (
+        InteractionInputMessage.from_bytes(client._ws.sent[1]).payload.payload
+        == fresh_audio
+    )
+
+
 async def test_large_audio_split_into_max_chunks_and_paced(monkeypatch) -> None:
     """A payload larger than the cap is split, and split chunks are gapped."""
     real_sleep = asyncio.sleep
@@ -116,8 +231,9 @@ async def test_large_audio_split_into_max_chunks_and_paced(monkeypatch) -> None:
         send_chunk_gap_s=0.2,
     )
     client._running = True
+    client._inference_server_ready = True
     client._ws = _FakeWS()  # type: ignore[assignment]
-    await client._pending_client_messages_queue.put(_audio_msg(b"\x01\x02\x03\x04" * 3))
+    await client.send_message(_audio_msg(b"\x01\x02\x03\x04" * 3))
 
     await _drain_send_loop(client, expected_sends=3, real_sleep=real_sleep)
 
@@ -143,8 +259,9 @@ async def test_single_message_sends_without_gap(monkeypatch) -> None:
         ws_url="ws://t", api_key="k", config_id="c", send_chunk_gap_s=0.2
     )
     client._running = True
+    client._inference_server_ready = True
     client._ws = _FakeWS()  # type: ignore[assignment]
-    await client._pending_client_messages_queue.put(_audio_msg(b"\x01\x02" * 10))
+    await client.send_message(_audio_msg(b"\x01\x02" * 10))
 
     await _drain_send_loop(client, expected_sends=1, real_sleep=real_sleep)
 
@@ -167,9 +284,10 @@ async def test_backlog_of_messages_is_paced(monkeypatch) -> None:
         ws_url="ws://t", api_key="k", config_id="c", send_chunk_gap_s=0.2
     )
     client._running = True
+    client._inference_server_ready = True
     client._ws = _FakeWS()  # type: ignore[assignment]
     for _ in range(3):
-        await client._pending_client_messages_queue.put(_audio_msg(b"\x01\x02" * 10))
+        await client.send_message(_audio_msg(b"\x01\x02" * 10))
 
     await _drain_send_loop(client, expected_sends=3, real_sleep=real_sleep)
 
@@ -202,14 +320,13 @@ async def test_interleaved_producer_is_still_paced(monkeypatch) -> None:
         ws_url="ws://t", api_key="k", config_id="c", send_chunk_gap_s=0.2
     )
     client._running = True
+    client._inference_server_ready = True
     client._ws = _FakeWS()  # type: ignore[assignment]
 
     task = asyncio.create_task(client._process_client_messages())
     try:
         for i in range(3):
-            await client._pending_client_messages_queue.put(
-                _audio_msg(b"\x01\x02" * 10)
-            )
+            await client.send_message(_audio_msg(b"\x01\x02" * 10))
             # Wait for THIS message to hit the wire before enqueueing the next —
             # the queue is empty at every gap decision, mimicking the replay race.
             for _ in range(200):

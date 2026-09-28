@@ -4,6 +4,20 @@ All notable changes to `ojin-client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0 — see CONTRIBUTING.md).
 
+## 0.11.1 - 2026-09-28
+
+### Added
+- `STVConfig.server_feed_fixed_chunk_size` opts into exact initial and steady
+  audio packet sizes. Oversized TTS inputs split without padding; short tails
+  still flush after the idle timeout or at a turn boundary. Default batching
+  continues to send all available audio once its minimum threshold is reached.
+- Server-feed traces distinguish queued audio from completed WebSocket writes,
+  including audio duration, queue wait, and socket write time.
+
+### Fixed
+- Cancellation retires an in-flight audio payload even when the cancel finishes
+  during its pacing delay or socket write, preserving the next reply.
+
 ## 0.11.0 - 2026-09-14
 
 ### Added

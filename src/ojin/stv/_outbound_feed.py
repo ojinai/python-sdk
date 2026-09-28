@@ -17,6 +17,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import logging
+import math
 from collections import deque
 from typing import Optional
 
@@ -60,14 +61,20 @@ class OutboundFeedMixin:
         # ms = bytes / _bytes_per_ms, for the batcher thresholds and the lead
         # clock. Derived from the feed rate so both clients share one formula.
         self._bytes_per_ms = feed_sample_rate * 2 / 1000.0
+        initial_ms = self._config.server_feed_initial_chunk_ms
+        steady_ms = self._config.server_feed_min_chunk_ms
+        if self._config.server_feed_fixed_chunk_size:
+            # Round up to whole PCM16 samples so packets never split a sample.
+            initial_bytes = math.ceil(initial_ms * feed_sample_rate / 1000) * 2
+            steady_bytes = math.ceil(steady_ms * feed_sample_rate / 1000) * 2
+        else:
+            initial_bytes = int(initial_ms * self._bytes_per_ms)
+            steady_bytes = int(steady_ms * self._bytes_per_ms)
         self._batcher = SendBatcher(
-            initial_chunk_bytes=int(
-                self._config.server_feed_initial_chunk_ms * self._bytes_per_ms
-            ),
-            min_chunk_bytes=int(
-                self._config.server_feed_min_chunk_ms * self._bytes_per_ms
-            ),
+            initial_chunk_bytes=initial_bytes,
+            min_chunk_bytes=steady_bytes,
             flush_idle_s=self._config.server_feed_flush_idle_ms / 1000.0,
+            fixed_chunk_size=self._config.server_feed_fixed_chunk_size,
         )
         self._batch_added = asyncio.Event()
         self._batch_flush_task: Optional[asyncio.Task] = None
@@ -244,8 +251,9 @@ class OutboundFeedMixin:
         if self._config.server_feed_batching_enabled:
             to_send = self._batcher.add(resampled)
             self._batch_added.set()  # any arrival resets the idle-flush timer
-            if to_send is not None:
+            while to_send is not None:
                 await self._send_audio_message(to_send)
+                to_send = self._batcher.pop_ready()
         else:
             await self._send_audio_message(resampled)
 
@@ -289,10 +297,28 @@ class OutboundFeedMixin:
         )
 
     async def _send_audio_now(self, pcm: bytes) -> None:
-        """Send one server-bound audio payload and record the to_server trace."""
+        """Queue one server-bound audio payload and record its audio duration."""
         await self._client.send_message(OjinAudioInputMessage(audio_int16_bytes=pcm))
         self._server_fed_ms += len(pcm) / self._bytes_per_ms
-        self._tracer.instant("to_server", "audio_sent", args={"bytes": len(pcm)})
+        self._tracer.instant(
+            "to_server",
+            "audio_queued",
+            args={"bytes": len(pcm), "duration_ms": len(pcm) / self._bytes_per_ms},
+        )
+
+    def _record_audio_sent(
+        self, byte_count: int, queue_wait_ms: float, send_ms: float
+    ) -> None:
+        self._tracer.instant(
+            "to_server",
+            "audio_sent",
+            args={
+                "bytes": byte_count,
+                "duration_ms": byte_count / self._bytes_per_ms,
+                "queue_wait_ms": round(queue_wait_ms, 3),
+                "send_ms": round(send_ms, 3),
+            },
+        )
 
     async def _server_feed_loop(self) -> None:
         """Release lead-gated payloads as playback advances (lead cap only).
@@ -364,6 +390,9 @@ class OutboundFeedMixin:
 
     def _start_feed_tasks(self) -> None:
         """Start the batch-flush and lead-gate feeder tasks (idempotent)."""
+        register = getattr(self._client, "set_audio_sent_callback", None)
+        if callable(register):
+            register(self._record_audio_sent)
         if self._config.server_feed_batching_enabled and self._batch_flush_task is None:
             self._batch_flush_task = asyncio.create_task(self._batch_flush_loop())
         if self._server_feed_max_lead_ms > 0 and self._feed_task is None:
