@@ -536,7 +536,6 @@ class OjinSTVClient(OutboundFeedMixin):
         if isinstance(message, OjinSessionReadyMessage):
             if message.parameters is not None:
                 self._session_data = message.parameters
-            self._configure_server_feed(message.parameters)
             self._initialized = True
             self._tracer.span("lifecycle", "connect", self._tr_connect_start)
             if self._playback_task is None:

@@ -64,6 +64,46 @@ async def _wait_for_writes(sent, count: int) -> None:
     assert len(sent) == count
 
 
+@pytest.mark.parametrize("direct", [False, True])
+async def test_presence_threshold_sends_whole_burst_then_rearms(direct: bool) -> None:
+    """A 320 ms startup threshold preserves larger TTS bursts across turns."""
+    transport = FakeOjinClient()
+    config = _config()
+    config.server_feed_initial_chunk_ms = 320
+    config.server_feed_fixed_chunk_size = False
+    client = OjinSTVClient(
+        client=transport,
+        config=config,
+        webrtc=(
+            WebRTCSettings(
+                room_url="https://ojin.daily.co/presence-feed", token="test-token"
+            )
+            if direct
+            else None
+        ),
+    )
+    engine = client._webrtc or client
+    pcm = b"\x01\x02" * 16000
+    try:
+        await engine._handle_message(
+            OjinSessionReadyMessage(parameters=READY_CONNECTED_PARAMETERS)
+        )
+        await client.start_turn()
+        await client.send_tts_audio(pcm[:3200], 16000, 1)
+        assert not _audio(transport)
+        await client.send_tts_audio(pcm[3200:], 16000, 1)
+        assert _audio(transport) == [pcm]
+
+        await client.start_turn()
+        initial = pcm[: 320 * 32]
+        await client.send_tts_audio(initial[:-2], 16000, 1)
+        assert _audio(transport) == [pcm]
+        await client.send_tts_audio(initial[-2:], 16000, 1)
+        assert _audio(transport) == [pcm, initial]
+    finally:
+        await client.close()
+
+
 @pytest.mark.parametrize("direct,rate", [(False, 16000), (True, 24000), (True, 44100)])
 async def test_oversized_input_preserves_exact_packets_tail_and_cancel_rearm(
     direct: bool, rate: int
