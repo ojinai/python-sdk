@@ -163,7 +163,9 @@ asyncio.run(main())
 
 **Turns.** A turn is one spoken utterance. Open it with `start_turn()`, then push audio with `send_tts_audio(pcm, sample_rate, num_channels)` as many times as you like. The client buffers and plays the **original** audio you sent while a 16 kHz copy goes to the server for lip-sync — so the voice the user hears is always exactly yours. Because the original is what's played back, you can feed **higher-quality** TTS (e.g. 24 kHz) for better sound and lip-sync still works on the 16 kHz copy — just set your player to the `sample_rate` each `STVAudioFrame` reports.
 
-**Input shaping.** Feed audio at whatever cadence your TTS produces — even tiny 40 ms fragments. The client takes care of the input shape to optimize latency and stability: it primes a ~1 s lead after each `start_turn()`, then combines your audio into **≥400 ms** chunks before forwarding it to the server, so the inference head never starves and lip-sync stays stable. It's automatic — tune it (or restore per-chunk sends) with the `server_feed_*` fields on [`STVConfig`](#configuration).
+**Input shaping.** Feed audio at whatever cadence your TTS produces, including 40 ms fragments. After each `start_turn()`, the client accumulates the server's recommended initial audio duration, or 1,000 ms if no valid recommendation is available. An explicit `server_feed_initial_chunk_ms` overrides the recommendation. Subsequent batches use a 400 ms minimum by default. Once a threshold is met, the client sends all available audio, subject to the transport's packet-size cap. A 1-second TTS packet stays together even if the initial threshold is 500 ms.
+
+Use `server_feed_fixed_chunk_size=True` only when you want exact initial and subsequent packet sizes. The SDK rounds those sizes up to complete PCM16 samples, retains overflow for the next packet, and flushes short tails without padding. Tune batching and send spacing with the `server_feed_*` fields on [`STVConfig`](#configuration).
 
 **Audio is the clock.** The playback loop emits **exactly one audio frame every tick** (real audio or silence so the consumer never starves) plus a video frame whenever one is ready, at `STVConfig.fps` (default 25 → a 40 ms tick). Video falls back to repeating the last frame rather than stalling.
 
@@ -379,9 +381,11 @@ avatar_token = (
 | `interrupt_audio_fade_s` | `0.75` | Fade length applied on barge-in |
 | `lipsync_trace_enabled` | `False` | Emit the per-tick A/V-sync diagnostics |
 | `server_feed_batching_enabled` | `True` | Prime + combine the server-bound audio feed (`False` = send each chunk as-is) |
-| `server_feed_initial_chunk_ms` | `1000` | Initial lead accumulated after each `start_turn()` |
+| `server_feed_initial_chunk_ms` | `None` | Accept the server's initial-batch recommendation (1,000 ms fallback); an explicit duration overrides it |
 | `server_feed_min_chunk_ms` | `400` | Steady-state minimum send size |
 | `server_feed_flush_idle_ms` | `200` | Quiet time before flushing a sub-threshold tail |
+| `server_feed_fixed_chunk_size` | `False` | Emit exact batch sizes rounded up to complete PCM16 samples; otherwise send the whole available batch |
+| `server_feed_send_gap_ms` | `200` | Minimum wait after an audio write before the next write starts |
 
 Video frames are emitted at the server's native resolution — read `STVVideoFrame.width`/`height` per frame rather than configuring an output size. Set `OJIN_MODE=dev` in the environment to attach the dev-mode query flag when connecting with the default transport.
 

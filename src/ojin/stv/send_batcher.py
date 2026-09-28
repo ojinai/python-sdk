@@ -115,6 +115,10 @@ class SendBatcher:
         """Make the next emit use the initial (lead) threshold again."""
         self._next_is_initial = True
 
+    def set_initial_chunk_bytes(self, byte_count: int) -> None:
+        """Change the initial threshold without losing pending audio or rearming."""
+        self._initial_chunk_bytes = byte_count
+
     def reset(self) -> None:
         """Discard buffered bytes and re-arm the initial threshold (barge-in)."""
         self._buf.clear()
