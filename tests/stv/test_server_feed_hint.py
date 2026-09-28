@@ -118,6 +118,29 @@ async def test_explicit_threshold_overrides_server_hint(direct: bool) -> None:
 
 
 @pytest.mark.parametrize("direct", [False, True])
+async def test_portrait_threshold_sends_whole_burst_then_rearms(direct: bool) -> None:
+    """An explicit 200 ms lead overrides older hints and preserves TTS bursts."""
+    client, engine, transport, _trace = _client(direct, initial=200)
+    pcm = b"\x01\x02" * 16000
+    try:
+        await engine._handle_message(_ready(500))
+        await client.start_turn()
+        await client.send_tts_audio(pcm[:3200], 16000, 1)
+        assert not _audio(transport)
+        await client.send_tts_audio(pcm[3200:], 16000, 1)
+        assert _audio(transport) == [pcm]
+
+        await client.start_turn()
+        initial = pcm[: 200 * 32]
+        await client.send_tts_audio(initial[:-2], 16000, 1)
+        assert _audio(transport) == [pcm]
+        await client.send_tts_audio(initial[-2:], 16000, 1)
+        assert _audio(transport) == [pcm, initial]
+    finally:
+        await client.close()
+
+
+@pytest.mark.parametrize("direct", [False, True])
 async def test_later_handshake_restores_fallback_without_losing_pending(
     direct: bool,
 ) -> None:

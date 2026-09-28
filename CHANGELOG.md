@@ -6,14 +6,16 @@ All notable changes to `ojin-client` are documented here. The format follows
 
 ## Unreleased
 
-## 0.12.0 - 2026-09-21
+## 0.12.0 - 2026-09-28
 
 ### Added
 
 - STV clients accept the server's recommended initial audio batch size before
-  replaying queued TTS. Human Portrait 2 servers can request 500 ms; servers
-  without a valid hint retain 1000 ms. Explicit `server_feed_initial_chunk_ms`
-  settings still take precedence; the default `None` selects automatic tuning.
+  replaying queued TTS. Servers without a valid hint retain 1000 ms. Explicit
+  `server_feed_initial_chunk_ms` settings still take precedence; the default
+  `None` selects automatic tuning. The Human Portrait low-latency profile uses
+  an explicit 200 ms threshold, overriding older 500 ms hints while preserving
+  larger TTS bursts in full.
 
 ### Fixed
 
