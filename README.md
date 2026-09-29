@@ -177,6 +177,19 @@ config = STVConfig(
 
 The explicit 200 ms setting takes precedence over an older server recommendation of 500 ms.
 
+Use `server_feed_fixed_chunk_size=True` only when you want exact packet sizes. The SDK rounds sizes up to complete PCM16 samples, retains overflow, and flushes short tails without padding.
+
+For the Human Presence low-latency deployment, pass this configuration to `OjinSTVClient`:
+
+```python
+config = STVConfig(
+    server_feed_initial_chunk_ms=320,
+    server_feed_min_chunk_ms=200,
+    server_feed_send_gap_ms=100,
+    server_feed_fixed_chunk_size=False,
+)
+```
+
 **Audio is the clock.** The playback loop emits **exactly one audio frame every tick** (real audio or silence so the consumer never starves) plus a video frame whenever one is ready, at `STVConfig.fps` (default 25 → a 40 ms tick). Video falls back to repeating the last frame rather than stalling.
 
 **Interruption (barge-in).** Call `interrupt()` to cut a turn mid-sentence. The client fades the current audio, cancels the in-flight inference server-side, and re-syncs cleanly for the next turn. The `INTERRUPTED` event fires when a barge-in is accepted.
@@ -394,6 +407,7 @@ avatar_token = (
 | `server_feed_initial_chunk_ms` | `None` | Accept the server recommendation (1,000 ms fallback); an explicit duration overrides it |
 | `server_feed_min_chunk_ms` | `400` | Steady-state minimum send size |
 | `server_feed_flush_idle_ms` | `200` | Quiet time before flushing a sub-threshold tail |
+| `server_feed_fixed_chunk_size` | `False` | Emit exact sizes rounded up to complete PCM16 samples; otherwise send the whole batch |
 | `server_feed_send_gap_ms` | `200` | Minimum wait after an audio write before the next write starts |
 
 Video frames are emitted at the server's native resolution — read `STVVideoFrame.width`/`height` per frame rather than configuring an output size. Set `OJIN_MODE=dev` in the environment to attach the dev-mode query flag when connecting with the default transport.

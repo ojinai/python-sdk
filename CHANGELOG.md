@@ -6,7 +6,7 @@ All notable changes to `ojin-client` are documented here. The format follows
 
 ## Unreleased
 
-## 0.12.0 - 2026-09-28
+## 0.12.0 - 2026-09-29
 
 ### Added
 
@@ -19,9 +19,22 @@ All notable changes to `ojin-client` are documented here. The format follows
 
 ### Fixed
 
-- Cancelling speech now discards the unsent remainder of a split audio message
-  even when cancellation finishes during a pacing delay or socket send. Fresh
-  replies continue normally after cancellation.
+- Startup recommendations preserve whole PCM16 samples in fixed-size batching,
+  including durations that fall between samples at 44.1 kHz.
+
+## 0.11.1 - 2026-09-28
+
+### Added
+- `STVConfig.server_feed_fixed_chunk_size` opts into exact initial and steady
+  audio packet sizes. Oversized TTS inputs split without padding; short tails
+  still flush after the idle timeout or at a turn boundary. Default batching
+  continues to send all available audio once its minimum threshold is reached.
+- Server-feed traces distinguish queued audio from completed WebSocket writes,
+  including audio duration, queue wait, and socket write time.
+
+### Fixed
+- Cancellation retires an in-flight audio payload even when the cancel finishes
+  during its pacing delay or socket write, preserving the next reply.
 
 ## 0.11.0 - 2026-09-14
 

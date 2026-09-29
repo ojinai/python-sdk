@@ -231,8 +231,9 @@ async def test_large_audio_split_into_max_chunks_and_paced(monkeypatch) -> None:
         send_chunk_gap_s=0.2,
     )
     client._running = True
+    client._inference_server_ready = True
     client._ws = _FakeWS()  # type: ignore[assignment]
-    await client._pending_client_messages_queue.put(_audio_msg(b"\x01\x02\x03\x04" * 3))
+    await client.send_message(_audio_msg(b"\x01\x02\x03\x04" * 3))
 
     await _drain_send_loop(client, expected_sends=3, real_sleep=real_sleep)
 
@@ -258,8 +259,9 @@ async def test_single_message_sends_without_gap(monkeypatch) -> None:
         ws_url="ws://t", api_key="k", config_id="c", send_chunk_gap_s=0.2
     )
     client._running = True
+    client._inference_server_ready = True
     client._ws = _FakeWS()  # type: ignore[assignment]
-    await client._pending_client_messages_queue.put(_audio_msg(b"\x01\x02" * 10))
+    await client.send_message(_audio_msg(b"\x01\x02" * 10))
 
     await _drain_send_loop(client, expected_sends=1, real_sleep=real_sleep)
 
@@ -282,9 +284,10 @@ async def test_backlog_of_messages_is_paced(monkeypatch) -> None:
         ws_url="ws://t", api_key="k", config_id="c", send_chunk_gap_s=0.2
     )
     client._running = True
+    client._inference_server_ready = True
     client._ws = _FakeWS()  # type: ignore[assignment]
     for _ in range(3):
-        await client._pending_client_messages_queue.put(_audio_msg(b"\x01\x02" * 10))
+        await client.send_message(_audio_msg(b"\x01\x02" * 10))
 
     await _drain_send_loop(client, expected_sends=3, real_sleep=real_sleep)
 
@@ -317,14 +320,13 @@ async def test_interleaved_producer_is_still_paced(monkeypatch) -> None:
         ws_url="ws://t", api_key="k", config_id="c", send_chunk_gap_s=0.2
     )
     client._running = True
+    client._inference_server_ready = True
     client._ws = _FakeWS()  # type: ignore[assignment]
 
     task = asyncio.create_task(client._process_client_messages())
     try:
         for i in range(3):
-            await client._pending_client_messages_queue.put(
-                _audio_msg(b"\x01\x02" * 10)
-            )
+            await client.send_message(_audio_msg(b"\x01\x02" * 10))
             # Wait for THIS message to hit the wire before enqueueing the next —
             # the queue is empty at every gap decision, mimicking the replay race.
             for _ in range(200):

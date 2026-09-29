@@ -150,12 +150,9 @@ class OjinClient(IOjinClient):
             max_input_chunk_bytes: Cap on a single audio send; larger
                 ``OjinAudioInputMessage`` payloads are split into this many bytes
                 per WebSocket frame.
-            send_chunk_gap_s: Minimum gap between consecutive audio sends while a
-                backlog remains (split chunks of one message, or a queue of pending
-                messages). Keeps a buffered burst from flooding the server; steady
-                realtime (one message at a time, queue drains empty) is never
-                delayed. Defaults to 0 (no pacing); ``OjinSTVClient`` passes its
-                configured value.
+            send_chunk_gap_s: Minimum gap between consecutive audio sends,
+                including split payloads. Sends after a longer idle need no wait.
+                Defaults to 0 (no pacing); ``OjinSTVClient`` passes its value.
 
         """
         super().__init__()
@@ -184,9 +181,10 @@ class OjinClient(IOjinClient):
         self._outbound_generation: int = 0
         self._active_interaction_id: str | None = None
         self._process_messages_task: Optional[asyncio.Task] = None
-        self._pending_client_messages_queue: asyncio.Queue[OjinMessage] = (
-            asyncio.Queue()
-        )
+        self._pending_client_messages_queue: asyncio.Queue[
+            tuple[OjinMessage, float]
+        ] = asyncio.Queue()
+        self._audio_sent_callback: Callable[[int, float, float], None] | None = None
         self._mode: str | None = mode
         self._pending_first_input: bool = False
         self._webrtc_status_callback: Optional[
@@ -197,6 +195,26 @@ class OjinClient(IOjinClient):
         # webrtc_* query params, the meeting token as the X-Ojin-Webrtc-Token
         # header. Carries a secret — never log it.
         self._webrtc_settings: Optional["WebRTCSettings"] = None
+
+    def set_audio_sent_callback(
+        self, callback: Callable[[int, float, float], None]
+    ) -> None:
+        """Observe completed audio writes with bytes, queue wait ms, and send ms.
+
+        Called synchronously after each WebSocket write, including split
+        payloads. Queue wait includes pacing; send time covers the socket write.
+        Keep the observer nonblocking. This is not a server acknowledgement.
+        """
+        self._audio_sent_callback = callback
+
+    def _notify_audio_sent(
+        self, byte_count: int, queue_wait_ms: float, send_ms: float
+    ) -> None:
+        if self._audio_sent_callback is not None:
+            try:
+                self._audio_sent_callback(byte_count, queue_wait_ms, send_ms)
+            except Exception:
+                logger.exception("audio send observer failed")
 
     def set_webrtc_connect_settings(self, settings: "WebRTCSettings") -> None:
         """Declare direct-WebRTC settings for the connection's upgrade request.
@@ -545,7 +563,7 @@ class OjinClient(IOjinClient):
             message,
             (OjinAudioInputMessage, OjinTextInputMessage, OjinEndInteractionMessage),
         ):
-            await self._pending_client_messages_queue.put(message)
+            await self._pending_client_messages_queue.put((message, time.monotonic()))
             return
 
         logger.error("The message %s is Unknown", message)
@@ -570,7 +588,7 @@ class OjinClient(IOjinClient):
                 await asyncio.sleep(1.0)
                 continue
 
-            message: OjinMessage = await self._pending_client_messages_queue.get()
+            message, queued_at = await self._pending_client_messages_queue.get()
             generation = self._outbound_generation
             if isinstance(message, OjinAudioInputMessage):
                 max_chunk_size = self._max_input_chunk_bytes
@@ -612,8 +630,15 @@ class OjinClient(IOjinClient):
                     )
                     proxy_message = InteractionInputMessage(payload=interaction_input)
 
-                    await self._ws.send(proxy_message.to_bytes())
+                    wire_message = proxy_message.to_bytes()
+                    send_started = time.monotonic()
+                    await self._ws.send(wire_message)
                     self._last_audio_send_t = time.monotonic()
+                    self._notify_audio_sent(
+                        len(chunk),
+                        (send_started - queued_at) * 1000.0,
+                        (self._last_audio_send_t - send_started) * 1000.0,
+                    )
 
             elif isinstance(message, OjinTextInputMessage):
                 text_message = message.to_proxy_message()

@@ -29,6 +29,7 @@ class SendBatcher:
         min_chunk_bytes: int,
         flush_idle_s: float,
         clock: Callable[[], float] = time.monotonic,
+        fixed_chunk_size: bool = False,
     ) -> None:
         """Create an empty batcher armed for an initial-threshold emit.
 
@@ -39,6 +40,8 @@ class SendBatcher:
             flush_idle_s: quiet seconds after the last add before a tail is
                 flush-due.
             clock: monotonic seconds source (injectable for deterministic tests).
+            fixed_chunk_size: emit exactly the active threshold, retaining any
+                overflow for subsequent :meth:`pop_ready` calls.
 
         """
         super().__init__()
@@ -46,6 +49,9 @@ class SendBatcher:
         self._min_chunk_bytes = min_chunk_bytes
         self._flush_idle_s = flush_idle_s
         self._clock = clock
+        self._fixed_chunk_size = fixed_chunk_size
+        if fixed_chunk_size and min(initial_chunk_bytes, min_chunk_bytes) <= 0:
+            raise ValueError("Fixed audio chunk sizes must be positive")
         self._buf = bytearray()
         self._next_is_initial = True
         self._last_add_ts = clock()
@@ -59,14 +65,21 @@ class SendBatcher:
         """Append bytes; return a batch to send when the size threshold is met.
 
         The threshold is ``initial_chunk_bytes`` until the first emit after each
-        (re)arm, then ``min_chunk_bytes``. On reaching it, drains and returns ALL
-        buffered bytes (the threshold is a minimum, not a quantum) and clears the
-        initial flag. Returns ``None`` below threshold. Empty input is a no-op.
+        (re)arm, then ``min_chunk_bytes``. By default it returns all buffered
+        bytes when the threshold is reached. In fixed-size mode it returns
+        exactly the threshold; call :meth:`pop_ready` until it returns ``None``
+        to release any other complete packets. Empty input is a no-op.
         """
         if not pcm16k:
             return None
         self._buf.extend(pcm16k)
         self._last_add_ts = self._clock()
+        return self.pop_ready()
+
+    def pop_ready(self) -> Optional[bytes]:
+        """Return the next complete packet without resetting the idle timer."""
+        if not self._buf:
+            return None
         threshold = (
             self._initial_chunk_bytes
             if self._next_is_initial
@@ -74,6 +87,10 @@ class SendBatcher:
         )
         if len(self._buf) >= threshold:
             self._next_is_initial = False
+            if self._fixed_chunk_size:
+                out = bytes(self._buf[:threshold])
+                del self._buf[:threshold]
+                return out
             return self._take()
         return None
 
