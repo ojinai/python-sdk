@@ -163,7 +163,19 @@ asyncio.run(main())
 
 **Turns.** A turn is one spoken utterance. Open it with `start_turn()`, then push audio with `send_tts_audio(pcm, sample_rate, num_channels)` as many times as you like. The client buffers and plays the **original** audio you sent while a 16 kHz copy goes to the server for lip-sync — so the voice the user hears is always exactly yours. Because the original is what's played back, you can feed **higher-quality** TTS (e.g. 24 kHz) for better sound and lip-sync still works on the 16 kHz copy — just set your player to the `sample_rate` each `STVAudioFrame` reports.
 
-**Input shaping.** Feed audio at whatever cadence your TTS produces, including 40 ms fragments. By default, the client accumulates 1,000 ms after each `start_turn()` and uses a 400 ms minimum for subsequent batches. Once a threshold is met, it sends all available audio, subject to the transport's packet-size cap. A 1-second TTS burst stays together even at a 320 ms threshold.
+**Input shaping.** Feed audio at whatever cadence your TTS produces, including 40 ms fragments. After each `start_turn()`, the client accumulates the server's recommended initial audio duration, or 1,000 ms if no valid recommendation is available. An explicit `server_feed_initial_chunk_ms` overrides the recommendation. Subsequent batches use a 400 ms minimum by default. Once a threshold is met, the client sends all available audio, subject to the transport's packet-size cap. A 1-second TTS burst stays together even at a 200 ms threshold.
+
+For the Human Portrait low-latency deployment, pass this configuration to `OjinSTVClient`:
+
+```python
+config = STVConfig(
+    server_feed_initial_chunk_ms=200,
+    server_feed_min_chunk_ms=200,
+    server_feed_send_gap_ms=100,
+)
+```
+
+The explicit 200 ms setting takes precedence over an older server recommendation of 500 ms.
 
 Use `server_feed_fixed_chunk_size=True` only when you want exact packet sizes. The SDK rounds sizes up to complete PCM16 samples, retains overflow, and flushes short tails without padding.
 
@@ -392,7 +404,7 @@ avatar_token = (
 | `interrupt_audio_fade_s` | `0.75` | Fade length applied on barge-in |
 | `lipsync_trace_enabled` | `False` | Emit the per-tick A/V-sync diagnostics |
 | `server_feed_batching_enabled` | `True` | Prime + combine the server-bound audio feed (`False` = send each chunk as-is) |
-| `server_feed_initial_chunk_ms` | `1000` | Initial lead accumulated after each `start_turn()` |
+| `server_feed_initial_chunk_ms` | `None` | Accept the server recommendation (1,000 ms fallback); an explicit duration overrides it |
 | `server_feed_min_chunk_ms` | `400` | Steady-state minimum send size |
 | `server_feed_flush_idle_ms` | `200` | Quiet time before flushing a sub-threshold tail |
 | `server_feed_fixed_chunk_size` | `False` | Emit exact sizes rounded up to complete PCM16 samples; otherwise send the whole batch |

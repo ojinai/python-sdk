@@ -256,14 +256,16 @@ async def test_short_utterance_idle_flushes_without_padding() -> None:
 
 
 @pytest.mark.parametrize("fixed", [False, True])
+@pytest.mark.parametrize("initial_source", ["explicit", "hint"])
 async def test_fractional_sample_thresholds_preserve_complete_pcm_samples(
     fixed: bool,
+    initial_source: str,
 ) -> None:
     """Fixed packets round up to whole samples; default mode keeps the burst."""
     rate = 44100
     transport = FakeOjinClient()
     config = _config()
-    config.server_feed_initial_chunk_ms = 329
+    config.server_feed_initial_chunk_ms = 329 if initial_source == "explicit" else None
     config.server_feed_min_chunk_ms = 201
     config.server_feed_fixed_chunk_size = fixed
     client = OjinSTVClient(
@@ -278,12 +280,15 @@ async def test_fractional_sample_thresholds_preserve_complete_pcm_samples(
     )
     engine = client._webrtc
     pcm = b"\x01\x02" * rate
+    parameters = dict(READY_CONNECTED_PARAMETERS)
+    parameters["server_feed_initial_chunk_ms"] = (
+        500 if initial_source == "explicit" else 329
+    )
     try:
-        await engine._handle_message(
-            OjinSessionReadyMessage(parameters=READY_CONNECTED_PARAMETERS)
-        )
         await client.start_turn()
         await client.send_tts_audio(pcm, rate, 1)
+        assert not _audio(transport)
+        await engine._handle_message(OjinSessionReadyMessage(parameters=parameters))
         assert [len(packet) for packet in _audio(transport)] == (
             [29018, 17730, 17730, 17730] if fixed else [len(pcm)]
         )

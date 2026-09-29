@@ -34,6 +34,8 @@ logger = logging.getLogger(__name__)
 # conversion is an instance value (`_bytes_per_ms`) derived from the feed rate;
 # 16 kHz stays the default so the legacy client is byte-identical.
 FEED_SAMPLE_RATE = 16_000
+_DEFAULT_INITIAL_CHUNK_MS = 1000
+_MAX_SERVER_INITIAL_CHUNK_MS = 8000
 
 
 class OutboundFeedMixin:
@@ -60,19 +62,16 @@ class OutboundFeedMixin:
         """
         # ms = bytes / _bytes_per_ms, for the batcher thresholds and the lead
         # clock. Derived from the feed rate so both clients share one formula.
+        self._feed_sample_rate = feed_sample_rate
         self._bytes_per_ms = feed_sample_rate * 2 / 1000.0
         initial_ms = self._config.server_feed_initial_chunk_ms
-        steady_ms = self._config.server_feed_min_chunk_ms
-        if self._config.server_feed_fixed_chunk_size:
-            # Round up to whole PCM16 samples so packets never split a sample.
-            initial_bytes = math.ceil(initial_ms * feed_sample_rate / 1000) * 2
-            steady_bytes = math.ceil(steady_ms * feed_sample_rate / 1000) * 2
-        else:
-            initial_bytes = int(initial_ms * self._bytes_per_ms)
-            steady_bytes = int(steady_ms * self._bytes_per_ms)
+        if initial_ms is None:
+            initial_ms = _DEFAULT_INITIAL_CHUNK_MS
         self._batcher = SendBatcher(
-            initial_chunk_bytes=initial_bytes,
-            min_chunk_bytes=steady_bytes,
+            initial_chunk_bytes=self._feed_chunk_bytes(initial_ms),
+            min_chunk_bytes=self._feed_chunk_bytes(
+                self._config.server_feed_min_chunk_ms
+            ),
             flush_idle_s=self._config.server_feed_flush_idle_ms / 1000.0,
             fixed_chunk_size=self._config.server_feed_fixed_chunk_size,
         )
@@ -114,6 +113,26 @@ class OutboundFeedMixin:
         # turn's own trailing audio must still be dropped, not replayed).
         self._interrupt_deferred: list[tuple] = []
         self._deferring_input = False
+
+    def _feed_chunk_bytes(self, duration_ms: int) -> int:
+        if self._config.server_feed_fixed_chunk_size:
+            # Round up to whole PCM16 samples so packets never split a sample.
+            return math.ceil(duration_ms * self._feed_sample_rate / 1000) * 2
+        return int(duration_ms * self._bytes_per_ms)
+
+    def _configure_server_feed(self, parameters: dict | None) -> None:
+        initial_ms = self._config.server_feed_initial_chunk_ms
+        if initial_ms is None:
+            hint = (parameters or {}).get("server_feed_initial_chunk_ms")
+            if (
+                isinstance(hint, int)
+                and not isinstance(hint, bool)
+                and 0 < hint <= _MAX_SERVER_INITIAL_CHUNK_MS
+            ):
+                initial_ms = hint
+            else:
+                initial_ms = _DEFAULT_INITIAL_CHUNK_MS
+        self._batcher.set_initial_chunk_bytes(self._feed_chunk_bytes(initial_ms))
 
     # ------------------------------------------------------------------
     # Host seams

@@ -4,6 +4,24 @@ All notable changes to `ojin-client` are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/), and the project adheres to
 [Semantic Versioning](https://semver.org/) (pre-1.0 — see CONTRIBUTING.md).
 
+## Unreleased
+
+## 0.12.0 - 2026-09-29
+
+### Added
+
+- STV clients accept the server's recommended initial audio batch size before
+  replaying queued TTS. Servers without a valid hint retain 1000 ms. Explicit
+  `server_feed_initial_chunk_ms` settings still take precedence; the default
+  `None` selects automatic tuning. The Human Portrait low-latency profile uses
+  an explicit 200 ms threshold, overriding older 500 ms hints while preserving
+  larger TTS bursts in full.
+
+### Fixed
+
+- Startup recommendations preserve whole PCM16 samples in fixed-size batching,
+  including durations that fall between samples at 44.1 kHz.
+
 ## 0.11.1 - 2026-09-28
 
 ### Added

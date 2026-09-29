@@ -511,6 +511,7 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         self._cancel_join_timer()
         if message.parameters is not None:
             self._session_data = message.parameters
+        self._configure_server_feed(message.parameters)
         self._initialized = True
         self._tracer.span("lifecycle", "connect", self._tr_connect_start)
         await self._events.emit(STVEvent.SESSION_READY, session_data=self._session_data)
