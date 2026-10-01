@@ -6,6 +6,8 @@ All notable changes to `ojin-client` are documented here. The format follows
 
 ## Unreleased
 
+## 0.12.1 - 2026-10-01
+
 ### Changed
 - `WebRTCSettings.webrtc_join_timeout_s` now defaults to **90 s** (was 10 s). The
   wait covers the model's cold start as well as the room join, and a cold start
