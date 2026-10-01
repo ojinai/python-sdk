@@ -177,6 +177,9 @@ class OjinClient(IOjinClient):
         # tracer derives an ingress-bandwidth lane from its slope.
         self._ingress_bytes_total: int = 0
         self._inference_server_ready: bool = False
+        # Set once an error has been queued for the consumer, so a close that
+        # follows it is not reported as a second, vaguer error.
+        self._error_reported: bool = False
         self._cancelled: bool = False
         self._outbound_generation: int = 0
         self._active_interaction_id: str | None = None
@@ -270,6 +273,7 @@ class OjinClient(IOjinClient):
                 # Enable TCP_NODELAY to reduce latency for real-time frames
                 _configure_tcp_nodelay(self._ws)
                 self._running = True
+                self._error_reported = False
                 self._receive_task = asyncio.create_task(
                     self._receive_server_messages()
                 )
@@ -352,7 +356,39 @@ class OjinClient(IOjinClient):
         except Exception as e:
             logger.exception("Error in WebSocket receive loop: %s", e)
         finally:
+            if self._running:  # the server ended it, not our own close()
+                await self._report_closed_before_ready()
             await self.close()
+
+    async def _report_closed_before_ready(self) -> None:
+        """Queue an error when the connection ends before ``sessionReady``.
+
+        Consumers block on :meth:`receive_message`, so a proxy that closes
+        without an ``errorResponse`` (a failed entitlement check, a dropped
+        connection) would otherwise look like a session that is still starting
+        until the caller's own timeout expires.
+        """
+        if self._inference_server_ready or self._error_reported:
+            return
+        close_code = getattr(self._ws, "close_code", None)
+        close_reason = getattr(self._ws, "close_reason", None)
+        detail = ""
+        if close_code is not None:
+            detail = f" (close code {close_code}"
+            detail += f": {close_reason})" if close_reason else ")"
+        self._error_reported = True
+        await self._available_response_messages_queue.put(
+            ErrorResponseMessage(
+                payload=ErrorResponse(
+                    interaction_id=None,
+                    code="CONNECTION_CLOSED",
+                    message="The connection closed before the session was ready"
+                    + detail,
+                    timestamp=int(time.time() * 1000),
+                    details=None,
+                )
+            )
+        )
 
     async def _handle_server_message(self, message: str | bytes) -> None:
         """Handle an incoming WebSocket message.
@@ -401,6 +437,7 @@ class OjinClient(IOjinClient):
                         "active_interaction_id": self._active_interaction_id,
                     },
                 )
+                self._error_reported = True
                 await self._available_response_messages_queue.put(
                     ErrorResponseMessage(
                         payload=ErrorResponse(
@@ -431,6 +468,7 @@ class OjinClient(IOjinClient):
                         "active_interaction_id": self._active_interaction_id,
                     },
                 )
+                self._error_reported = True
                 await self._available_response_messages_queue.put(
                     ErrorResponseMessage(
                         payload=ErrorResponse(
@@ -473,6 +511,7 @@ class OjinClient(IOjinClient):
                 await self._available_response_messages_queue.put(msg)
 
                 if isinstance(msg, ErrorResponseMessage):
+                    self._error_reported = True
                     raise RuntimeError(f"Error in Inference Server received: {msg}")
 
                 if isinstance(msg, OjinSessionReadyPing):

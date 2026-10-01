@@ -665,3 +665,67 @@ async def test_webrtc_status_survives_cancel_drain() -> None:
     # The seeded interaction response was drained by the cancel; the status,
     # delivered via the callback, was never at risk.
     assert client._available_response_messages_queue.empty()
+
+
+class _ClosingWS:
+    """Delivers ``messages`` and then ends, as a socket the server closed does."""
+
+    def __init__(self, messages: list, close_code: int, close_reason: str) -> None:
+        self._messages = list(messages)
+        self.close_code = close_code
+        self.close_reason = close_reason
+
+    def __aiter__(self) -> "_ClosingWS":
+        return self
+
+    async def __anext__(self):
+        if not self._messages:
+            raise StopAsyncIteration
+        return self._messages.pop(0)
+
+    async def close(self) -> None:
+        """Nothing to release."""
+
+
+async def _run_receive_loop(messages: list, code: int, reason: str) -> list:
+    """Run the receive loop over a server-closed socket; return what it queued."""
+    client = _client()
+    client._ws = _ClosingWS(messages, code, reason)
+    client._running = True
+    await client._receive_server_messages()
+    queue = client._available_response_messages_queue
+    return [queue.get_nowait() for _ in range(queue.qsize())]
+
+
+async def test_close_before_session_ready_is_reported_with_the_close_reason() -> None:
+    """A proxy close with no errorResponse must not look like a slow start."""
+    queued = await _run_receive_loop([], 1008, "Insufficient funds")
+
+    assert len(queued) == 1
+    assert isinstance(queued[0], ErrorResponseMessage)
+    assert queued[0].payload.code == "CONNECTION_CLOSED"
+    assert "before the session was ready" in queued[0].payload.message
+    assert "1008: Insufficient funds" in queued[0].payload.message
+
+
+async def test_close_after_server_error_reports_only_the_server_error() -> None:
+    """The server's own errorResponse is the cause; the close adds no second one."""
+    error = {
+        "type": "errorResponse",
+        "payload": {
+            "code": "BACKEND_UNAVAILABLE",
+            "message": "No GPU became available",
+            "timestamp": 1789000000000,
+        },
+    }
+    queued = await _run_receive_loop([json.dumps(error)], 1013, "")
+
+    assert [m.payload.code for m in queued] == ["BACKEND_UNAVAILABLE"]
+
+
+async def test_close_after_session_ready_queues_no_error() -> None:
+    """Only the pre-ready wait is covered; a later close stays as it was."""
+    ready = {"type": "sessionReady", "payload": {"parameters": {"persona": "x"}}}
+    queued = await _run_receive_loop([json.dumps(ready)], 1000, "")
+
+    assert [type(m) for m in queued] == [OjinSessionReadyMessage]

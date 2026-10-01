@@ -669,9 +669,9 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         self._tracer.instant("webrtc", "join_timeout")
         await self._fail(
             WEBRTC_JOIN_TIMEOUT,
-            "The session was not ready within "
-            f"{self._webrtc_settings.webrtc_join_timeout_s} s (the wait covers the "
-            "room join and the model's cold start)",
+            "Timed out: the session was not ready within "
+            f"{self._webrtc_settings.webrtc_join_timeout_s:g} s (the wait covers "
+            "the room join and the model's cold start)",
             {"outcome": "timeout"},
         )
 

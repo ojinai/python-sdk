@@ -205,8 +205,8 @@ client = OjinSTVClient(
   ends at close. Don't build a render path in this mode.
 - `WEBRTC_CONNECTED` fires when the avatar is in the room; `FIRST_FRAME` and the
   speaking events still fire.
-- **No fallback.** A failed join, a `webrtc_join_timeout_s` expiry (default 10 s,
-  includes cold start — use ~30 s in production) or an unsupporting server is a fatal
+- **No fallback.** A failed join, a `webrtc_join_timeout_s` expiry (default 90 s,
+  includes cold start — don't lower it below ~60 s) or an unsupporting server is a fatal
   `ERROR` naming the cause (`WEBRTC_AUTH_FAILED`, `WEBRTC_NETWORK_FAILED`,
   `WEBRTC_INVALID_SETTINGS`, `WEBRTC_JOIN_TIMEOUT`, `WEBRTC_ROOM_LOST` or
   `WEBRTC_NOT_SUPPORTED`) and the session closes.

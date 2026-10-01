@@ -10,6 +10,7 @@ import asyncio
 
 import pytest
 
+from ojin.entities.interaction_messages import ErrorResponse, ErrorResponseMessage
 from ojin.ojin_client_messages import (
     FrameType,
     OjinAudioInputMessage,
@@ -239,6 +240,30 @@ async def test_join_timeout_is_reported_and_closes() -> None:
     await asyncio.sleep(0.2)
 
     assert [e["code"] for e in errors] == ["WEBRTC_JOIN_TIMEOUT"]
+    assert closed == [{}]
+
+
+async def test_error_before_session_ready_fails_without_waiting_for_timeout() -> None:
+    """A start the server gives up on ends at once, under the server's own code."""
+    fake_client = _NeverReadyClient()
+    client, _ = make_client(fake=fake_client, join_timeout_s=60.0)
+    errors = _record(client, STVEvent.ERROR)
+    closed = _record(client, STVEvent.CLOSED)
+    await client.start()
+
+    await fake_client.push(
+        ErrorResponseMessage(
+            payload=ErrorResponse(
+                code="BACKEND_UNAVAILABLE",
+                message="No GPU became available",
+                timestamp=1789000000000,
+            )
+        )
+    )
+    await asyncio.sleep(0.05)
+
+    assert [(e["code"], e["fatal"]) for e in errors] == [("BACKEND_UNAVAILABLE", True)]
+    assert errors[0]["message"] == "No GPU became available"
     assert closed == [{}]
 
 
