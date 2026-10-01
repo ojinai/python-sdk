@@ -265,7 +265,8 @@ async def test_no_session_ready_within_timeout_is_fatal_and_closes() -> None:
     assert len(errors) == 1
     assert errors[0]["code"] == "WEBRTC_JOIN_TIMEOUT"
     assert errors[0]["fatal"] is True
-    assert "not ready within" in errors[0]["message"]
+    assert errors[0]["message"].startswith("Timed out: ")
+    assert "not ready within 90 s" in errors[0]["message"]
     assert client._preinit_inputs == []  # held input discarded on timeout
     assert _audio_messages(fake_client) == []
     assert closed == [{}]

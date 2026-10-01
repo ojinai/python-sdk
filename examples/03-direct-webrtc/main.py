@@ -23,8 +23,6 @@ import wave
 from ojin import Credentials, MissingCredentialsError, load_env, resolve_credentials
 from ojin.stv import OjinSTVClient, STVEvent, WebRTCSettings
 
-JOIN_TIMEOUT_S = 30.0  # covers the room join AND a model cold start
-
 
 def read_mono_wav(path: pathlib.Path) -> tuple[bytes, int]:
     """Read a mono 16-bit PCM WAV as (pcm_bytes, sample_rate), or exit with a hint."""
@@ -60,7 +58,6 @@ def webrtc_settings_from_env(sample_rate: int) -> WebRTCSettings:
             room_url=room_url,
             token=token,
             audio_sample_rate=sample_rate,  # publish at the clip's own rate
-            webrtc_join_timeout_s=JOIN_TIMEOUT_S,
         )
     except ValueError as exc:
         sys.exit(f"\n  Invalid WebRTC settings: {exc}\n")

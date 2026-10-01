@@ -45,7 +45,9 @@ class WebRTCSettings:
 
     Set ``audio_sample_rate`` to the rate your TTS emits to avoid resampling.
     ``webrtc_join_timeout_s`` bounds the whole wait for the session to become
-    ready — the room join *and* a model cold start — so leave headroom.
+    ready — the room join *and* a model cold start, which alone can take more
+    than 30 s. It is a backstop: a start the service itself gives up on is
+    reported sooner, as the server's own error.
 
     The settings are declared in the WebSocket **upgrade request** (DR-006 as
     amended 2026-07-24): the non-secret fields ride ``webrtc_*`` query params
@@ -64,7 +66,7 @@ class WebRTCSettings:
     token: str = field(repr=False)
     provider: WebRTCProvider | str = WebRTCProvider.DAILY
     audio_sample_rate: int = 16000
-    webrtc_join_timeout_s: float = 10.0
+    webrtc_join_timeout_s: float = 90.0
     version: int = 2
 
     def to_connect_query_params(self) -> dict:

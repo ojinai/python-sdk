@@ -375,7 +375,7 @@ def test_webrtc_settings_repr_hides_token_and_pins_defaults() -> None:
     assert settings.version == 2  # protocol v2 (DR-006)
     # Client-local; in v2 it governs the whole sessionReady wait and must not
     # appear in the connect declaration.
-    assert settings.webrtc_join_timeout_s == 10.0
+    assert settings.webrtc_join_timeout_s == 90.0
     assert "webrtc_join_timeout_s" not in settings.to_connect_query_params()
     assert settings.to_connect_query_params()["webrtc_version"] == "2"
     # The token travels only in the header — never in a query param.

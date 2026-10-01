@@ -380,7 +380,7 @@ avatar_token = (
 | `WEBRTC_AUTH_FAILED` | The room rejected the avatar's token |
 | `WEBRTC_NETWORK_FAILED` | Ojin couldn't reach the room |
 | `WEBRTC_INVALID_SETTINGS` | The room URL or provider was unusable |
-| `WEBRTC_JOIN_TIMEOUT` | The session wasn't ready within `webrtc_join_timeout_s` (default 10 s — it covers the model's cold start too, so leave headroom) |
+| `WEBRTC_JOIN_TIMEOUT` | The session wasn't ready within `webrtc_join_timeout_s` (default 90 s — it covers the model's cold start too, which alone can take more than 30 s) |
 | `WEBRTC_ROOM_LOST` | The avatar dropped out of the room mid-session |
 | `WEBRTC_NOT_SUPPORTED` | The server returned no room result for this session |
 | `WEBRTC_JOIN_FAILED` | Fallback: the join failed with a code this SDK doesn't recognise |
@@ -412,7 +412,7 @@ avatar_token = (
 
 Video frames are emitted at the server's native resolution — read `STVVideoFrame.width`/`height` per frame rather than configuring an output size. Set `OJIN_MODE=dev` in the environment to attach the dev-mode query flag when connecting with the default transport.
 
-For direct WebRTC, `WebRTCSettings` takes `provider`, `room_url`, `token`, `audio_sample_rate` (default `16000`) and `webrtc_join_timeout_s` (default `10.0`); the playback fields above don't apply because the media goes to the room.
+For direct WebRTC, `WebRTCSettings` takes `provider`, `room_url`, `token`, `audio_sample_rate` (default `16000`) and `webrtc_join_timeout_s` (default `90.0`); the playback fields above don't apply because the media goes to the room.
 
 ---
 
@@ -491,7 +491,8 @@ async def main(pcm_16k_mono: bytes) -> None:
 - **Choppy playback** — keep the event loop free; the SDK already decodes JPEG off-loop, but heavy synchronous work in your frame handlers will stall the 40 ms tick. Enable `STVConfig(lipsync_trace_enabled=True)` to inspect per-tick timing.
 - **Latency higher than expected** — the WebSocket transport is built for **server-to-server** use over a stable connection. Run the client on a backend (not an end-user device), ideally in **US East**, close to Ojin's inference; deliver the final media to end users over a realtime transport such as WebRTC — or publish straight into their room with [direct WebRTC](#direct-webrtc-livekit--daily). The client keeps a small video buffer (`initial_buffer_frames`) to absorb network jitter, since the server delivers at realtime 25 fps.
 - **`WEBRTC_AUTH_FAILED`** — the token doesn't grant the avatar access to that room. On LiveKit, check the token's identity is exactly `ojin-avatar` and it allows publishing; on Daily, check the meeting token is for the same room as `room_url`.
-- **`WEBRTC_JOIN_TIMEOUT`** — the session didn't become ready within `webrtc_join_timeout_s`. It covers the model's cold start as well as the room join, so raise it (e.g. `30.0`) if it trips on first sessions.
+- **`WEBRTC_JOIN_TIMEOUT`** — the session didn't become ready within `webrtc_join_timeout_s` (default 90 s). It covers the model's cold start as well as the room join, and a cold start alone can take more than 30 s, so don't lower it below that. Retrying usually succeeds: the server keeps starting after the client gives up.
+- **`CONNECTION_CLOSED`** — the connection ended before the session was ready and the server sent no error of its own. The message carries the WebSocket close code and reason (for example `1008: Insufficient funds`).
 - **Your bot hears the avatar** — it's subscribed to the `ojin-avatar` participant's microphone. Detect it with `is_avatar_participant()` / `is_avatar_identity()` and unsubscribe.
 
 ---

@@ -6,6 +6,22 @@ All notable changes to `ojin-client` are documented here. The format follows
 
 ## Unreleased
 
+### Changed
+- `WebRTCSettings.webrtc_join_timeout_s` now defaults to **90 s** (was 10 s). The
+  wait covers the model's cold start as well as the room join, and a cold start
+  alone can take more than 30 s, so the old default failed sessions the server
+  was about to start. An explicit value still wins; anything under ~60 s will
+  trip on cold starts.
+- The `WEBRTC_JOIN_TIMEOUT` message now starts with `Timed out:`.
+
+### Fixed
+- A connection that the server closes before `sessionReady` without sending an
+  `errorResponse` (for example a failed entitlement check) is now reported at
+  once as a fatal `ERROR` with code `CONNECTION_CLOSED` and the WebSocket close
+  code and reason in the message. Previously nothing was reported: the WebSocket
+  client waited forever and the WebRTC client waited out the whole join timeout,
+  then blamed a timeout.
+
 ## 0.12.0 - 2026-09-29
 
 ### Added
