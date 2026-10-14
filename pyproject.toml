@@ -1,6 +1,6 @@
 [project]
 name = "ojin-client"
-version = "0.12.1"
+version = "0.12.2"
 description = "Ojin platform services"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -12,7 +12,7 @@ classifiers = [
 dependencies = [    
     "websockets>=15.0.1,<16",
     "async-lru>=2.0.5,<3",
-    "pyjwt>=2.13.0,<3",  # 2.13.0 fixes PYSEC-2026-175..179 / GHSA-jq35-7prp-9v3f
+    "pyjwt>=2.15.0,<3",  # 2.15.0 fixes the 2.14/2.15 key-confusion and JWKS advisories (incl. GHSA-gvp8-978c-rx2q)
     "pydantic-settings>=2.8.1,<3",
     "deprecated>=1.2.14,<2",
 ]
