@@ -6,6 +6,14 @@ All notable changes to `ojin-client` are documented here. The format follows
 
 ## Unreleased
 
+## 0.12.2 - 2026-10-14
+
+### Security
+- Require `pyjwt>=2.15.0` (was `>=2.13.0`). Older releases let public keys
+  (PEM with altered whitespace, DER, JWK containers) and empty keys act as HMAC
+  secrets, let `PyJWKClient` follow redirects when fetching JWKS, and had
+  several denial-of-service bugs in token parsing.
+
 ## 0.12.1 - 2026-10-01
 
 ### Changed
