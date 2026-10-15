@@ -46,8 +46,11 @@ class WebRTCSettings:
     Set ``audio_sample_rate`` to the rate your TTS emits to avoid resampling.
     ``webrtc_join_timeout_s`` bounds the whole wait for the session to become
     ready — the room join *and* a model cold start, which alone can take more
-    than 30 s. It is a backstop: a start the service itself gives up on is
-    reported sooner, as the server's own error.
+    than 30 s — on a service that sends no startup status. A service that
+    reports its startup progress (``sessionPing`` messages every few seconds)
+    bounds the start itself; from the first such message the client waits as
+    long as the reports keep coming and fails only after
+    ``startup_inactivity_timeout_s`` of silence instead.
 
     The settings are declared in the WebSocket **upgrade request** (DR-006 as
     amended 2026-07-24): the non-secret fields ride ``webrtc_*`` query params
@@ -58,7 +61,8 @@ class WebRTCSettings:
     the ``sessionSetup`` it authors.
 
     ``token`` is excluded from ``repr``, must never be logged, and never
-    appears in a URL. ``webrtc_join_timeout_s`` is client-local and is never
+    appears in a URL. ``webrtc_join_timeout_s`` and
+    ``startup_inactivity_timeout_s`` are client-local and are never
     serialized.
     """
 
@@ -67,6 +71,7 @@ class WebRTCSettings:
     provider: WebRTCProvider | str = WebRTCProvider.DAILY
     audio_sample_rate: int = 16000
     webrtc_join_timeout_s: float = 90.0
+    startup_inactivity_timeout_s: float = 20.0
     version: int = 2
 
     def to_connect_query_params(self) -> dict:
@@ -74,8 +79,9 @@ class WebRTCSettings:
 
         Values are strings ready for URL-encoding. The ``token`` is
         deliberately absent — a URL lands in access logs; the token travels
-        via :meth:`to_connect_headers` instead. ``webrtc_join_timeout_s`` is
-        likewise absent (client-local, never serialized).
+        via :meth:`to_connect_headers` instead. ``webrtc_join_timeout_s`` and
+        ``startup_inactivity_timeout_s`` are likewise absent (client-local,
+        never serialized).
         """
         return {
             "webrtc_version": str(self.version),
@@ -113,6 +119,11 @@ class WebRTCSettings:
         if self.webrtc_join_timeout_s <= 0:
             raise ValueError(
                 f"webrtc_join_timeout_s must be > 0, got {self.webrtc_join_timeout_s}"
+            )
+        if self.startup_inactivity_timeout_s <= 0:
+            raise ValueError(
+                "startup_inactivity_timeout_s must be > 0, got "
+                f"{self.startup_inactivity_timeout_s}"
             )
         rate = self.audio_sample_rate
         if not _MIN_AUDIO_SAMPLE_RATE <= rate <= _MAX_AUDIO_SAMPLE_RATE or (

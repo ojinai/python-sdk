@@ -22,6 +22,7 @@ EventCallback = Callable[..., object]
 class STVEvent(Enum):
     """Lifecycle/state events emitted by :class:`OjinSTVClient`."""
 
+    SESSION_STARTING = "session_starting"  # args: phase, elapsed_ms
     SESSION_READY = "session_ready"  # args: session_data
     WEBRTC_CONNECTED = "webrtc_connected"  # args: participant_id
     FIRST_FRAME = "first_frame"  # args: frame_type

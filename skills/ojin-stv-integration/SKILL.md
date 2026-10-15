@@ -133,6 +133,7 @@ Handlers may be sync or async; one failing handler never breaks the loops.
 
 | Event | Fires when | Kwargs |
 |---|---|---|
+| `SESSION_STARTING` | direct WebRTC only: the service reported startup progress (every few seconds until ready) | `phase`, `elapsed_ms` |
 | `SESSION_READY` | session is live (safe to send audio) | `session_data` |
 | `WEBRTC_CONNECTED` | direct WebRTC only: the avatar joined your room | `participant_id` |
 | `FIRST_FRAME` | the avatar's first video frame is out (to your output, or into the room) | `frame_type` |
@@ -205,8 +206,9 @@ client = OjinSTVClient(
   ends at close. Don't build a render path in this mode.
 - `WEBRTC_CONNECTED` fires when the avatar is in the room; `FIRST_FRAME` and the
   speaking events still fire.
-- **No fallback.** A failed join, a `webrtc_join_timeout_s` expiry (default 90 s,
-  includes cold start — don't lower it below ~60 s) or an unsupporting server is a fatal
+- **No fallback.** A failed join, a startup that times out (`webrtc_join_timeout_s`, default
+  90 s, on a service that sends no startup status; `startup_inactivity_timeout_s`
+  of silence, default 20 s, on one that does) or an unsupporting server is a fatal
   `ERROR` naming the cause (`WEBRTC_AUTH_FAILED`, `WEBRTC_NETWORK_FAILED`,
   `WEBRTC_INVALID_SETTINGS`, `WEBRTC_JOIN_TIMEOUT`, `WEBRTC_ROOM_LOST` or
   `WEBRTC_NOT_SUPPORTED`) and the session closes.

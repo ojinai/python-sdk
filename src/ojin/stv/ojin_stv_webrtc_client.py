@@ -61,6 +61,7 @@ from ojin.ojin_client_messages import (
     OjinCancelInteractionMessage,
     OjinInteractionResponseMessage,
     OjinSessionReadyMessage,
+    OjinSessionReadyPing,
     OjinWebRTCStatusMessage,
 )
 from ojin.stv._outbound_feed import OutboundFeedMixin
@@ -77,6 +78,7 @@ _HALF_SECOND_TOL = 0.01
 _MS_PER_METADATA_FRAME = 40.0  # metadata frames are paced at 25/s
 _METADATA_WATCHDOG_S = 5.0
 _WATCHDOG_POLL_S = 1.0
+_STARTUP_WATCHDOG_POLL_S = 0.5
 _SPEECH_TYPES = (int(FrameType.SPEECH), int(FrameType.START_OF_SPEECH))
 _SILENCE_TYPES = (int(FrameType.IDLE), int(FrameType.FADE_OUT))
 
@@ -180,6 +182,10 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         self._closed = False
         self._close_task: Optional[asyncio.Task] = None
         self._request_sent_at = 0.0
+        # Startup status from the service: once it reports progress, the
+        # fixed join timer gives way to a silence watchdog.
+        self._last_startup_status_at: Optional[float] = None
+        self._last_startup_phase: Optional[str] = None
         self._last_metadata_at = 0.0
         self._first_frame_pending = False
         self._last_frame_type: Optional[int] = None
@@ -284,7 +290,9 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         The webrtc request rides the connect exchange itself (declared on the
         transport at construction), so once the connection is up the
         negotiation is already in flight: the join timer armed here governs
-        the whole ``sessionReady`` wait (``webrtc_join_timeout_s``).
+        the ``sessionReady`` wait (``webrtc_join_timeout_s``) until the
+        service's first startup status report hands it to the silence
+        watchdog (see :meth:`_on_startup_status`).
         """
         self._tr_session_start = self._tracer.mark()
         self._tr_connect_start = self._tr_session_start
@@ -324,7 +332,8 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         was_initialized = self._initialized
         self._initialized = False
         self._preinit_inputs.clear()
-        self._cancel_join_timer()
+        join_timer, self._join_timer_task = self._join_timer_task, None
+        await self._cancel_task(join_timer)
         await self._cancel_task(self._watchdog_task)
         self._watchdog_task = None
         if was_initialized:
@@ -478,6 +487,8 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         """Route one server message (session ready / interaction / error)."""
         if isinstance(message, OjinSessionReadyMessage):
             await self._on_session_ready(message)
+        elif isinstance(message, OjinSessionReadyPing):
+            await self._on_startup_status(message)
         elif isinstance(message, OjinInteractionResponseMessage):
             was_interrupting = self._interruption_ongoing
             await self._on_interaction_response(message)
@@ -493,6 +504,9 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
             self._tracer.instant(
                 "lifecycle", "server_error", args={"code": code, "message": text}
             )
+            # The server's verdict ends the start; no startup timer may add a
+            # second ERROR behind it.
+            self._cancel_join_timer()
             await self._events.emit(STVEvent.ERROR, message=text, code=code, fatal=True)
             self._schedule_close()
 
@@ -658,11 +672,66 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         await asyncio.sleep(self._webrtc_settings.webrtc_join_timeout_s)
         await self._handle_join_timeout()
 
+    async def _on_startup_status(self, ping: OjinSessionReadyPing) -> None:
+        """Note that the service is still starting the session.
+
+        The service sends these while it waits on its own bounded steps, so
+        from the first one the total is its responsibility, not ours: the
+        fixed join timer is replaced by a watchdog that fails only when the
+        reports stop.
+        """
+        if self._state is not _DirectState.PENDING or self._initialized or self._closed:
+            return
+        first = self._last_startup_status_at is None
+        self._last_startup_status_at = self._clock()
+        self._last_startup_phase = ping.phase
+        self._tracer.instant(
+            "webrtc",
+            "startup_status",
+            args={"phase": ping.phase or "", "elapsed_ms": ping.elapsed_ms or 0},
+        )
+        if first:
+            self._cancel_join_timer()
+            self._join_timer_task = asyncio.create_task(self._startup_watchdog())
+        await self._events.emit(
+            STVEvent.SESSION_STARTING, phase=ping.phase, elapsed_ms=ping.elapsed_ms
+        )
+
+    async def _startup_watchdog(self) -> None:
+        """Fail the start once the service's status reports fall silent.
+
+        Polled every ``_STARTUP_WATCHDOG_POLL_S``, so the failure lands up to
+        that much after ``startup_inactivity_timeout_s`` of silence, never
+        before it.
+        """
+        limit = self._webrtc_settings.startup_inactivity_timeout_s
+        while True:
+            await asyncio.sleep(_STARTUP_WATCHDOG_POLL_S)
+            last = self._last_startup_status_at
+            if last is None or self._clock() - last < limit:
+                continue
+            if (
+                self._state is not _DirectState.PENDING
+                or self._initialized
+                or self._closed
+            ):
+                return
+            self._tracer.instant("webrtc", "startup_stalled")
+            phase = self._last_startup_phase or "unknown"
+            await self._fail(
+                WEBRTC_JOIN_TIMEOUT,
+                "Timed out: the service stopped reporting progress for "
+                f"{limit:g} s while the session was starting (last phase: {phase})",
+                {"outcome": "timeout", "last_phase": phase},
+            )
+            return
+
     async def _handle_join_timeout(self) -> None:
         """Fail the session if no sessionReady arrived within the join timeout.
 
         In v2 the server joins the room during setup, so
-        ``webrtc_join_timeout_s`` governs the whole ``sessionReady`` wait.
+        ``webrtc_join_timeout_s`` governs the ``sessionReady`` wait on a
+        service that sends no startup status.
         """
         if self._state is not _DirectState.PENDING or self._initialized:
             return

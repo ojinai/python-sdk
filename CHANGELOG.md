@@ -6,6 +6,24 @@ All notable changes to `ojin-client` are documented here. The format follows
 
 ## Unreleased
 
+## 0.12.2 - 2026-10-15
+
+### Added
+- `STVEvent.SESSION_STARTING` (args `phase`, `elapsed_ms`): the service's startup
+  status, emitted in direct-WebRTC mode for each `sessionPing` it sends while
+  the session is still starting. `OjinSessionReadyPing` now carries `phase` and
+  `elapsed_ms`; a ping whose fields have unexpected types parses with them unset
+  and can never end the session.
+- `WebRTCSettings.startup_inactivity_timeout_s` (default 20 s).
+
+### Changed
+- The direct-WebRTC start is no longer bounded by a blind total once the service
+  reports progress. From the first `sessionPing` the fixed `webrtc_join_timeout_s`
+  timer is replaced by a watchdog that fails (`WEBRTC_JOIN_TIMEOUT`, naming the
+  last phase reported) only after `startup_inactivity_timeout_s` of silence; the
+  service's own deadlines bound the total. A service that sends no status is
+  handled as before.
+
 ## 0.12.1 - 2026-10-01
 
 ### Changed

@@ -118,6 +118,27 @@ def _read_tcp_info(sock: socket.socket) -> dict[str, int]:
         return {}
 
 
+def _parse_session_ping(data: dict) -> OjinSessionReadyPing:
+    """Read the startup status out of a ``sessionPing`` (bare on older services).
+
+    Never raises: a status message must not be able to end the session, so a
+    field of the wrong type is simply left unset.
+    """
+    payload = data.get("payload")
+    if not isinstance(payload, dict):
+        return OjinSessionReadyPing()
+    phase = payload.get("phase")
+    elapsed = payload.get("elapsed_ms")
+    elapsed_ms: int | None = None
+    if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+        # json.loads admits NaN and Infinity, which int() refuses.
+        with contextlib.suppress(ValueError, OverflowError):
+            elapsed_ms = int(elapsed)
+    return OjinSessionReadyPing(
+        phase=phase if isinstance(phase, str) else None, elapsed_ms=elapsed_ms
+    )
+
+
 class OjinClient(IOjinClient):
     """WebSocket client for communicating with the OJIN STV service.
 
@@ -507,16 +528,17 @@ class OjinClient(IOjinClient):
                     await self._available_response_messages_queue.put(session_ready)
                     return
 
-                msg = msg_class(**data)
+                msg = (
+                    _parse_session_ping(data)
+                    if msg_type == "sessionPing"
+                    else msg_class(**data)
+                )
                 await self._available_response_messages_queue.put(msg)
 
                 if isinstance(msg, ErrorResponseMessage):
                     self._error_reported = True
                     raise RuntimeError(f"Error in Inference Server received: {msg}")
 
-                if isinstance(msg, OjinSessionReadyPing):
-                    # Discard session pings
-                    pass
             else:
                 logger.warning("Unknown message type: %s", msg_type)
 
