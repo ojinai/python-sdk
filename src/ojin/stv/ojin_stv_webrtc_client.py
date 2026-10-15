@@ -290,7 +290,9 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         The webrtc request rides the connect exchange itself (declared on the
         transport at construction), so once the connection is up the
         negotiation is already in flight: the join timer armed here governs
-        the whole ``sessionReady`` wait (``webrtc_join_timeout_s``).
+        the ``sessionReady`` wait (``webrtc_join_timeout_s``) until the
+        service's first startup status report hands it to the silence
+        watchdog (see :meth:`_on_startup_status`).
         """
         self._tr_session_start = self._tracer.mark()
         self._tr_connect_start = self._tr_session_start
@@ -330,7 +332,8 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         was_initialized = self._initialized
         self._initialized = False
         self._preinit_inputs.clear()
-        self._cancel_join_timer()
+        join_timer, self._join_timer_task = self._join_timer_task, None
+        await self._cancel_task(join_timer)
         await self._cancel_task(self._watchdog_task)
         self._watchdog_task = None
         if was_initialized:
@@ -501,6 +504,9 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
             self._tracer.instant(
                 "lifecycle", "server_error", args={"code": code, "message": text}
             )
+            # The server's verdict ends the start; no startup timer may add a
+            # second ERROR behind it.
+            self._cancel_join_timer()
             await self._events.emit(STVEvent.ERROR, message=text, code=code, fatal=True)
             self._schedule_close()
 
@@ -674,7 +680,7 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         fixed join timer is replaced by a watchdog that fails only when the
         reports stop.
         """
-        if self._state is not _DirectState.PENDING or self._initialized:
+        if self._state is not _DirectState.PENDING or self._initialized or self._closed:
             return
         first = self._last_startup_status_at is None
         self._last_startup_status_at = self._clock()
@@ -692,14 +698,23 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         )
 
     async def _startup_watchdog(self) -> None:
-        """Fail the start once the service's status reports fall silent."""
+        """Fail the start once the service's status reports fall silent.
+
+        Polled every ``_STARTUP_WATCHDOG_POLL_S``, so the failure lands up to
+        that much after ``startup_inactivity_timeout_s`` of silence, never
+        before it.
+        """
         limit = self._webrtc_settings.startup_inactivity_timeout_s
         while True:
             await asyncio.sleep(_STARTUP_WATCHDOG_POLL_S)
             last = self._last_startup_status_at
             if last is None or self._clock() - last < limit:
                 continue
-            if self._state is not _DirectState.PENDING or self._initialized:
+            if (
+                self._state is not _DirectState.PENDING
+                or self._initialized
+                or self._closed
+            ):
                 return
             self._tracer.instant("webrtc", "startup_stalled")
             phase = self._last_startup_phase or "unknown"
@@ -715,7 +730,8 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         """Fail the session if no sessionReady arrived within the join timeout.
 
         In v2 the server joins the room during setup, so
-        ``webrtc_join_timeout_s`` governs the whole ``sessionReady`` wait.
+        ``webrtc_join_timeout_s`` governs the ``sessionReady`` wait on a
+        service that sends no startup status.
         """
         if self._state is not _DirectState.PENDING or self._initialized:
             return

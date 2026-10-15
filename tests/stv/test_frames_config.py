@@ -86,6 +86,8 @@ def test_webrtc_provider_str_is_wire_value() -> None:
         {"token": ""},
         {"webrtc_join_timeout_s": 0},
         {"webrtc_join_timeout_s": -1.0},
+        {"startup_inactivity_timeout_s": 0},
+        {"startup_inactivity_timeout_s": -5.0},
     ],
 )
 def test_webrtc_settings_rejects_invalid_fields(overrides: dict) -> None:

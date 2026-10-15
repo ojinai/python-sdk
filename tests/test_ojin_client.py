@@ -749,6 +749,27 @@ async def test_session_ping_carries_the_startup_status() -> None:
     assert (msg.phase, msg.elapsed_ms) == ("waiting_for_container", 12000)
 
 
+@pytest.mark.parametrize(
+    "payload",
+    [
+        {"phase": 5, "elapsed_ms": "abc"},
+        {"phase": None, "elapsed_ms": 12.5},
+        {"phase": ["x"], "elapsed_ms": True},
+        "not an object",
+    ],
+)
+async def test_malformed_session_ping_never_ends_the_session(payload: object) -> None:
+    """A status message with odd field types parses loosely and the session goes on."""
+    bad_ping = json.dumps({"type": "sessionPing", "payload": payload})
+    ready = json.dumps({"type": "sessionReady", "payload": {"parameters": {}}})
+    queued = await _run_receive_loop([bad_ping, ready], 1000, "")
+
+    assert [type(m) for m in queued] == [OjinSessionReadyPing, OjinSessionReadyMessage]
+    ping = queued[0]
+    assert ping.phase is None or isinstance(ping.phase, str)
+    assert ping.elapsed_ms is None or isinstance(ping.elapsed_ms, int)
+
+
 async def test_bare_session_ping_is_still_a_ping() -> None:
     """An older service's payload-less ping parses with empty status fields."""
     client = _client()

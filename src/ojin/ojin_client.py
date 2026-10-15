@@ -119,12 +119,23 @@ def _read_tcp_info(sock: socket.socket) -> dict[str, int]:
 
 
 def _parse_session_ping(data: dict) -> OjinSessionReadyPing:
-    """Read the startup status out of a ``sessionPing`` (bare on older services)."""
+    """Read the startup status out of a ``sessionPing`` (bare on older services).
+
+    Never raises: a status message must not be able to end the session, so a
+    field of the wrong type is simply left unset.
+    """
     payload = data.get("payload")
     if not isinstance(payload, dict):
         return OjinSessionReadyPing()
+    phase = payload.get("phase")
+    elapsed = payload.get("elapsed_ms")
     return OjinSessionReadyPing(
-        phase=payload.get("phase"), elapsed_ms=payload.get("elapsed_ms")
+        phase=phase if isinstance(phase, str) else None,
+        elapsed_ms=(
+            int(elapsed)
+            if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool)
+            else None
+        ),
     )
 
 

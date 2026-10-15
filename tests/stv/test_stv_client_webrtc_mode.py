@@ -270,7 +270,7 @@ def _startup_client(join_timeout_s: float, inactivity_s: float):
 
 async def test_startup_status_replaces_the_fixed_join_timeout() -> None:
     """While the service keeps reporting progress, the client keeps waiting."""
-    client, fake_client = _startup_client(join_timeout_s=0.05, inactivity_s=0.3)
+    client, fake_client = _startup_client(join_timeout_s=0.05, inactivity_s=0.6)
     errors = _record(client, STVEvent.ERROR)
     starting = _record(client, STVEvent.SESSION_STARTING)
     ready = _record(client, STVEvent.SESSION_READY)
@@ -311,6 +311,84 @@ async def test_startup_status_going_silent_fails_the_start() -> None:
     assert "stopped reporting progress for 0.2 s" in errors[0]["message"]
     assert "last phase: setting_up_session" in errors[0]["message"]
     assert closed == [{}]
+
+
+async def test_a_second_report_reuses_the_watchdog_and_a_late_one_is_ignored() -> None:
+    """One watchdog per start; reports after the session is ready change nothing."""
+    client, fake_client = _startup_client(join_timeout_s=5.0, inactivity_s=5.0)
+    starting = _record(client, STVEvent.SESSION_STARTING)
+    errors = _record(client, STVEvent.ERROR)
+    await client.start()
+
+    await fake_client.push(OjinSessionReadyPing(phase="waiting_for_container"))
+    await asyncio.sleep(0.02)
+    first_watchdog = client._webrtc._join_timer_task
+    await fake_client.push(OjinSessionReadyPing(phase="setting_up_session"))
+    await asyncio.sleep(0.02)
+    assert client._webrtc._join_timer_task is first_watchdog
+    assert [s["phase"] for s in starting] == [
+        "waiting_for_container",
+        "setting_up_session",
+    ]
+
+    await fake_client.push(
+        OjinSessionReadyMessage(parameters=READY_CONNECTED_PARAMETERS)
+    )
+    await asyncio.sleep(0.02)
+    await fake_client.push(OjinSessionReadyPing(phase="setting_up_session"))
+    await asyncio.sleep(0.02)
+
+    assert len(starting) == 2  # the late report was ignored
+    assert first_watchdog.cancelled() or first_watchdog.done()
+    assert client.is_connected is True
+    await client.close()
+    assert errors == []
+
+
+class _SlowClosingClient(_NeverReadyClient):
+    """A transport whose close takes a while, as a real WebSocket handshake does."""
+
+    async def close(self) -> None:
+        """Hold the close open so messages can still arrive meanwhile."""
+        await asyncio.sleep(0.05)
+        await super().close()
+
+
+async def test_a_first_report_during_close_cannot_revive_the_start() -> None:
+    """A status report landing while close() runs arms nothing and reports nothing."""
+    fake_client = _SlowClosingClient()
+    client = OjinSTVClient(
+        webrtc=WebRTCSettings(
+            room_url=ROOM_URL,
+            token=TOKEN,
+            provider="livekit",
+            audio_sample_rate=RATE,
+            webrtc_join_timeout_s=5.0,
+            startup_inactivity_timeout_s=0.2,
+        ),
+        client=fake_client,
+        tracer=RecordingTracer(),
+        config=STVConfig(
+            loop_stall_watchdog_ms=0,
+            stall_probe_ms=0,
+            server_feed_batching_enabled=False,
+        ),
+    )
+    events: list[str] = []
+    for event in (STVEvent.SESSION_STARTING, STVEvent.ERROR, STVEvent.CLOSED):
+        client.add_listener(
+            event, lambda _event=event, **_: events.append(_event.value)
+        )
+    await client.start()
+
+    closing = asyncio.create_task(client.close())
+    await asyncio.sleep(0.01)  # close() is inside the transport's slow close
+    await fake_client.push(OjinSessionReadyPing(phase="waiting_for_container"))
+    await closing
+    await asyncio.sleep(0.8)  # past the inactivity limit and the watchdog poll
+
+    assert events == ["closed"]
+    assert client._webrtc._join_timer_task is None
 
 
 async def test_bare_ping_from_an_older_service_still_counts_as_progress() -> None:

@@ -10,8 +10,10 @@ All notable changes to `ojin-client` are documented here. The format follows
 
 ### Added
 - `STVEvent.SESSION_STARTING` (args `phase`, `elapsed_ms`): the service's startup
-  status, emitted for each `sessionPing` it sends while the session is still
-  starting. `OjinSessionReadyPing` now carries `phase` and `elapsed_ms`.
+  status, emitted in direct-WebRTC mode for each `sessionPing` it sends while
+  the session is still starting. `OjinSessionReadyPing` now carries `phase` and
+  `elapsed_ms`; a ping whose fields have unexpected types parses with them unset
+  and can never end the session.
 - `WebRTCSettings.startup_inactivity_timeout_s` (default 20 s).
 
 ### Changed

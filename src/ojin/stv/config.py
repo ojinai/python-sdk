@@ -61,7 +61,8 @@ class WebRTCSettings:
     the ``sessionSetup`` it authors.
 
     ``token`` is excluded from ``repr``, must never be logged, and never
-    appears in a URL. ``webrtc_join_timeout_s`` is client-local and is never
+    appears in a URL. ``webrtc_join_timeout_s`` and
+    ``startup_inactivity_timeout_s`` are client-local and are never
     serialized.
     """
 
@@ -78,8 +79,9 @@ class WebRTCSettings:
 
         Values are strings ready for URL-encoding. The ``token`` is
         deliberately absent — a URL lands in access logs; the token travels
-        via :meth:`to_connect_headers` instead. ``webrtc_join_timeout_s`` is
-        likewise absent (client-local, never serialized).
+        via :meth:`to_connect_headers` instead. ``webrtc_join_timeout_s`` and
+        ``startup_inactivity_timeout_s`` are likewise absent (client-local,
+        never serialized).
         """
         return {
             "webrtc_version": str(self.version),

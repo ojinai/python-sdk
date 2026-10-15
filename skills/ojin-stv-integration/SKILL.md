@@ -133,6 +133,7 @@ Handlers may be sync or async; one failing handler never breaks the loops.
 
 | Event | Fires when | Kwargs |
 |---|---|---|
+| `SESSION_STARTING` | direct WebRTC only: the service reported startup progress (every few seconds until ready) | `phase`, `elapsed_ms` |
 | `SESSION_READY` | session is live (safe to send audio) | `session_data` |
 | `WEBRTC_CONNECTED` | direct WebRTC only: the avatar joined your room | `participant_id` |
 | `FIRST_FRAME` | the avatar's first video frame is out (to your output, or into the room) | `frame_type` |

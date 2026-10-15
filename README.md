@@ -202,7 +202,7 @@ Register handlers with `@client.on(STVEvent.X)` or `client.add_listener(STVEvent
 
 | Event | Fires when | Handler kwargs |
 |---|---|---|
-| `SESSION_STARTING` | The service is still starting the session and reported its progress (every few seconds until `SESSION_READY`) | `phase: str \| None`, `elapsed_ms: int \| None` |
+| `SESSION_STARTING` | Direct WebRTC only: the service is still starting the session and reported its progress (every few seconds until `SESSION_READY`) | `phase: str \| None`, `elapsed_ms: int \| None` |
 | `SESSION_READY` | The session is live and ready for audio | `session_data: dict \| None` |
 | `WEBRTC_CONNECTED` | Direct WebRTC only: the avatar has joined your room | `participant_id: str \| None` |
 | `FIRST_FRAME` | The avatar's first video frame is out (emitted to your output, or published to the room) | `frame_type: int` |
