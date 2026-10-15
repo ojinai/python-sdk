@@ -18,6 +18,7 @@ from ojin.ojin_client_messages import (
     OjinCancelInteractionMessage,
     OjinInteractionResponseMessage,
     OjinSessionReadyMessage,
+    OjinSessionReadyPing,
     OjinWebRTCStatusMessage,
 )
 
@@ -729,3 +730,29 @@ async def test_close_after_session_ready_queues_no_error() -> None:
     queued = await _run_receive_loop([json.dumps(ready)], 1000, "")
 
     assert [type(m) for m in queued] == [OjinSessionReadyMessage]
+
+
+async def test_session_ping_carries_the_startup_status() -> None:
+    """A sessionPing with a payload is parsed into phase and elapsed time."""
+    client = _client()
+    ping = {
+        "type": "sessionPing",
+        "payload": {
+            "phase": "waiting_for_container",
+            "elapsed_ms": 12000,
+            "timestamp": 1,
+        },
+    }
+    await client._handle_server_message(json.dumps(ping))
+    msg = client._available_response_messages_queue.get_nowait()
+    assert isinstance(msg, OjinSessionReadyPing)
+    assert (msg.phase, msg.elapsed_ms) == ("waiting_for_container", 12000)
+
+
+async def test_bare_session_ping_is_still_a_ping() -> None:
+    """An older service's payload-less ping parses with empty status fields."""
+    client = _client()
+    await client._handle_server_message(json.dumps({"type": "sessionPing"}))
+    msg = client._available_response_messages_queue.get_nowait()
+    assert isinstance(msg, OjinSessionReadyPing)
+    assert (msg.phase, msg.elapsed_ms) == (None, None)

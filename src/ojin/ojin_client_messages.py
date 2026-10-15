@@ -68,7 +68,17 @@ class OjinSessionReadyMessage(OjinMessage):
 
 
 class OjinSessionReadyPing(OjinMessage):
-    """Ping message used to check session readiness with the Ojin backend."""
+    """Startup status from the service while the session is still starting.
+
+    Sent every few seconds before ``sessionReady`` by a service that bounds
+    the start itself. ``phase`` names what it is waiting on (for example
+    ``waiting_for_container`` or ``setting_up_session``) and ``elapsed_ms``
+    is the time since the start was requested; both are absent on an older
+    service, which sends the bare ping.
+    """
+
+    phase: str | None = None
+    elapsed_ms: int | None = None
 
 
 class OjinInteractionResponseMessage(OjinMessage):

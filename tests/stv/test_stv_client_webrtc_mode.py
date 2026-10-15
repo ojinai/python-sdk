@@ -15,6 +15,8 @@ from ojin.ojin_client_messages import (
     FrameType,
     OjinAudioInputMessage,
     OjinCancelInteractionMessage,
+    OjinSessionReadyMessage,
+    OjinSessionReadyPing,
 )
 from ojin.stv.config import STVConfig, WebRTCProvider, WebRTCSettings
 from ojin.stv.events import STVEvent
@@ -241,6 +243,89 @@ async def test_join_timeout_is_reported_and_closes() -> None:
 
     assert [e["code"] for e in errors] == ["WEBRTC_JOIN_TIMEOUT"]
     assert closed == [{}]
+
+
+def _startup_client(join_timeout_s: float, inactivity_s: float):
+    """Build a WebRTC-mode client whose transport never delivers sessionReady itself."""
+    fake_client = _NeverReadyClient()
+    client = OjinSTVClient(
+        webrtc=WebRTCSettings(
+            room_url=ROOM_URL,
+            token=TOKEN,
+            provider="livekit",
+            audio_sample_rate=RATE,
+            webrtc_join_timeout_s=join_timeout_s,
+            startup_inactivity_timeout_s=inactivity_s,
+        ),
+        client=fake_client,
+        tracer=RecordingTracer(),
+        config=STVConfig(
+            loop_stall_watchdog_ms=0,
+            stall_probe_ms=0,
+            server_feed_batching_enabled=False,
+        ),
+    )
+    return client, fake_client
+
+
+async def test_startup_status_replaces_the_fixed_join_timeout() -> None:
+    """While the service keeps reporting progress, the client keeps waiting."""
+    client, fake_client = _startup_client(join_timeout_s=0.05, inactivity_s=0.3)
+    errors = _record(client, STVEvent.ERROR)
+    starting = _record(client, STVEvent.SESSION_STARTING)
+    ready = _record(client, STVEvent.SESSION_READY)
+    await client.start()
+
+    # Four reports over 0.4 s: well past the 0.05 s join timeout.
+    for i in range(4):
+        await fake_client.push(
+            OjinSessionReadyPing(phase="waiting_for_container", elapsed_ms=i * 100)
+        )
+        await asyncio.sleep(0.1)
+    await fake_client.push(
+        OjinSessionReadyMessage(parameters=READY_CONNECTED_PARAMETERS)
+    )
+    await asyncio.sleep(0.05)
+
+    assert errors == []
+    assert [s["phase"] for s in starting] == ["waiting_for_container"] * 4
+    assert starting[-1]["elapsed_ms"] == 300
+    assert len(ready) == 1
+    assert client.is_connected is True
+    await client.close()
+
+
+async def test_startup_status_going_silent_fails_the_start() -> None:
+    """Once the service has reported progress, only its silence ends the wait."""
+    client, fake_client = _startup_client(join_timeout_s=5.0, inactivity_s=0.2)
+    errors = _record(client, STVEvent.ERROR)
+    closed = _record(client, STVEvent.CLOSED)
+    await client.start()
+
+    await fake_client.push(
+        OjinSessionReadyPing(phase="setting_up_session", elapsed_ms=40_000)
+    )
+    await asyncio.sleep(0.8)
+
+    assert [(e["code"], e["fatal"]) for e in errors] == [("WEBRTC_JOIN_TIMEOUT", True)]
+    assert "stopped reporting progress for 0.2 s" in errors[0]["message"]
+    assert "last phase: setting_up_session" in errors[0]["message"]
+    assert closed == [{}]
+
+
+async def test_bare_ping_from_an_older_service_still_counts_as_progress() -> None:
+    """A ping without phase or elapsed time still says the service is working."""
+    client, fake_client = _startup_client(join_timeout_s=0.05, inactivity_s=0.3)
+    errors = _record(client, STVEvent.ERROR)
+    starting = _record(client, STVEvent.SESSION_STARTING)
+    await client.start()
+
+    await fake_client.push(OjinSessionReadyPing())
+    await asyncio.sleep(0.15)
+
+    assert errors == []
+    assert starting == [{"phase": None, "elapsed_ms": None}]
+    await client.close()
 
 
 async def test_error_before_session_ready_fails_without_waiting_for_timeout() -> None:
