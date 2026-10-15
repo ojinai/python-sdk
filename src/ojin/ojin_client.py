@@ -129,13 +129,13 @@ def _parse_session_ping(data: dict) -> OjinSessionReadyPing:
         return OjinSessionReadyPing()
     phase = payload.get("phase")
     elapsed = payload.get("elapsed_ms")
+    elapsed_ms: int | None = None
+    if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool):
+        # json.loads admits NaN and Infinity, which int() refuses.
+        with contextlib.suppress(ValueError, OverflowError):
+            elapsed_ms = int(elapsed)
     return OjinSessionReadyPing(
-        phase=phase if isinstance(phase, str) else None,
-        elapsed_ms=(
-            int(elapsed)
-            if isinstance(elapsed, (int, float)) and not isinstance(elapsed, bool)
-            else None
-        ),
+        phase=phase if isinstance(phase, str) else None, elapsed_ms=elapsed_ms
     )
 
 

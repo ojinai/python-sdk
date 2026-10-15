@@ -391,6 +391,30 @@ async def test_a_first_report_during_close_cannot_revive_the_start() -> None:
     assert client._webrtc._join_timer_task is None
 
 
+async def test_a_server_error_leaves_no_startup_timer_to_add_a_second_error() -> None:
+    """The server's verdict is the only ERROR, even if its listener runs long."""
+    fake_client = _NeverReadyClient()
+    client, _ = make_client(fake=fake_client, join_timeout_s=0.1)
+    timeline: list[tuple[str, object]] = []
+
+    async def _slow_error_listener(code: str | None = None, **_: object) -> None:
+        timeline.append(("error", code))
+        await asyncio.sleep(0.5)  # outlasts the fixed join timer
+
+    client.add_listener(STVEvent.ERROR, _slow_error_listener)
+    client.add_listener(STVEvent.CLOSED, lambda **_: timeline.append(("closed", None)))
+    await client.start()
+
+    await fake_client.push(
+        ErrorResponseMessage(
+            payload=ErrorResponse(code="BOOM", message="boom", timestamp=1789000000000)
+        )
+    )
+    await asyncio.sleep(1.0)
+
+    assert timeline == [("error", "BOOM"), ("closed", None)]
+
+
 async def test_bare_ping_from_an_older_service_still_counts_as_progress() -> None:
     """A ping without phase or elapsed time still says the service is working."""
     client, fake_client = _startup_client(join_timeout_s=0.05, inactivity_s=0.3)

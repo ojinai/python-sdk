@@ -755,6 +755,8 @@ async def test_session_ping_carries_the_startup_status() -> None:
         {"phase": 5, "elapsed_ms": "abc"},
         {"phase": None, "elapsed_ms": 12.5},
         {"phase": ["x"], "elapsed_ms": True},
+        {"elapsed_ms": float("nan")},  # json.dumps emits the NaN literal
+        {"elapsed_ms": float("inf")},
         "not an object",
     ],
 )
