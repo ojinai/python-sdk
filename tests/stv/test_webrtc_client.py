@@ -96,10 +96,10 @@ async def test_clock_advances_40ms_per_speech_frame() -> None:
     await _connect(client, fake_client)
 
     await client._handle_message(_frame(FrameType.START_OF_SPEECH))
-    assert client._played_real_ms == 40.0
+    assert client.played_audio_ms == 40.0
     await client._handle_message(_frame(FrameType.SPEECH))
     await client._handle_message(_frame(FrameType.SPEECH))
-    assert client._played_real_ms == 120.0
+    assert client.played_audio_ms == 120.0
     await client.close()
 
 
@@ -111,8 +111,50 @@ async def test_idle_and_fadeout_never_advance_clock() -> None:
     for _ in range(5):
         await client._handle_message(_frame(FrameType.IDLE))
     await client._handle_message(_frame(FrameType.FADE_OUT))
-    assert client._played_real_ms == 0.0
+    assert client.played_audio_ms == 0.0
     await client.close()
+
+
+async def test_public_progress_counts_metadata_even_when_delivery_is_bursty() -> None:
+    """Elapsed arrival time cannot add or remove published speech duration."""
+    now = [0.0]
+    client, fake_client, _ = make_client(clock=lambda: now[0])
+    await _connect(client, fake_client)
+    starts = []
+    client.add_listener(
+        STVEvent.BOT_STARTED_SPEAKING,
+        lambda **_: starts.append(client.played_audio_ms),
+    )
+
+    now[0] = 10.0
+    for _ in range(25):
+        await client._handle_message(_frame(FrameType.SPEECH))
+    assert client.played_audio_ms == 1000.0
+    assert starts == [40.0]
+    now[0] = 100.0
+    await client._handle_message(_frame(FrameType.IDLE))
+    assert client.played_audio_ms == 1000.0
+    await client.close()
+
+
+async def test_progress_stays_cumulative_across_interruption_and_next_turn() -> None:
+    """Sending, interrupting, and starting another turn cannot invent progress."""
+    client, fake_client, _ = make_client(server_feed_batching_enabled=False)
+    await _connect(client, fake_client)
+    await client.start_turn()
+    await client.send_tts_audio(b"\x01\x02" * 16000, 16000, 1)
+    assert client.played_audio_ms == 0.0
+    await client._handle_message(_frame(FrameType.SPEECH))
+    assert client.played_audio_ms == 40.0
+    await client.interrupt()
+    await client._handle_message(_frame(FrameType.IDLE))
+    await client.start_turn()
+    await client.send_tts_audio(b"\x01\x02" * 640, 16000, 1)
+    assert client.played_audio_ms == 40.0
+    await client._handle_message(_frame(FrameType.SPEECH))
+    assert client.played_audio_ms == 80.0
+    await client.close()
+    assert client.played_audio_ms == 80.0
 
 
 async def test_lead_gated_sends_release_on_speech_frames() -> None:

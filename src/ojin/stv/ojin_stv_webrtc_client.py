@@ -247,6 +247,16 @@ class OjinSTVWebRTCClient(OutboundFeedMixin):
         """Server-provided session parameters, available after SESSION_READY."""
         return self._session_data
 
+    @property
+    def played_audio_ms(self) -> float:
+        """Cumulative server-published speech duration, in milliseconds.
+
+        Speech metadata advances this counter by 40 ms per frame; idle and
+        fade-out metadata do not. New turns and interruptions do not reset it.
+        This measures publication, not the receiving browser's audio playback.
+        """
+        return self._played_real_ms
+
     def on(self, event: STVEvent) -> Callable:
         """Register an event handler via decorator (see :class:`STVEvent`)."""
         return self._events.on(event)
