@@ -196,6 +196,8 @@ config = STVConfig(
 
 **Output sink.** By default frames land in a `QueueOutput` you drain with `output_stream()`. Inject a custom `STVOutput` (e.g. to push straight into a media transport) and consume it directly — `output_stream()` is only for the default queue.
 
+**Speech progress.** `client.played_audio_ms` counts cumulative original speech output, excluding idle filler. WebSocket mode counts audio handed to the output sink; direct WebRTC mode counts server-published speech metadata. Neither confirms that the listener heard the audio. The counter starts at zero for each client and is not reset by turns or interruptions, so save a baseline to measure a particular interval.
+
 ### Events
 
 Register handlers with `@client.on(STVEvent.X)` or `client.add_listener(STVEvent.X, cb)`. Handlers may be sync or async, and a failing handler never breaks the playback loop.
@@ -206,8 +208,8 @@ Register handlers with `@client.on(STVEvent.X)` or `client.add_listener(STVEvent
 | `SESSION_READY` | The session is live and ready for audio | `session_data: dict \| None` |
 | `WEBRTC_CONNECTED` | Direct WebRTC only: the avatar has joined your room | `participant_id: str \| None` |
 | `FIRST_FRAME` | The avatar's first video frame is out (emitted to your output, or published to the room) | `frame_type: int` |
-| `BOT_STARTED_SPEAKING` | The first speech frame of a turn is played | — |
-| `BOT_STOPPED_SPEAKING` | A turn has finished playing | — |
+| `BOT_STARTED_SPEAKING` | Speech starts or resumes after idle frames | None |
+| `BOT_STOPPED_SPEAKING` | Speech pauses or ends; this alone does not confirm a complete streaming turn | None |
 | `INTERRUPTED` | A barge-in was accepted | — |
 | `ERROR` | A transport, server or WebRTC error occurred | `message: str`, `code: str` (server / WebRTC), `fatal: bool` |
 | `CLOSED` | The session has been torn down | — |

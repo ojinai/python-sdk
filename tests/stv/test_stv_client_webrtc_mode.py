@@ -133,6 +133,24 @@ async def test_connected_session_uses_the_same_input_api() -> None:
     assert client.is_connected is False
 
 
+async def test_public_progress_reports_direct_publishing_without_local_media() -> None:
+    """The common client exposes the direct engine's cumulative speech clock."""
+    output = ListOutput()
+    client, fake_client = make_client(output=output)
+    connected = asyncio.Event()
+    first_speech = asyncio.Event()
+    client.add_listener(STVEvent.WEBRTC_CONNECTED, lambda **_: connected.set())
+    client.add_listener(STVEvent.BOT_STARTED_SPEAKING, lambda **_: first_speech.set())
+    assert client.played_audio_ms == 0.0
+    await client.start()
+    await asyncio.wait_for(connected.wait(), 1)
+    await fake_client.push(_frame(FrameType.SPEECH))
+    await asyncio.wait_for(first_speech.wait(), 1)
+    assert client.played_audio_ms == 40.0
+    assert output.audio == [] and output.video == []
+    await client.close()
+
+
 async def test_say_and_interrupt_work_in_webrtc_mode() -> None:
     """The one-shot say() helper and barge-in go through the WebRTC engine."""
     client, fake_client = make_client()

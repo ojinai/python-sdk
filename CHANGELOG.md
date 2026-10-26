@@ -6,6 +6,15 @@ All notable changes to `ojin-client` are documented here. The format follows
 
 ## Unreleased
 
+## 0.12.3 - 2026-10-26
+
+### Added
+
+- `OjinSTVClient.played_audio_ms` exposes cumulative original speech output,
+  excluding idle filler. In direct WebRTC mode it counts server-published
+  speech, independent of metadata arrival timing. It does not confirm that a
+  listener heard the audio. Turns and interruptions do not reset the counter.
+
 ## 0.12.2 - 2026-10-15
 
 ### Added

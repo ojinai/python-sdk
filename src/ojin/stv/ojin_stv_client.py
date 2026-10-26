@@ -243,6 +243,20 @@ class OjinSTVClient(OutboundFeedMixin):
             return self._webrtc.session_data
         return self._session_data
 
+    @property
+    def played_audio_ms(self) -> float:
+        """Cumulative original speech output, in milliseconds.
+
+        WebSocket mode counts audio handed to the output sink, excluding idle
+        filler. Direct WebRTC mode counts server-published speech metadata,
+        independent of when those messages arrive. Neither is an acknowledgment
+        that the listener heard the audio. The counter starts at zero for this
+        client and is not reset by a new turn or an interruption.
+        """
+        if self._webrtc is not None:
+            return self._webrtc.played_audio_ms
+        return self._played_real_ms
+
     def on(self, event: STVEvent) -> Callable:
         """Register an event handler via decorator (see :class:`STVEvent`)."""
         return self._events.on(event)

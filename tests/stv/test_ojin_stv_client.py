@@ -172,6 +172,26 @@ def test_emit_tick_always_emits_one_audio_frame() -> None:
     asyncio.run(run())
 
 
+def test_public_progress_counts_original_audio_but_not_idle_filler() -> None:
+    """Quiet original PCM advances progress; generated idle audio does not."""
+
+    async def run() -> None:
+        client, _, output = make_client()
+        assert client.played_audio_ms == 0.0
+        await client._emit_tick()
+        assert client.played_audio_ms == 0.0
+        buffer = AudioBuffer(sample_rate=16000)
+        buffer.bytes_.extend(b"\x00" * 1280)
+        client._synchronizer.current_buffer = buffer
+        await client._emit_tick()
+        assert client.played_audio_ms == 40.0
+        await client._emit_tick()
+        assert client.played_audio_ms == 40.0
+        assert len(output.audio) == 3
+
+    asyncio.run(run())
+
+
 def test_interrupt_sends_cancel_only_when_interruptible() -> None:
     """Interrupt sends a cancel only when a live buffer is playing."""
 
