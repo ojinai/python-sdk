@@ -6,6 +6,13 @@ All notable changes to `ojin-client` are documented here. The format follows
 
 ## Unreleased
 
+## 0.12.4 - 2026-11-11
+
+### Changed
+
+- The `stv` extra now allows OpenCV 5; the default STV decoder and tests pass with
+  `opencv-python-headless` 5.0.0.93.
+
 ## 0.12.3 - 2026-10-26
 
 ### Added
