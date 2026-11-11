@@ -1,6 +1,6 @@
 [project]
 name = "ojin-client"
-version = "0.12.3"
+version = "0.12.4"
 description = "Ojin platform services"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -44,7 +44,7 @@ ojin = ["*.pem"]
 # resampler, so injecting your own avoids them.
 stv = [
     "numpy>=1.24,<3",
-    "opencv-python-headless>=4.9,<5",
+    "opencv-python-headless>=4.9,<6",
     "soxr>=0.3,<2",
 ]
 dev = [
@@ -58,7 +58,7 @@ dev = [
     "fastapi>=0.115.13",
     "uvicorn>=0.34.3",
     "numpy>=1.24,<3",
-    "opencv-python-headless>=4.9,<5",
+    "opencv-python-headless>=4.9,<6",
     "soxr>=0.3,<2",
 ]
 
